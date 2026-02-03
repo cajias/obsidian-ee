@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/collab-core",
+    "crates/collab-relay",
+    "crates/collab-cli",
+    "crates/collab-proto",
+    "tests/e2e-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Obsidian E2E Team"]
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# CRDT
+yrs = "0.21"
+
+# MLS (Messaging Layer Security)
+openmls = "0.6"
+openmls_rust_crypto = "0.2"
+openmls_basic_credential = "0.2"
+
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# AWS SDK (using latest versions for Rust 2024 compatibility)
+aws-config = "1.8"
+aws-sdk-dynamodb = "1.104"
+aws-sdk-lambda = "1.97"
+
+# Testing
+pretty_assertions = "1.4"
+tokio-test = "0.4"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allow unwrap/expect in code - they're fine for tests and sometimes necessary
+unwrap_used = "allow"
+expect_used = "allow"

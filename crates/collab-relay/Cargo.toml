@@ -1,0 +1,32 @@
+[package]
+name = "collab-relay"
+description = "WebSocket relay server for collaborative document editing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "collab-relay"
+path = "src/main.rs"
+
+[dependencies]
+collab-proto = { path = "../collab-proto" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+aws-config.workspace = true
+aws-sdk-dynamodb.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio-test.workspace = true
+
+[lints]
+workspace = true

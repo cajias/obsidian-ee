@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # LocalStack for AWS services (DynamoDB, SQS, etc.)
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=dynamodb,sqs
+      - DEBUG=1
+      - PERSISTENCE=1
+    volumes:
+      - "./localstack-init:/etc/localstack/init/ready.d"
+      - "localstack_data:/var/lib/localstack"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for presence/pubsub
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Relay server (our Rust service)
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.relay
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=debug
+      - DYNAMODB_ENDPOINT=http://localstack:4566
+      - REDIS_URL=redis://redis:6379
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    depends_on:
+      localstack:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  localstack_data:

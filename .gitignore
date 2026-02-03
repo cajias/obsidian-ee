@@ -1,0 +1,34 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Node (for CDK)
+node_modules/
+infra/cdk.out/
+
+# LocalStack
+.localstack/
+
+# Test artifacts
+*.cast
+*.gif
+
+# Coverage
+*.profraw
+lcov.info
+coverage/
