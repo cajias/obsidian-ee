@@ -15,7 +15,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting relay server on {}", addr);
 
     let server = RelayServer::new();
-    server.start(&addr).await?;
+    let bound = server.bind(&addr).await?;
+
+    tracing::info!("Relay server listening on {}", bound.addr);
+
+    // Wait for shutdown signal (Ctrl+C)
+    tokio::signal::ctrl_c().await?;
+    bound.handle.shutdown();
 
     Ok(())
 }

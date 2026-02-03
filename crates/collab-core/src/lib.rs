@@ -10,8 +10,8 @@ mod encryption;
 mod mls;
 
 pub use document::CollabDocument;
-pub use encryption::EncryptedDocument;
-pub use mls::MlsDocumentGroup;
+pub use encryption::{EncryptedDocument, Invite};
+pub use mls::{MlsDocumentGroup, PendingMember};
 
 /// Document identifier type.
 pub type DocumentId = String;

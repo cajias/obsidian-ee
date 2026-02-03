@@ -20,9 +20,9 @@ rust-version = "1.75"
 yrs = "0.21"
 
 # MLS (Messaging Layer Security)
-openmls = "0.6"
-openmls_rust_crypto = "0.2"
-openmls_basic_credential = "0.2"
+openmls = "0.7"
+openmls_rust_crypto = "0.4"
+openmls_basic_credential = "0.4"
 
 # Async runtime
 tokio = { version = "1.41", features = ["full"] }

@@ -1,6 +1,6 @@
 //! Encrypted document wrapper combining Yrs CRDT with MLS encryption.
 
-use crate::{CollabDocument, DocumentId, MlsDocumentGroup, Result};
+use crate::{CollabDocument, DocumentId, MlsDocumentGroup, PendingMember, Result};
 
 /// An encrypted collaborative document.
 ///
@@ -34,14 +34,14 @@ impl EncryptedDocument {
         Ok(Self { doc, mls })
     }
 
-    /// Join an existing encrypted document.
+    /// Join an existing encrypted document using a pending member state.
     ///
     /// # Errors
     ///
     /// Returns an error if joining the MLS group fails.
-    pub fn join(invite: &Invite, user_id: &str) -> Result<Self> {
+    pub fn join(invite: &Invite, pending: PendingMember) -> Result<Self> {
         let doc = CollabDocument::new(invite.doc_id.clone());
-        let mls = MlsDocumentGroup::join(&invite.welcome, user_id)?;
+        let mls = pending.join(&invite.welcome)?;
 
         Ok(Self { doc, mls })
     }
@@ -67,7 +67,7 @@ impl EncryptedDocument {
     /// # Errors
     ///
     /// Returns an error if encryption fails.
-    pub fn get_encrypted_update(&self) -> Result<EncryptedOp> {
+    pub fn get_encrypted_update(&mut self) -> Result<EncryptedOp> {
         let update = self.doc.encode_update();
         let ciphertext = self.mls.encrypt(&update)?;
 
@@ -86,11 +86,13 @@ impl EncryptedDocument {
 
     /// Create an invite for another user to join.
     ///
+    /// Takes the key package bytes from a `PendingMember`.
+    ///
     /// # Errors
     ///
     /// Returns an error if creating the invite fails.
-    pub fn create_invite(&mut self) -> Result<Invite> {
-        let (_commit, welcome) = self.mls.add_member(&[])?;
+    pub fn create_invite(&mut self, key_package: &[u8]) -> Result<Invite> {
+        let (_commit, welcome) = self.mls.add_member(key_package)?;
 
         Ok(Invite { doc_id: self.doc.id().to_string(), welcome })
     }
@@ -112,9 +114,15 @@ mod tests {
     #[test]
     fn test_encrypted_document_sync() {
         let mut alice_doc = EncryptedDocument::create("doc1", "alice").unwrap();
-        let invite = alice_doc.create_invite().unwrap();
 
-        let mut bob_doc = EncryptedDocument::join(&invite, "bob").unwrap();
+        // Bob creates a pending member
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+
+        // Alice creates invite for Bob
+        let invite = alice_doc.create_invite(bob_pending.key_package()).unwrap();
+
+        // Bob joins using the invite
+        let mut bob_doc = EncryptedDocument::join(&invite, bob_pending).unwrap();
 
         // Alice edits
         alice_doc.insert(0, "Hello");
@@ -128,17 +136,24 @@ mod tests {
     #[test]
     fn test_encrypted_op_is_not_plaintext() {
         let mut alice_doc = EncryptedDocument::create("doc1", "alice").unwrap();
+
+        // Add another member so we can encrypt
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let _invite = alice_doc.create_invite(bob_pending.key_package()).unwrap();
+
         alice_doc.insert(0, "Secret message");
 
         let encrypted_op = alice_doc.get_encrypted_update().unwrap();
 
-        // The encrypted bytes should not contain the plaintext directly
-        // Note: Current placeholder implementation doesn't truly encrypt,
-        // but the test structure is here for when real MLS is implemented
-        let _encrypted_str = String::from_utf8_lossy(&encrypted_op.ciphertext);
-        // With real encryption, this assertion would pass:
-        // assert!(!_encrypted_str.contains("Secret"));
-        // For now, we just verify the op was created
+        // The encrypted bytes should not contain the plaintext
+        assert!(
+            !encrypted_op.ciphertext
+                .windows("Secret".len())
+                .any(|w| w == b"Secret"),
+            "Ciphertext should not contain plaintext"
+        );
+
+        // Verify the op was created
         assert!(!encrypted_op.ciphertext.is_empty());
     }
 }

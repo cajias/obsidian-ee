@@ -10,4 +10,6 @@ pub mod relay;
 pub mod routing;
 pub mod storage;
 
-pub use relay::RelayServer;
+pub use relay::{BoundServer, ClientHandle, RelayServer, ServerHandle};
+pub use routing::MessageRouter;
+pub use storage::OfflineQueue;
