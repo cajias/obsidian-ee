@@ -30,7 +30,7 @@ pub struct ClientHandle {
 impl ClientHandle {
     /// Create a new client handle.
     #[must_use]
-    pub fn new(user_id: String, tx: mpsc::UnboundedSender<ServerMessage>) -> Self {
+    pub const fn new(user_id: String, tx: mpsc::UnboundedSender<ServerMessage>) -> Self {
         Self { user_id, tx }
     }
 

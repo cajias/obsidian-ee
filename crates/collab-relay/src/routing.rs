@@ -69,15 +69,17 @@ impl MessageRouter {
     ///
     /// Returns the number of clients the message was sent to.
     pub async fn route_message(&self, doc_id: &str, from_user: &str, message: ServerMessage) -> usize {
-        let subs = self.subscriptions.read().await;
-        let clients = self.clients.read().await;
-
-        let Some(subscribers) = subs.get(doc_id) else {
-            return 0;
+        let subscribers: Vec<String> = {
+            let subs = self.subscriptions.read().await;
+            match subs.get(doc_id) {
+                Some(set) => set.iter().cloned().collect(),
+                None => return 0,
+            }
         };
 
+        let clients = self.clients.read().await;
         let mut sent_count = 0;
-        for subscriber_id in subscribers {
+        for subscriber_id in &subscribers {
             // Don't send to the sender
             if subscriber_id == from_user {
                 continue;
@@ -89,6 +91,7 @@ impl MessageRouter {
                 }
             }
         }
+        drop(clients);
 
         sent_count
     }

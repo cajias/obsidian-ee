@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 /// Stores messages for offline clients.
 ///
-/// In-memory implementation for now; will be backed by DynamoDB later.
+/// In-memory implementation for now; will be backed by `DynamoDB` later.
 pub struct OfflineQueue {
     /// Queued messages per user.
     queues: Arc<RwLock<HashMap<UserId, VecDeque<ServerMessage>>>>,
@@ -51,6 +51,7 @@ impl OfflineQueue {
         while queue.len() > self.max_per_user {
             queue.pop_front();
         }
+        drop(queues);
     }
 
     /// Retrieve and clear all queued messages for a user.
@@ -121,7 +122,9 @@ mod tests {
         for (i, msg) in messages.iter().enumerate() {
             match msg {
                 ServerMessage::YrsUpdate { encrypted, .. } => {
-                    assert_eq!(encrypted[0], (i + 1) as u8);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let expected = (i + 1) as u8;
+                    assert_eq!(encrypted[0], expected);
                 }
                 _ => panic!("Expected YrsUpdate"),
             }
@@ -151,7 +154,9 @@ mod tests {
         for (i, msg) in messages.iter().enumerate() {
             match msg {
                 ServerMessage::YrsUpdate { encrypted, .. } => {
-                    assert_eq!(encrypted[0], (i + 3) as u8);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let expected = (i + 3) as u8;
+                    assert_eq!(encrypted[0], expected);
                 }
                 _ => panic!("Expected YrsUpdate"),
             }

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Returns an error if document creation fails.
 pub fn init(doc_id: &str, user_id: &str, state_file: Option<&Path>) -> anyhow::Result<InitResult> {
-    let doc = EncryptedDocument::create(doc_id, user_id)?;
+    let _doc = EncryptedDocument::create(doc_id, user_id)?;
 
     // Save state if requested
     if let Some(path) = state_file {
@@ -174,7 +174,7 @@ pub struct InviteResult {
 /// Join an existing collaborative document.
 ///
 /// Note: This is a simplified version. In a real implementation,
-/// we'd need to persist the PendingMember state from keygen.
+/// we'd need to persist the `PendingMember` state from keygen.
 ///
 /// # Errors
 ///
@@ -261,7 +261,7 @@ pub fn demo(doc_id: &str) -> anyhow::Result<DemoResult> {
 
     // Bob receives and decrypts
     bob_doc.apply_encrypted_update(&encrypted_update)?;
-    let bob_content = bob_doc.get_content();
+    let _bob_content = bob_doc.get_content();
 
     // Bob responds
     bob_doc.insert(17, " Hi from Bob!");
@@ -325,16 +325,16 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result used for error propagation at call sites
 fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    fn decode_char(c: u8) -> Option<u8> {
+    const fn decode_char(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
             b'a'..=b'z' => Some(c - b'a' + 26),
             b'0'..=b'9' => Some(c - b'0' + 52),
             b'+' => Some(62),
             b'/' => Some(63),
-            b'=' => None,
-            _ => None,
+            _ => None, // includes b'=' padding
         }
     }
 
@@ -382,7 +382,8 @@ mod tests {
     #[test]
     fn test_base64_key_package_roundtrip() {
         // Simulate a realistic key package size
-        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let data: Vec<u8> = (0u16..500).map(|i| (i % 256) as u8).collect();
         let encoded = base64_encode(&data);
         let decoded = base64_decode(&encoded).unwrap();
         assert_eq!(decoded, data);

@@ -99,9 +99,8 @@ impl PendingMember {
         let mls_message = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
             .map_err(|e| Error::Mls(format!("Failed to deserialize welcome: {e:?}")))?;
 
-        let welcome = match mls_message.extract() {
-            MlsMessageBodyIn::Welcome(w) => w,
-            _ => return Err(Error::Mls("Expected welcome message".to_string())),
+        let MlsMessageBodyIn::Welcome(welcome) = mls_message.extract() else {
+            return Err(Error::Mls("Expected welcome message".to_string()));
         };
 
         // Join configuration
