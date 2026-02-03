@@ -32,10 +32,7 @@ impl OfflineQueue {
     /// Create a new offline queue with a custom max messages per user.
     #[must_use]
     pub fn with_max_per_user(max_per_user: usize) -> Self {
-        Self {
-            queues: Arc::new(RwLock::new(HashMap::new())),
-            max_per_user,
-        }
+        Self { queues: Arc::new(RwLock::new(HashMap::new())), max_per_user }
     }
 
     /// Queue a message for an offline user.
@@ -59,18 +56,13 @@ impl OfflineQueue {
     /// Returns messages in the order they were queued (FIFO).
     pub async fn drain(&self, user_id: &str) -> Vec<ServerMessage> {
         let mut queues = self.queues.write().await;
-        queues
-            .remove(user_id)
-            .map(Vec::from)
-            .unwrap_or_default()
+        queues.remove(user_id).map(Vec::from).unwrap_or_default()
     }
 
     /// Check if there are queued messages for a user.
     pub async fn has_messages(&self, user_id: &str) -> bool {
         let queues = self.queues.read().await;
-        queues
-            .get(user_id)
-            .is_some_and(|q| !q.is_empty())
+        queues.get(user_id).is_some_and(|q| !q.is_empty())
     }
 
     /// Get the number of queued messages for a user.

@@ -28,10 +28,7 @@ impl MessageRouter {
 
     /// Register a client for message routing.
     pub async fn register_client(&self, handle: ClientHandle) {
-        self.clients
-            .write()
-            .await
-            .insert(handle.user_id.clone(), handle);
+        self.clients.write().await.insert(handle.user_id.clone(), handle);
     }
 
     /// Unregister a client.
@@ -68,7 +65,12 @@ impl MessageRouter {
     /// Route a message to all subscribers of a document except the sender.
     ///
     /// Returns the number of clients the message was sent to.
-    pub async fn route_message(&self, doc_id: &str, from_user: &str, message: ServerMessage) -> usize {
+    pub async fn route_message(
+        &self,
+        doc_id: &str,
+        from_user: &str,
+        message: ServerMessage,
+    ) -> usize {
         let subscribers: Vec<String> = {
             let subs = self.subscriptions.read().await;
             match subs.get(doc_id) {
@@ -99,21 +101,12 @@ impl MessageRouter {
     /// Get all subscribers for a document.
     #[cfg(test)]
     pub async fn get_subscribers(&self, doc_id: &str) -> HashSet<String> {
-        self.subscriptions
-            .read()
-            .await
-            .get(doc_id)
-            .cloned()
-            .unwrap_or_default()
+        self.subscriptions.read().await.get(doc_id).cloned().unwrap_or_default()
     }
 
     /// Check if a user is subscribed to a document.
     pub async fn is_subscribed(&self, user_id: &str, doc_id: &str) -> bool {
-        self.subscriptions
-            .read()
-            .await
-            .get(doc_id)
-            .is_some_and(|subs| subs.contains(user_id))
+        self.subscriptions.read().await.get(doc_id).is_some_and(|subs| subs.contains(user_id))
     }
 }
 

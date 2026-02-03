@@ -51,9 +51,9 @@ impl PendingMember {
         // Generate signature keys
         let signature_keys = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
             .map_err(|e| Error::Mls(format!("Failed to generate signature keys: {e:?}")))?;
-        signature_keys.store(crypto.storage()).map_err(|e| {
-            Error::Mls(format!("Failed to store signature keys: {e:?}"))
-        })?;
+        signature_keys
+            .store(crypto.storage())
+            .map_err(|e| Error::Mls(format!("Failed to store signature keys: {e:?}")))?;
 
         // Create basic credential
         let credential = BasicCredential::new(user_id.as_bytes().to_vec());
@@ -104,20 +104,13 @@ impl PendingMember {
         };
 
         // Join configuration
-        let join_config = MlsGroupJoinConfig::builder()
-            .use_ratchet_tree_extension(true)
-            .build();
+        let join_config = MlsGroupJoinConfig::builder().use_ratchet_tree_extension(true).build();
 
         // Join the group
-        let group = StagedWelcome::new_from_welcome(
-            &self.crypto,
-            &join_config,
-            welcome,
-            None,
-        )
-        .map_err(|e| Error::Mls(format!("Failed to stage welcome: {e:?}")))?
-        .into_group(&self.crypto)
-        .map_err(|e| Error::Mls(format!("Failed to join group: {e:?}")))?;
+        let group = StagedWelcome::new_from_welcome(&self.crypto, &join_config, welcome, None)
+            .map_err(|e| Error::Mls(format!("Failed to stage welcome: {e:?}")))?
+            .into_group(&self.crypto)
+            .map_err(|e| Error::Mls(format!("Failed to join group: {e:?}")))?;
 
         Ok(MlsDocumentGroup {
             user_id: self.user_id,
@@ -143,9 +136,9 @@ impl MlsDocumentGroup {
         // Generate signature keys
         let signature_keys = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
             .map_err(|e| Error::Mls(format!("Failed to generate signature keys: {e:?}")))?;
-        signature_keys.store(crypto.storage()).map_err(|e| {
-            Error::Mls(format!("Failed to store signature keys: {e:?}"))
-        })?;
+        signature_keys
+            .store(crypto.storage())
+            .map_err(|e| Error::Mls(format!("Failed to store signature keys: {e:?}")))?;
 
         // Create basic credential
         let credential = BasicCredential::new(user_id.as_bytes().to_vec());
@@ -161,13 +154,9 @@ impl MlsDocumentGroup {
             .build();
 
         // Create the group
-        let group = MlsGroup::new(
-            &crypto,
-            &signature_keys,
-            &group_config,
-            credential_with_key.clone(),
-        )
-        .map_err(|e| Error::Mls(format!("Failed to create MLS group: {e:?}")))?;
+        let group =
+            MlsGroup::new(&crypto, &signature_keys, &group_config, credential_with_key.clone())
+                .map_err(|e| Error::Mls(format!("Failed to create MLS group: {e:?}")))?;
 
         // Generate a key package for potential future use
         let key_package = Self::create_key_package(&crypto, &signature_keys, &credential_with_key)?;
@@ -286,15 +275,16 @@ impl MlsDocumentGroup {
 
         let processed = self
             .group
-            .process_message(&self.crypto, message.try_into_protocol_message().map_err(|_| {
-                Error::Mls("Expected protocol message".to_string())
-            })?)
+            .process_message(
+                &self.crypto,
+                message
+                    .try_into_protocol_message()
+                    .map_err(|_| Error::Mls("Expected protocol message".to_string()))?,
+            )
             .map_err(|e| Error::Mls(format!("Failed to process message: {e:?}")))?;
 
         match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                Ok(app_msg.into_bytes())
-            }
+            ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
             ProcessedMessageContent::ProposalMessage(_) => {
                 Err(Error::Mls("Unexpected proposal message".to_string()))
             }
@@ -337,10 +327,7 @@ mod tests {
         assert!(key_package.len() > 100, "Key package should be substantial MLS data");
 
         // Key package should not be all zeros (placeholder check)
-        assert!(
-            key_package.iter().any(|&b| b != 0),
-            "Key package should not be all zeros"
-        );
+        assert!(key_package.iter().any(|&b| b != 0), "Key package should not be all zeros");
 
         assert_eq!(group.epoch(), 0);
         assert_eq!(group.user_id(), "alice");
@@ -393,9 +380,7 @@ mod tests {
 
         // Ciphertext should NOT contain plaintext
         assert!(
-            !ciphertext
-                .windows(plaintext.len())
-                .any(|w| w == plaintext),
+            !ciphertext.windows(plaintext.len()).any(|w| w == plaintext),
             "Ciphertext should not contain plaintext"
         );
 

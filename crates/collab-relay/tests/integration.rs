@@ -21,10 +21,7 @@ impl TestServer {
     async fn start() -> Self {
         let server = RelayServer::new();
         let bound = server.bind("127.0.0.1:0").await.unwrap();
-        Self {
-            addr: bound.addr,
-            handle: bound.handle,
-        }
+        Self { addr: bound.addr, handle: bound.handle }
     }
 
     fn url(&self) -> String {
@@ -63,16 +60,11 @@ impl TestClient {
             }
         }
     }
-
 }
 
 /// Helper to identify a client.
 async fn identify(client: &mut TestClient, user_id: &str) {
-    client
-        .send(ClientMessage::Identify {
-            user_id: user_id.into(),
-        })
-        .await;
+    client.send(ClientMessage::Identify { user_id: user_id.into() }).await;
     let response = client.recv().await;
     assert!(matches!(
         response,
@@ -82,11 +74,7 @@ async fn identify(client: &mut TestClient, user_id: &str) {
 
 /// Helper to subscribe a client to a document.
 async fn subscribe(client: &mut TestClient, doc_id: &str) {
-    client
-        .send(ClientMessage::Subscribe {
-            doc_id: doc_id.into(),
-        })
-        .await;
+    client.send(ClientMessage::Subscribe { doc_id: doc_id.into() }).await;
     let response = client.recv().await;
     assert!(matches!(
         response,
@@ -139,9 +127,7 @@ async fn test_multiple_clients_concurrent_connect() {
                 let (mut write, mut read) = ws.split();
 
                 // Identify
-                let msg = ClientMessage::Identify {
-                    user_id: format!("user{i}"),
-                };
+                let msg = ClientMessage::Identify { user_id: format!("user{i}") };
                 let json = serde_json::to_string(&msg).unwrap();
                 write.send(Message::Text(json)).await.unwrap();
 
@@ -173,11 +159,7 @@ async fn test_subscribe_unsubscribe_flow() {
     subscribe(&mut client, "doc1").await;
 
     // Unsubscribe
-    client
-        .send(ClientMessage::Unsubscribe {
-            doc_id: "doc1".into(),
-        })
-        .await;
+    client.send(ClientMessage::Unsubscribe { doc_id: "doc1".into() }).await;
 
     let response = client.recv().await;
     assert!(matches!(
@@ -192,20 +174,10 @@ async fn test_error_on_subscribe_without_identify() {
     let mut client = TestClient::connect(&server).await;
 
     // Try to subscribe without identifying first
-    client
-        .send(ClientMessage::Subscribe {
-            doc_id: "doc1".into(),
-        })
-        .await;
+    client.send(ClientMessage::Subscribe { doc_id: "doc1".into() }).await;
 
     let response = client.recv().await;
-    assert!(matches!(
-        response,
-        ServerMessage::Error {
-            code: ErrorCode::NotIdentified,
-            ..
-        }
-    ));
+    assert!(matches!(response, ServerMessage::Error { code: ErrorCode::NotIdentified, .. }));
 }
 
 #[tokio::test]
@@ -224,13 +196,7 @@ async fn test_error_on_yrs_update_without_identify() {
         .await;
 
     let response = client.recv().await;
-    assert!(matches!(
-        response,
-        ServerMessage::Error {
-            code: ErrorCode::NotIdentified,
-            ..
-        }
-    ));
+    assert!(matches!(response, ServerMessage::Error { code: ErrorCode::NotIdentified, .. }));
 }
 
 #[tokio::test]
@@ -246,11 +212,7 @@ async fn test_multiple_document_subscriptions() {
     subscribe(&mut client, "doc3").await;
 
     // Unsubscribe from one
-    client
-        .send(ClientMessage::Unsubscribe {
-            doc_id: "doc2".into(),
-        })
-        .await;
+    client.send(ClientMessage::Unsubscribe { doc_id: "doc2".into() }).await;
 
     let response = client.recv().await;
     assert!(matches!(
@@ -274,11 +236,5 @@ async fn test_mls_handshake_requires_identify() {
         .await;
 
     let response = client.recv().await;
-    assert!(matches!(
-        response,
-        ServerMessage::Error {
-            code: ErrorCode::NotIdentified,
-            ..
-        }
-    ));
+    assert!(matches!(response, ServerMessage::Error { code: ErrorCode::NotIdentified, .. }));
 }

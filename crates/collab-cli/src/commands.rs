@@ -79,17 +79,18 @@ pub fn keygen(user_id: &str, output_file: &Path) -> anyhow::Result<KeygenResult>
     // We can't easily serialize the full PendingMember (contains crypto state),
     // so we save the key package and rely on regenerating for join.
     // In a real implementation, we'd serialize the crypto state properly.
-    let output = KeygenOutput {
-        user_id: user_id.to_string(),
-        key_package: base64_encode(&key_package),
-    };
+    let output =
+        KeygenOutput { user_id: user_id.to_string(), key_package: base64_encode(&key_package) };
 
     fs::write(output_file, serde_json::to_string_pretty(&output)?)?;
 
     Ok(KeygenResult {
         user_id: user_id.to_string(),
         key_package_file: output_file.display().to_string(),
-        message: format!("Generated key package. Share '{0}' with the document owner.", output_file.display()),
+        message: format!(
+            "Generated key package. Share '{0}' with the document owner.",
+            output_file.display()
+        ),
     })
 }
 
@@ -156,7 +157,11 @@ pub fn create_invite(
     Ok(InviteResult {
         doc_id: invite.doc_id,
         invite_file: invite_output.display().to_string(),
-        message: format!("Invite created. Share '{0}' with {1}.", invite_output.display(), keygen.user_id),
+        message: format!(
+            "Invite created. Share '{0}' with {1}.",
+            invite_output.display(),
+            keygen.user_id
+        ),
     })
 }
 
@@ -179,7 +184,11 @@ pub struct InviteResult {
 /// # Errors
 ///
 /// Returns an error if joining fails.
-pub fn join(invite_file: &Path, user_id: &str, state_output: Option<&Path>) -> anyhow::Result<JoinResult> {
+pub fn join(
+    invite_file: &Path,
+    user_id: &str,
+    state_output: Option<&Path>,
+) -> anyhow::Result<JoinResult> {
     // Load the invite
     let invite_content = fs::read_to_string(invite_file)?;
     let invite: Invite = serde_json::from_str(&invite_content)?;

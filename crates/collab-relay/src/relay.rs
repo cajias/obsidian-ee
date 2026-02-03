@@ -69,10 +69,7 @@ impl RelayServer {
     #[must_use]
     pub fn new() -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
-        Self {
-            clients: Arc::new(RwLock::new(HashMap::new())),
-            shutdown_tx,
-        }
+        Self { clients: Arc::new(RwLock::new(HashMap::new())), shutdown_tx }
     }
 
     /// Bind and start the relay server on the given address.
@@ -87,9 +84,7 @@ impl RelayServer {
         let local_addr = listener.local_addr()?;
 
         let shutdown_tx = self.shutdown_tx.clone();
-        let handle = ServerHandle {
-            shutdown_tx: shutdown_tx.clone(),
-        };
+        let handle = ServerHandle { shutdown_tx: shutdown_tx.clone() };
 
         let server = Arc::new(self);
 
@@ -123,14 +118,14 @@ impl RelayServer {
             }
         });
 
-        Ok(BoundServer {
-            addr: local_addr,
-            handle,
-        })
+        Ok(BoundServer { addr: local_addr, handle })
     }
 
     /// Handle a single WebSocket connection.
-    async fn handle_connection(&self, stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_connection(
+        &self,
+        stream: TcpStream,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ws_stream = tokio_tungstenite::accept_async(stream).await?;
         let (write, mut read) = ws_stream.split();
 
@@ -289,10 +284,7 @@ mod tests {
         async fn start() -> Self {
             let server = RelayServer::new();
             let bound = server.bind("127.0.0.1:0").await.unwrap();
-            Self {
-                addr: bound.addr,
-                handle: bound.handle,
-            }
+            Self { addr: bound.addr, handle: bound.handle }
         }
 
         fn url(&self) -> String {
@@ -346,11 +338,7 @@ mod tests {
         let server = TestServer::start().await;
         let mut client = TestClient::connect(&server).await;
 
-        client
-            .send(ClientMessage::Identify {
-                user_id: "alice".into(),
-            })
-            .await;
+        client.send(ClientMessage::Identify { user_id: "alice".into() }).await;
 
         let response = client.recv().await;
         assert!(matches!(
@@ -365,17 +353,10 @@ mod tests {
         let mut client = TestClient::connect(&server).await;
 
         // Try to subscribe without identifying first
-        client
-            .send(ClientMessage::Subscribe {
-                doc_id: "doc1".into(),
-            })
-            .await;
+        client.send(ClientMessage::Subscribe { doc_id: "doc1".into() }).await;
 
         let response = client.recv().await;
-        assert!(matches!(
-            response,
-            ServerMessage::Error { code: ErrorCode::NotIdentified, .. }
-        ));
+        assert!(matches!(response, ServerMessage::Error { code: ErrorCode::NotIdentified, .. }));
     }
 
     #[tokio::test]
@@ -384,19 +365,11 @@ mod tests {
         let mut client = TestClient::connect(&server).await;
 
         // Identify first
-        client
-            .send(ClientMessage::Identify {
-                user_id: "alice".into(),
-            })
-            .await;
+        client.send(ClientMessage::Identify { user_id: "alice".into() }).await;
         let _ = client.recv().await; // Identified response
 
         // Now subscribe
-        client
-            .send(ClientMessage::Subscribe {
-                doc_id: "doc1".into(),
-            })
-            .await;
+        client.send(ClientMessage::Subscribe { doc_id: "doc1".into() }).await;
 
         let response = client.recv().await;
         assert!(matches!(

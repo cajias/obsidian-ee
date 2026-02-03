@@ -147,9 +147,7 @@ mod tests {
 
         // The encrypted bytes should not contain the plaintext
         assert!(
-            !encrypted_op.ciphertext
-                .windows("Secret".len())
-                .any(|w| w == b"Secret"),
+            !encrypted_op.ciphertext.windows("Secret".len()).any(|w| w == b"Secret"),
             "Ciphertext should not contain plaintext"
         );
 
