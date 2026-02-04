@@ -4,16 +4,20 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use collab_proto::{ClientMessage, ErrorCode, ServerMessage};
+use collab_proto::{ClientMessage, ErrorCode, MlsMessageType, ServerMessage};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::routing::MessageRouter;
+
 /// The relay server managing WebSocket connections.
 pub struct RelayServer {
     /// Connected clients by user ID.
     clients: Arc<RwLock<HashMap<String, ClientHandle>>>,
+    /// Message router for subscriptions.
+    router: Arc<MessageRouter>,
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -69,7 +73,11 @@ impl RelayServer {
     #[must_use]
     pub fn new() -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
-        Self { clients: Arc::new(RwLock::new(HashMap::new())), shutdown_tx }
+        Self {
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            router: Arc::new(MessageRouter::new()),
+            shutdown_tx,
+        }
     }
 
     /// Bind and start the relay server on the given address.
@@ -95,6 +103,7 @@ impl RelayServer {
     }
 
     /// Handle a single WebSocket connection.
+    #[allow(clippy::too_many_lines)]
     async fn handle_connection(
         &self,
         stream: TcpStream,
@@ -148,9 +157,10 @@ impl RelayServer {
             }
         }
 
-        // Clean up: remove client from connected clients
+        // Clean up: remove client from connected clients and router
         if let Some(uid) = user_id {
             self.clients.write().await.remove(&uid);
+            self.router.unregister_client(&uid).await;
             tracing::debug!("Client {} disconnected", uid);
         }
 
@@ -170,13 +180,18 @@ impl RelayServer {
                 self.handle_identify(uid, tx, user_id).await;
             }
             ClientMessage::Subscribe { doc_id } => {
-                handle_subscribe(user_id.as_ref(), tx, doc_id);
+                self.handle_subscribe(user_id.as_ref(), tx, doc_id).await;
             }
             ClientMessage::Unsubscribe { doc_id } => {
-                handle_unsubscribe(user_id.as_ref(), tx, doc_id);
+                self.handle_unsubscribe(user_id.as_ref(), tx, doc_id).await;
             }
-            ClientMessage::YrsUpdate { .. } | ClientMessage::MlsHandshake { .. } => {
-                handle_update(user_id.as_ref(), tx);
+            ClientMessage::YrsUpdate { doc_id, encrypted, epoch, signature } => {
+                self.handle_yrs_update(user_id.as_ref(), tx, doc_id, encrypted, epoch, signature)
+                    .await;
+            }
+            ClientMessage::MlsHandshake { doc_id, payload, message_type } => {
+                self.handle_mls_handshake(user_id.as_ref(), tx, doc_id, payload, message_type)
+                    .await;
             }
         }
     }
@@ -192,12 +207,97 @@ impl RelayServer {
 
         // Store the client handle
         let handle = ClientHandle::new(uid.clone(), tx.clone());
-        self.clients.write().await.insert(uid.clone(), handle);
+        self.clients.write().await.insert(uid.clone(), handle.clone());
+
+        // Register with router for message routing
+        self.router.register_client(handle).await;
 
         *user_id = Some(uid.clone());
 
         let response = ServerMessage::Identified { user_id: uid };
         let _ = tx.send(response);
+    }
+
+    /// Handle the Subscribe message.
+    async fn handle_subscribe(
+        &self,
+        user_id: Option<&String>,
+        tx: &mpsc::UnboundedSender<ServerMessage>,
+        doc_id: String,
+    ) {
+        let Some(uid) = user_id else {
+            send_not_identified_error(tx, "subscribing");
+            return;
+        };
+
+        self.router.subscribe(uid, &doc_id).await;
+        let _ = tx.send(ServerMessage::Subscribed { doc_id });
+    }
+
+    /// Handle the Unsubscribe message.
+    async fn handle_unsubscribe(
+        &self,
+        user_id: Option<&String>,
+        tx: &mpsc::UnboundedSender<ServerMessage>,
+        doc_id: String,
+    ) {
+        let Some(uid) = user_id else {
+            send_not_identified_error(tx, "unsubscribing");
+            return;
+        };
+
+        self.router.unsubscribe(uid, &doc_id).await;
+        let _ = tx.send(ServerMessage::Unsubscribed { doc_id });
+    }
+
+    /// Handle `YrsUpdate` message - route to subscribers.
+    async fn handle_yrs_update(
+        &self,
+        user_id: Option<&String>,
+        tx: &mpsc::UnboundedSender<ServerMessage>,
+        doc_id: String,
+        encrypted: Vec<u8>,
+        epoch: u64,
+        signature: Vec<u8>,
+    ) {
+        let Some(uid) = user_id else {
+            send_not_identified_error(tx, "sending updates");
+            return;
+        };
+
+        let message = ServerMessage::YrsUpdate {
+            doc_id: doc_id.clone(),
+            from: uid.clone(),
+            encrypted,
+            epoch,
+            signature,
+        };
+
+        self.router.route_message(&doc_id, uid, message).await;
+    }
+
+    /// Handle `MlsHandshake` message - route to subscribers.
+    async fn handle_mls_handshake(
+        &self,
+        user_id: Option<&String>,
+        tx: &mpsc::UnboundedSender<ServerMessage>,
+        doc_id: String,
+        payload: Vec<u8>,
+        message_type: MlsMessageType,
+    ) {
+        let Some(uid) = user_id else {
+            send_not_identified_error(tx, "sending MLS handshake");
+            return;
+        };
+
+        let message = ServerMessage::MlsHandshake {
+            doc_id: doc_id.clone(),
+            from: uid.clone(),
+            payload,
+            message_type,
+        };
+
+        self.router.route_message(&doc_id, uid, message).await;
     }
 
     /// Get a client handle by user ID (for testing).
@@ -263,53 +363,12 @@ async fn spawn_connection_handler(server: Arc<RelayServer>, stream: TcpStream) {
     }
 }
 
-/// Handle the Subscribe message.
-fn handle_subscribe(
-    user_id: Option<&String>,
-    tx: &mpsc::UnboundedSender<ServerMessage>,
-    doc_id: String,
-) {
-    if !require_identified(user_id, tx, "subscribing") {
-        return;
-    }
-    // Subscription handling will be implemented in T11
-    let _ = tx.send(ServerMessage::Subscribed { doc_id });
-}
-
-/// Handle the Unsubscribe message.
-fn handle_unsubscribe(
-    user_id: Option<&String>,
-    tx: &mpsc::UnboundedSender<ServerMessage>,
-    doc_id: String,
-) {
-    if !require_identified(user_id, tx, "unsubscribing") {
-        return;
-    }
-    // Unsubscription handling will be implemented in T11
-    let _ = tx.send(ServerMessage::Unsubscribed { doc_id });
-}
-
-/// Handle `YrsUpdate` or `MlsHandshake` messages.
-fn handle_update(user_id: Option<&String>, tx: &mpsc::UnboundedSender<ServerMessage>) {
-    // Message routing will be implemented in T11
-    require_identified(user_id, tx, "sending updates");
-}
-
-/// Check if the user is identified, sending an error if not.
-/// Returns `true` if identified, `false` otherwise.
-fn require_identified(
-    user_id: Option<&String>,
-    tx: &mpsc::UnboundedSender<ServerMessage>,
-    action: &str,
-) -> bool {
-    if user_id.is_some() {
-        return true;
-    }
+/// Send a "not identified" error message.
+fn send_not_identified_error(tx: &mpsc::UnboundedSender<ServerMessage>, action: &str) {
     let _ = tx.send(ServerMessage::Error {
         code: ErrorCode::NotIdentified,
         message: format!("Must identify before {action}"),
     });
-    false
 }
 
 /// Forward messages from a channel to a WebSocket writer.

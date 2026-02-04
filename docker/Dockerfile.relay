@@ -7,6 +7,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY tests/ tests/
+COPY xtask/ xtask/
 
 # Build release binary
 RUN cargo build --release -p collab-relay
