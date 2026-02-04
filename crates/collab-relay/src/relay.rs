@@ -137,7 +137,9 @@ impl RelayServer {
                                         code: ErrorCode::InvalidMessage,
                                         message: format!("Invalid message format: {e}"),
                                     };
-                                    let _ = tx.send(error);
+                                    if let Err(e) = tx.send(error) {
+                                        tracing::warn!(error = %e, "Failed to send error response to client");
+                                    }
                                 }
                             }
                         }
@@ -165,6 +167,7 @@ impl RelayServer {
         }
 
         writer_task.abort();
+        let _ = writer_task.await;
         Ok(())
     }
 
@@ -215,7 +218,9 @@ impl RelayServer {
         *user_id = Some(uid.clone());
 
         let response = ServerMessage::Identified { user_id: uid };
-        let _ = tx.send(response);
+        if let Err(e) = tx.send(response) {
+            tracing::warn!(error = %e, "Failed to send Identified response to client");
+        }
     }
 
     /// Handle the Subscribe message.
@@ -231,7 +236,9 @@ impl RelayServer {
         };
 
         self.router.subscribe(uid, &doc_id).await;
-        let _ = tx.send(ServerMessage::Subscribed { doc_id });
+        if let Err(e) = tx.send(ServerMessage::Subscribed { doc_id }) {
+            tracing::warn!(error = %e, "Failed to send Subscribed response to client");
+        }
     }
 
     /// Handle the Unsubscribe message.
@@ -247,7 +254,9 @@ impl RelayServer {
         };
 
         self.router.unsubscribe(uid, &doc_id).await;
-        let _ = tx.send(ServerMessage::Unsubscribed { doc_id });
+        if let Err(e) = tx.send(ServerMessage::Unsubscribed { doc_id }) {
+            tracing::warn!(error = %e, "Failed to send Unsubscribed response to client");
+        }
     }
 
     /// Handle `YrsUpdate` message - route to subscribers.
@@ -365,10 +374,12 @@ async fn spawn_connection_handler(server: Arc<RelayServer>, stream: TcpStream) {
 
 /// Send a "not identified" error message.
 fn send_not_identified_error(tx: &mpsc::UnboundedSender<ServerMessage>, action: &str) {
-    let _ = tx.send(ServerMessage::Error {
+    if let Err(e) = tx.send(ServerMessage::Error {
         code: ErrorCode::NotIdentified,
         message: format!("Must identify before {action}"),
-    });
+    }) {
+        tracing::warn!(error = %e, action = %action, "Failed to send NotIdentified error to client");
+    }
 }
 
 /// Forward messages from a channel to a WebSocket writer.
@@ -380,11 +391,16 @@ async fn forward_messages_to_websocket<W>(
     W::Error: std::fmt::Debug,
 {
     while let Some(msg) = rx.recv().await {
-        let Ok(json) = serde_json::to_string(&msg) else {
-            continue;
+        let json = match serde_json::to_string(&msg) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize ServerMessage to JSON");
+                continue;
+            }
         };
         let mut writer = write.lock().await;
-        if writer.send(Message::Text(json)).await.is_err() {
+        if let Err(e) = writer.send(Message::Text(json)).await {
+            tracing::warn!(error = ?e, "Failed to send message over WebSocket");
             break;
         }
     }

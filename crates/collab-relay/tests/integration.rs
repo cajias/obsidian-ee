@@ -109,10 +109,18 @@ async fn test_full_flow_connect_identify_subscribe_exchange() {
         })
         .await;
 
-    // Bob should receive the update
-    // Note: Current implementation doesn't route messages yet (T11 integration pending)
-    // This test verifies the protocol flow works
-    // The actual routing is tested in routing.rs unit tests
+    // Bob should receive the update from Alice
+    let response = bob.recv().await;
+    match response {
+        ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch, signature } => {
+            assert_eq!(doc_id, "doc1");
+            assert_eq!(from, "alice");
+            assert_eq!(encrypted, vec![1, 2, 3, 4, 5]);
+            assert_eq!(epoch, 1);
+            assert_eq!(signature, vec![0xAB, 0xCD]);
+        }
+        other => panic!("Expected YrsUpdate, got {:?}", other),
+    }
 }
 
 #[tokio::test]

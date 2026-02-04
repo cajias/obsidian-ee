@@ -66,6 +66,7 @@ impl MessageRouter {
     /// Route a message to all subscribers of a document except the sender.
     ///
     /// Returns the number of clients the message was sent to.
+    #[allow(clippy::excessive_nesting, clippy::significant_drop_tightening)]
     pub async fn route_message(
         &self,
         doc_id: &str,
@@ -81,13 +82,22 @@ impl MessageRouter {
         };
 
         let clients = self.clients.read().await;
-        let sent_count = subscribers
-            .iter()
-            .filter(|id| *id != from_user)
-            .filter_map(|id| clients.get(id))
-            .filter(|client| client.send(message.clone()).is_ok())
-            .count();
-        drop(clients);
+        let mut sent_count = 0;
+
+        for subscriber_id in subscribers.iter().filter(|id| *id != from_user) {
+            let Some(client) = clients.get(subscriber_id) else {
+                continue;
+            };
+            if client.send(message.clone()).is_ok() {
+                sent_count += 1;
+            } else {
+                tracing::warn!(
+                    subscriber = %subscriber_id,
+                    doc_id = %doc_id,
+                    "Failed to route message to subscriber - channel closed"
+                );
+            }
+        }
 
         sent_count
     }

@@ -162,6 +162,7 @@ fn analyze_crate(krate: &str) {
     }
 
     let Ok(json) = String::from_utf8(out.stdout) else {
+        eprintln!("  Warning: Invalid UTF-8 output from analysis for {krate}");
         return;
     };
     report_complexity_issues(&json, krate);
@@ -171,6 +172,7 @@ fn report_complexity_issues(json: &str, krate: &str) {
     // Parse and report high-complexity functions
     // Thresholds: cyclomatic > 15, cognitive > 25
     let Ok(data) = serde_json::from_str::<serde_json::Value>(json) else {
+        eprintln!("  Warning: Failed to parse analysis output for {krate}");
         return;
     };
 
@@ -240,11 +242,17 @@ fn check_function_complexity(space: &serde_json::Value) -> Option<String> {
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> ExitCode {
-    let status = Command::new(cmd).args(args).status().expect("Failed to execute command");
-
-    if status.success() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    match Command::new(cmd).args(args).status() {
+        Ok(status) => {
+            if status.success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to execute '{cmd}': {e}");
+            ExitCode::FAILURE
+        }
     }
 }
