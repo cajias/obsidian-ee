@@ -10,7 +10,7 @@ mod encryption;
 mod mls;
 
 pub use document::CollabDocument;
-pub use encryption::{EncryptedDocument, Invite};
+pub use encryption::{EncryptedDocument, EncryptedOp, Invite};
 pub use mls::{MlsDocumentGroup, PendingMember};
 
 /// Document identifier type.
