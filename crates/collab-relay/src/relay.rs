@@ -362,14 +362,16 @@ fn handle_accept_result(
     };
     tracing::debug!("New connection from {}", peer_addr);
     let server = Arc::clone(server);
-    tokio::spawn(spawn_connection_handler(server, stream));
+    spawn_connection_handler(server, stream);
 }
 
 /// Spawn a connection handler task.
-async fn spawn_connection_handler(server: Arc<RelayServer>, stream: TcpStream) {
-    if let Err(e) = server.handle_connection(stream).await {
-        tracing::error!("Connection error: {}", e);
-    }
+fn spawn_connection_handler(server: Arc<RelayServer>, stream: TcpStream) {
+    tokio::spawn(async move {
+        if let Err(e) = server.handle_connection(stream).await {
+            tracing::error!("Connection error: {}", e);
+        }
+    });
 }
 
 /// Send a "not identified" error message.
