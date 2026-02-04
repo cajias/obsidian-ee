@@ -80,7 +80,8 @@ enum Commands {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
     let cli = Cli::parse();
@@ -103,8 +104,7 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::Connect { relay_url, user, doc } => {
-            println!("Connecting to {relay_url} as {user} for doc {doc}");
-            println!("Note: Real-time connection not yet implemented.");
+            collab_cli::commands::connect(&relay_url, &user, &doc).await?;
         }
         Commands::Demo { doc_id } => {
             let result = collab_cli::commands::demo(&doc_id)?;

@@ -5,7 +5,10 @@ use std::path::Path;
 
 use collab_core::{EncryptedDocument, MlsDocumentGroup, PendingMember};
 use collab_proto::Invite;
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
 /// Initialize a new collaborative document.
 ///
@@ -299,6 +302,69 @@ pub struct DemoResult {
     pub bob_content: String,
     /// Human-readable message.
     pub message: String,
+}
+
+/// Connect to a relay server and listen for updates.
+///
+/// # Errors
+///
+/// Returns an error if connection fails.
+pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Result<()> {
+    use collab_proto::{ClientMessage, ServerMessage};
+
+    println!("Connecting to {relay_url} as {user_id} for document {doc_id}...");
+
+    // Connect to relay
+    let (ws, _) = connect_async(relay_url).await?;
+    let (mut write, mut read) = ws.split();
+
+    // Identify
+    let identify = ClientMessage::Identify { user_id: user_id.to_string() };
+    write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
+
+    // Subscribe to document
+    let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string() };
+    write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
+
+    println!("Connected! Listening for updates...");
+    println!("(Press Ctrl+C to exit)");
+
+    // Simple message loop
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                let server_msg: ServerMessage = serde_json::from_str(&text)?;
+                match server_msg {
+                    ServerMessage::Identified { user_id } => {
+                        println!("Identified as {user_id}");
+                    }
+                    ServerMessage::Subscribed { doc_id } => {
+                        println!("Subscribed to {doc_id}");
+                    }
+                    ServerMessage::YrsUpdate { from, doc_id, encrypted, .. } => {
+                        println!("Update from {from} for {doc_id} ({} bytes)", encrypted.len());
+                    }
+                    ServerMessage::Error { message, .. } => {
+                        eprintln!("Error: {message}");
+                    }
+                    _ => {
+                        println!("{server_msg:?}");
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => {
+                println!("Connection closed");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 // Helper functions for base64 encoding/decoding using standard approach
