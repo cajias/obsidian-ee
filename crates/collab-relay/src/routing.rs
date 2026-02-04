@@ -54,17 +54,19 @@ impl MessageRouter {
     /// Unsubscribe a user from a document.
     pub async fn unsubscribe(&self, user_id: &str, doc_id: &str) {
         let mut subs = self.subscriptions.write().await;
-        if let Some(subscribers) = subs.get_mut(doc_id) {
-            subscribers.remove(user_id);
-            if subscribers.is_empty() {
-                subs.remove(doc_id);
-            }
+        let Some(subscribers) = subs.get_mut(doc_id) else {
+            return;
+        };
+        subscribers.remove(user_id);
+        if subscribers.is_empty() {
+            subs.remove(doc_id);
         }
     }
 
     /// Route a message to all subscribers of a document except the sender.
     ///
     /// Returns the number of clients the message was sent to.
+    #[allow(clippy::excessive_nesting, clippy::significant_drop_tightening)]
     pub async fn route_message(
         &self,
         doc_id: &str,
@@ -81,19 +83,21 @@ impl MessageRouter {
 
         let clients = self.clients.read().await;
         let mut sent_count = 0;
-        for subscriber_id in &subscribers {
-            // Don't send to the sender
-            if subscriber_id == from_user {
-                continue;
-            }
 
-            if let Some(client) = clients.get(subscriber_id) {
-                if client.send(message.clone()).is_ok() {
-                    sent_count += 1;
-                }
+        for subscriber_id in subscribers.iter().filter(|id| *id != from_user) {
+            let Some(client) = clients.get(subscriber_id) else {
+                continue;
+            };
+            if client.send(message.clone()).is_ok() {
+                sent_count += 1;
+            } else {
+                tracing::warn!(
+                    subscriber = %subscriber_id,
+                    doc_id = %doc_id,
+                    "Failed to route message to subscriber - channel closed"
+                );
             }
         }
-        drop(clients);
 
         sent_count
     }
@@ -129,6 +133,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
     async fn test_subscribe_and_receive() {
         let router = MessageRouter::new();
 

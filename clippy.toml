@@ -1,0 +1,17 @@
+# Clippy configuration for obsidian-ee
+# https://doc.rust-lang.org/clippy/configuration.html
+
+# Flag functions longer than 50 lines
+too-many-lines-threshold = 50
+
+# Flag excessive nesting (more than 3 levels deep)
+excessive-nesting-threshold = 3
+
+# Cognitive complexity threshold (deprecated but still available)
+cognitive-complexity-threshold = 25
+
+# Allow up to 7 function arguments before warning
+too-many-arguments-threshold = 7
+
+# Type complexity threshold
+type-complexity-threshold = 250

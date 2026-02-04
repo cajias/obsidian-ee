@@ -53,6 +53,7 @@ impl TestClient {
         self.write.send(Message::Text(json)).await.unwrap();
     }
 
+    #[allow(clippy::excessive_nesting)]
     async fn recv(&mut self) -> ServerMessage {
         loop {
             if let Some(Ok(Message::Text(text))) = self.read.next().await {
@@ -108,13 +109,22 @@ async fn test_full_flow_connect_identify_subscribe_exchange() {
         })
         .await;
 
-    // Bob should receive the update
-    // Note: Current implementation doesn't route messages yet (T11 integration pending)
-    // This test verifies the protocol flow works
-    // The actual routing is tested in routing.rs unit tests
+    // Bob should receive the update from Alice
+    let response = bob.recv().await;
+    match response {
+        ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch, signature } => {
+            assert_eq!(doc_id, "doc1");
+            assert_eq!(from, "alice");
+            assert_eq!(encrypted, vec![1, 2, 3, 4, 5]);
+            assert_eq!(epoch, 1);
+            assert_eq!(signature, vec![0xAB, 0xCD]);
+        }
+        other => panic!("Expected YrsUpdate, got {:?}", other),
+    }
 }
 
 #[tokio::test]
+#[allow(clippy::excessive_nesting)]
 async fn test_multiple_clients_concurrent_connect() {
     let server = TestServer::start().await;
 
@@ -132,12 +142,11 @@ async fn test_multiple_clients_concurrent_connect() {
                 write.send(Message::Text(json)).await.unwrap();
 
                 // Wait for response
-                if let Some(Ok(Message::Text(text))) = read.next().await {
-                    let response: ServerMessage = serde_json::from_str(&text).unwrap();
-                    matches!(response, ServerMessage::Identified { .. })
-                } else {
-                    false
-                }
+                let Some(Ok(Message::Text(text))) = read.next().await else {
+                    return false;
+                };
+                let response: ServerMessage = serde_json::from_str(&text).unwrap();
+                matches!(response, ServerMessage::Identified { .. })
             })
         })
         .collect();
