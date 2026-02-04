@@ -304,6 +304,29 @@ pub struct DemoResult {
     pub message: String,
 }
 
+/// Handle a server message by printing appropriate output.
+fn handle_server_message(server_msg: collab_proto::ServerMessage) {
+    use collab_proto::ServerMessage;
+
+    match server_msg {
+        ServerMessage::Identified { user_id } => {
+            println!("Identified as {user_id}");
+        }
+        ServerMessage::Subscribed { doc_id } => {
+            println!("Subscribed to {doc_id}");
+        }
+        ServerMessage::YrsUpdate { from, doc_id, encrypted, .. } => {
+            println!("Update from {from} for {doc_id} ({} bytes)", encrypted.len());
+        }
+        ServerMessage::Error { message, .. } => {
+            eprintln!("Error: {message}");
+        }
+        _ => {
+            println!("{server_msg:?}");
+        }
+    }
+}
+
 /// Connect to a relay server and listen for updates.
 ///
 /// # Errors
@@ -334,23 +357,7 @@ pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Re
         match msg {
             Ok(Message::Text(text)) => {
                 let server_msg: ServerMessage = serde_json::from_str(&text)?;
-                match server_msg {
-                    ServerMessage::Identified { user_id } => {
-                        println!("Identified as {user_id}");
-                    }
-                    ServerMessage::Subscribed { doc_id } => {
-                        println!("Subscribed to {doc_id}");
-                    }
-                    ServerMessage::YrsUpdate { from, doc_id, encrypted, .. } => {
-                        println!("Update from {from} for {doc_id} ({} bytes)", encrypted.len());
-                    }
-                    ServerMessage::Error { message, .. } => {
-                        eprintln!("Error: {message}");
-                    }
-                    _ => {
-                        println!("{server_msg:?}");
-                    }
-                }
+                handle_server_message(server_msg);
             }
             Ok(Message::Close(_)) => {
                 println!("Connection closed");
@@ -432,10 +439,8 @@ fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
             result.push(((b1 & 0x0f) << 4) | (v2 >> 2));
         }
 
-        if let Some(v3) = b3 {
-            if let Some(v2) = b2 {
-                result.push(((v2 & 0x03) << 6) | v3);
-            }
+        if let (Some(v2), Some(v3)) = (b2, b3) {
+            result.push(((v2 & 0x03) << 6) | v3);
         }
     }
 

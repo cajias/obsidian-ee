@@ -89,34 +89,7 @@ impl RelayServer {
         let server = Arc::new(self);
 
         // Spawn the accept loop
-        tokio::spawn(async move {
-            let mut shutdown_rx = shutdown_tx.subscribe();
-
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        match result {
-                            Ok((stream, peer_addr)) => {
-                                tracing::debug!("New connection from {}", peer_addr);
-                                let server = Arc::clone(&server);
-                                tokio::spawn(async move {
-                                    if let Err(e) = server.handle_connection(stream).await {
-                                        tracing::error!("Connection error: {}", e);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Accept error: {}", e);
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        tracing::info!("Shutting down server");
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(run_accept_loop(server, listener, shutdown_tx));
 
         Ok(BoundServer { addr: local_addr, handle })
     }
@@ -130,21 +103,12 @@ impl RelayServer {
         let (write, mut read) = ws_stream.split();
 
         // Channel for sending messages to this client
-        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
 
         // Spawn task to forward messages from channel to WebSocket
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let write_clone = Arc::clone(&write);
-        let writer_task = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let mut writer = write_clone.lock().await;
-                    if writer.send(Message::Text(json)).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
+        let writer_task = tokio::spawn(forward_messages_to_websocket(rx, write_clone));
 
         let mut user_id: Option<String> = None;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -203,49 +167,37 @@ impl RelayServer {
     ) {
         match msg {
             ClientMessage::Identify { user_id: uid } => {
-                tracing::debug!("User identified: {}", uid);
-
-                // Store the client handle
-                let handle = ClientHandle::new(uid.clone(), tx.clone());
-                self.clients.write().await.insert(uid.clone(), handle);
-
-                *user_id = Some(uid.clone());
-
-                let response = ServerMessage::Identified { user_id: uid };
-                let _ = tx.send(response);
+                self.handle_identify(uid, tx, user_id).await;
             }
             ClientMessage::Subscribe { doc_id } => {
-                if user_id.is_none() {
-                    let _ = tx.send(ServerMessage::Error {
-                        code: ErrorCode::NotIdentified,
-                        message: "Must identify before subscribing".to_string(),
-                    });
-                    return;
-                }
-                // Subscription handling will be implemented in T11
-                let _ = tx.send(ServerMessage::Subscribed { doc_id });
+                handle_subscribe(user_id.as_ref(), tx, doc_id);
             }
             ClientMessage::Unsubscribe { doc_id } => {
-                if user_id.is_none() {
-                    let _ = tx.send(ServerMessage::Error {
-                        code: ErrorCode::NotIdentified,
-                        message: "Must identify before unsubscribing".to_string(),
-                    });
-                    return;
-                }
-                // Unsubscription handling will be implemented in T11
-                let _ = tx.send(ServerMessage::Unsubscribed { doc_id });
+                handle_unsubscribe(user_id.as_ref(), tx, doc_id);
             }
             ClientMessage::YrsUpdate { .. } | ClientMessage::MlsHandshake { .. } => {
-                if user_id.is_none() {
-                    let _ = tx.send(ServerMessage::Error {
-                        code: ErrorCode::NotIdentified,
-                        message: "Must identify before sending updates".to_string(),
-                    });
-                }
-                // Message routing will be implemented in T11
+                handle_update(user_id.as_ref(), tx);
             }
         }
+    }
+
+    /// Handle the Identify message.
+    async fn handle_identify(
+        &self,
+        uid: String,
+        tx: &mpsc::UnboundedSender<ServerMessage>,
+        user_id: &mut Option<String>,
+    ) {
+        tracing::debug!("User identified: {}", uid);
+
+        // Store the client handle
+        let handle = ClientHandle::new(uid.clone(), tx.clone());
+        self.clients.write().await.insert(uid.clone(), handle);
+
+        *user_id = Some(uid.clone());
+
+        let response = ServerMessage::Identified { user_id: uid };
+        let _ = tx.send(response);
     }
 
     /// Get a client handle by user ID (for testing).
@@ -264,6 +216,118 @@ impl RelayServer {
 impl Default for RelayServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Run the server accept loop, handling incoming connections.
+async fn run_accept_loop(
+    server: Arc<RelayServer>,
+    listener: TcpListener,
+    shutdown_tx: broadcast::Sender<()>,
+) {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                handle_accept_result(result, &server);
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Shutting down server");
+                break;
+            }
+        }
+    }
+}
+
+/// Handle the result of accepting a new connection.
+fn handle_accept_result(
+    result: std::io::Result<(TcpStream, SocketAddr)>,
+    server: &Arc<RelayServer>,
+) {
+    let Ok((stream, peer_addr)) = result else {
+        if let Err(e) = &result {
+            tracing::error!("Accept error: {}", e);
+        }
+        return;
+    };
+    tracing::debug!("New connection from {}", peer_addr);
+    let server = Arc::clone(server);
+    tokio::spawn(spawn_connection_handler(server, stream));
+}
+
+/// Spawn a connection handler task.
+async fn spawn_connection_handler(server: Arc<RelayServer>, stream: TcpStream) {
+    if let Err(e) = server.handle_connection(stream).await {
+        tracing::error!("Connection error: {}", e);
+    }
+}
+
+/// Handle the Subscribe message.
+fn handle_subscribe(
+    user_id: Option<&String>,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+    doc_id: String,
+) {
+    if !require_identified(user_id, tx, "subscribing") {
+        return;
+    }
+    // Subscription handling will be implemented in T11
+    let _ = tx.send(ServerMessage::Subscribed { doc_id });
+}
+
+/// Handle the Unsubscribe message.
+fn handle_unsubscribe(
+    user_id: Option<&String>,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+    doc_id: String,
+) {
+    if !require_identified(user_id, tx, "unsubscribing") {
+        return;
+    }
+    // Unsubscription handling will be implemented in T11
+    let _ = tx.send(ServerMessage::Unsubscribed { doc_id });
+}
+
+/// Handle `YrsUpdate` or `MlsHandshake` messages.
+fn handle_update(user_id: Option<&String>, tx: &mpsc::UnboundedSender<ServerMessage>) {
+    // Message routing will be implemented in T11
+    require_identified(user_id, tx, "sending updates");
+}
+
+/// Check if the user is identified, sending an error if not.
+/// Returns `true` if identified, `false` otherwise.
+fn require_identified(
+    user_id: Option<&String>,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+    action: &str,
+) -> bool {
+    if user_id.is_some() {
+        return true;
+    }
+    let _ = tx.send(ServerMessage::Error {
+        code: ErrorCode::NotIdentified,
+        message: format!("Must identify before {action}"),
+    });
+    false
+}
+
+/// Forward messages from a channel to a WebSocket writer.
+async fn forward_messages_to_websocket<W>(
+    mut rx: mpsc::UnboundedReceiver<ServerMessage>,
+    write: Arc<tokio::sync::Mutex<W>>,
+) where
+    W: SinkExt<Message> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    while let Some(msg) = rx.recv().await {
+        let Ok(json) = serde_json::to_string(&msg) else {
+            continue;
+        };
+        let mut writer = write.lock().await;
+        if writer.send(Message::Text(json)).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -304,6 +368,7 @@ mod tests {
         read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     }
 
+    #[allow(clippy::excessive_nesting)]
     impl TestClient {
         async fn connect(server: &TestServer) -> Self {
             let (ws, _) = connect_async(&server.url()).await.unwrap();
@@ -318,9 +383,10 @@ mod tests {
 
         async fn recv(&mut self) -> ServerMessage {
             loop {
-                if let Some(Ok(Message::Text(text))) = self.read.next().await {
-                    return serde_json::from_str(&text).unwrap();
-                }
+                let Some(Ok(Message::Text(text))) = self.read.next().await else {
+                    continue;
+                };
+                return serde_json::from_str(&text).unwrap();
             }
         }
     }
@@ -379,6 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
     async fn test_invalid_message() {
         let server = TestServer::start().await;
         let (ws, _) = connect_async(&server.url()).await.unwrap();

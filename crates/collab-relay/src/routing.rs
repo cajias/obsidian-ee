@@ -54,11 +54,12 @@ impl MessageRouter {
     /// Unsubscribe a user from a document.
     pub async fn unsubscribe(&self, user_id: &str, doc_id: &str) {
         let mut subs = self.subscriptions.write().await;
-        if let Some(subscribers) = subs.get_mut(doc_id) {
-            subscribers.remove(user_id);
-            if subscribers.is_empty() {
-                subs.remove(doc_id);
-            }
+        let Some(subscribers) = subs.get_mut(doc_id) else {
+            return;
+        };
+        subscribers.remove(user_id);
+        if subscribers.is_empty() {
+            subs.remove(doc_id);
         }
     }
 
@@ -80,19 +81,12 @@ impl MessageRouter {
         };
 
         let clients = self.clients.read().await;
-        let mut sent_count = 0;
-        for subscriber_id in &subscribers {
-            // Don't send to the sender
-            if subscriber_id == from_user {
-                continue;
-            }
-
-            if let Some(client) = clients.get(subscriber_id) {
-                if client.send(message.clone()).is_ok() {
-                    sent_count += 1;
-                }
-            }
-        }
+        let sent_count = subscribers
+            .iter()
+            .filter(|id| *id != from_user)
+            .filter_map(|id| clients.get(id))
+            .filter(|client| client.send(message.clone()).is_ok())
+            .count();
         drop(clients);
 
         sent_count
@@ -129,6 +123,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
     async fn test_subscribe_and_receive() {
         let router = MessageRouter::new();
 

@@ -6,6 +6,7 @@ members = [
     "crates/collab-cli",
     "crates/collab-proto",
     "tests/e2e-tests",
+    "xtask",
 ]
 
 [workspace.package]
@@ -62,6 +63,12 @@ unused_must_use = "deny"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+
+# Code complexity lints (from restriction category)
+too_many_lines = "warn"           # Functions > 100 lines
+excessive_nesting = "warn"        # Nesting > 4 levels (needs clippy.toml)
+too_many_arguments = "warn"       # Functions with > 7 args
+
 # Allow unwrap/expect in code - they're fine for tests and sometimes necessary
 unwrap_used = "allow"
 expect_used = "allow"

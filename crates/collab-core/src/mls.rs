@@ -297,6 +297,41 @@ impl MlsDocumentGroup {
         }
     }
 
+    /// Process a commit message from another member (e.g., when a new member is added).
+    ///
+    /// This is needed when other members add new participants to the group.
+    /// The committer sends the commit message to all existing members so they
+    /// can update their group state and epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing the commit fails.
+    pub fn process_commit(&mut self, commit_bytes: &[u8]) -> Result<()> {
+        let message = MlsMessageIn::tls_deserialize_exact(commit_bytes)
+            .map_err(|e| Error::Mls(format!("Failed to deserialize commit: {e:?}")))?;
+
+        let processed = self
+            .group
+            .process_message(
+                &self.crypto,
+                message
+                    .try_into_protocol_message()
+                    .map_err(|_| Error::Mls("Expected protocol message".to_string()))?,
+            )
+            .map_err(|e| Error::Mls(format!("Failed to process commit: {e:?}")))?;
+
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                // Merge the staged commit to update our group state
+                self.group
+                    .merge_staged_commit(&self.crypto, *staged_commit)
+                    .map_err(|e| Error::Mls(format!("Failed to merge staged commit: {e:?}")))?;
+                Ok(())
+            }
+            _ => Err(Error::Mls("Expected commit message".to_string())),
+        }
+    }
+
     /// Export the key package for sharing with others.
     ///
     /// # Errors

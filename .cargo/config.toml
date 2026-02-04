@@ -1,2 +1,5 @@
 [alias]
-lint = "clippy --all-targets --all-features -- -D warnings"
+lint = "xtask lint"
+xtask = "run --package xtask --"
+# Quick clippy only (no fmt/analysis)
+clippy-check = "clippy --all-targets --all-features -- -D warnings"

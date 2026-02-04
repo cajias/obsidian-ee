@@ -53,6 +53,7 @@ impl TestClient {
         self.write.send(Message::Text(json)).await.unwrap();
     }
 
+    #[allow(clippy::excessive_nesting)]
     async fn recv(&mut self) -> ServerMessage {
         loop {
             if let Some(Ok(Message::Text(text))) = self.read.next().await {
@@ -115,6 +116,7 @@ async fn test_full_flow_connect_identify_subscribe_exchange() {
 }
 
 #[tokio::test]
+#[allow(clippy::excessive_nesting)]
 async fn test_multiple_clients_concurrent_connect() {
     let server = TestServer::start().await;
 
@@ -132,12 +134,11 @@ async fn test_multiple_clients_concurrent_connect() {
                 write.send(Message::Text(json)).await.unwrap();
 
                 // Wait for response
-                if let Some(Ok(Message::Text(text))) = read.next().await {
-                    let response: ServerMessage = serde_json::from_str(&text).unwrap();
-                    matches!(response, ServerMessage::Identified { .. })
-                } else {
-                    false
-                }
+                let Some(Ok(Message::Text(text))) = read.next().await else {
+                    return false;
+                };
+                let response: ServerMessage = serde_json::from_str(&text).unwrap();
+                matches!(response, ServerMessage::Identified { .. })
             })
         })
         .collect();

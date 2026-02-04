@@ -87,14 +87,28 @@ impl EncryptedDocument {
     /// Create an invite for another user to join.
     ///
     /// Takes the key package bytes from a `PendingMember`.
+    /// Returns an invite containing the welcome message for the new member,
+    /// and a commit message that must be sent to all existing group members.
     ///
     /// # Errors
     ///
     /// Returns an error if creating the invite fails.
     pub fn create_invite(&mut self, key_package: &[u8]) -> Result<Invite> {
-        let (_commit, welcome) = self.mls.add_member(key_package)?;
+        let (commit, welcome) = self.mls.add_member(key_package)?;
 
-        Ok(Invite { doc_id: self.doc.id().to_string(), welcome })
+        Ok(Invite { doc_id: self.doc.id().to_string(), welcome, commit })
+    }
+
+    /// Process a commit message from another member (e.g., when a new member is added).
+    ///
+    /// This is needed when other members add new participants to the group.
+    /// Existing members must process the commit to update their group state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing the commit fails.
+    pub fn process_commit(&mut self, commit: &[u8]) -> Result<()> {
+        self.mls.process_commit(commit)
     }
 }
 
@@ -103,8 +117,11 @@ impl EncryptedDocument {
 pub struct Invite {
     /// Document identifier.
     pub doc_id: DocumentId,
-    /// MLS welcome message.
+    /// MLS welcome message for the new member.
     pub welcome: Vec<u8>,
+    /// MLS commit message for existing members.
+    /// Existing group members must process this to stay in sync.
+    pub commit: Vec<u8>,
 }
 
 #[cfg(test)]

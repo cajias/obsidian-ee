@@ -93,7 +93,15 @@ mod tests {
         }
     }
 
+    fn extract_update_data(msg: &ServerMessage) -> u8 {
+        let ServerMessage::YrsUpdate { encrypted, .. } = msg else {
+            panic!("Expected YrsUpdate");
+        };
+        encrypted[0]
+    }
+
     #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
     async fn test_offline_user_receives_on_reconnect() {
         let queue = OfflineQueue::new();
 
@@ -112,14 +120,9 @@ mod tests {
 
         // Verify order (FIFO)
         for (i, msg) in messages.iter().enumerate() {
-            match msg {
-                ServerMessage::YrsUpdate { encrypted, .. } => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let expected = (i + 1) as u8;
-                    assert_eq!(encrypted[0], expected);
-                }
-                _ => panic!("Expected YrsUpdate"),
-            }
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = (i + 1) as u8;
+            assert_eq!(extract_update_data(msg), expected);
         }
 
         // Queue should now be empty
@@ -128,6 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
     async fn test_max_messages_limit() {
         let queue = OfflineQueue::with_max_per_user(3);
 
@@ -144,14 +148,9 @@ mod tests {
 
         // Should have messages 3, 4, 5 (oldest 1, 2 dropped)
         for (i, msg) in messages.iter().enumerate() {
-            match msg {
-                ServerMessage::YrsUpdate { encrypted, .. } => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let expected = (i + 3) as u8;
-                    assert_eq!(encrypted[0], expected);
-                }
-                _ => panic!("Expected YrsUpdate"),
-            }
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = (i + 3) as u8;
+            assert_eq!(extract_update_data(msg), expected);
         }
     }
 
