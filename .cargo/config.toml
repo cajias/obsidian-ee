@@ -3,3 +3,10 @@ lint = "xtask lint"
 xtask = "run --package xtask --"
 # Quick clippy only (no fmt/analysis)
 clippy-check = "clippy --all-targets --all-features -- -D warnings"
+
+[build]
+# Default target for wasm-pack
+# wasm-pack will use wasm32-unknown-unknown automatically
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export-table"]

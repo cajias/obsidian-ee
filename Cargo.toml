@@ -5,6 +5,7 @@ members = [
     "crates/collab-relay",
     "crates/collab-cli",
     "crates/collab-proto",
+    "crates/collab-wasm",
     "tests/e2e-tests",
     "xtask",
 ]
@@ -21,9 +22,14 @@ rust-version = "1.75"
 yrs = "0.21"
 
 # MLS (Messaging Layer Security)
-openmls = "0.7"
+openmls = { version = "0.7", default-features = false }
 openmls_rust_crypto = "0.4"
 openmls_basic_credential = "0.4"
+
+# WASM support
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["console"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 # Async runtime
 tokio = { version = "1.41", features = ["full"] }
