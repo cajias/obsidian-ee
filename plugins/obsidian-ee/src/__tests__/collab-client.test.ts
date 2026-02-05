@@ -179,7 +179,7 @@ describe('CollabClient', () => {
 describe('CollabClient message handling', () => {
     let client: CollabClient;
     let mockCore: any;
-    let mockWs: MockWebSocket;
+    let _mockWs: MockWebSocket;
 
     beforeEach(() => {
         jest.useFakeTimers();
@@ -636,5 +636,243 @@ describe('CollabClient error handling', () => {
                 })
             );
         });
+    });
+});
+
+describe('CollabClient initialization verification', () => {
+    let mockCore: any;
+    let config: CollabClientConfig;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        mockCore = new CollabCore();
+        config = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            encryptionKey: new Uint8Array(32),
+        };
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    describe('connect() failure on sendIdentify/subscribe', () => {
+        it('should fail connect() if sendIdentify returns false', async () => {
+            // Create a MockWebSocket that has readyState CLOSED when send is called
+            const OriginalMockWebSocket = (global as any).WebSocket;
+            let _wsInstance: any;
+            (global as any).WebSocket = class FailingSendWebSocket {
+                static OPEN = 1;
+                static CONNECTING = 0;
+                static CLOSING = 2;
+                static CLOSED = 3;
+                readyState = 3; // CLOSED - so send() returns false
+                onopen: (() => void) | null = null;
+                onmessage: ((event: { data: string }) => void) | null = null;
+                onerror: ((error: any) => void) | null = null;
+                onclose: (() => void) | null = null;
+                constructor() {
+                    _wsInstance = this;
+                    setTimeout(() => this.onopen?.(), 0);
+                }
+                send() {}
+                close() {
+                    this.onclose?.();
+                }
+            };
+
+            const client = new CollabClient(mockCore, config);
+            const connectPromise = client.connect();
+            jest.runAllTimers();
+
+            await expect(connectPromise).rejects.toThrow('Failed to send initialization messages');
+
+            // Restore
+            (global as any).WebSocket = OriginalMockWebSocket;
+        });
+
+        it('should fail connect() if subscribe returns false', async () => {
+            // Create a MockWebSocket that returns CLOSED after first send
+            const OriginalMockWebSocket = (global as any).WebSocket;
+            let sendCount = 0;
+            (global as any).WebSocket = class PartialSendWebSocket {
+                static OPEN = 1;
+                static CONNECTING = 0;
+                static CLOSING = 2;
+                static CLOSED = 3;
+                readyState = 1; // OPEN initially
+                onopen: (() => void) | null = null;
+                onmessage: ((event: { data: string }) => void) | null = null;
+                onerror: ((error: any) => void) | null = null;
+                onclose: (() => void) | null = null;
+                constructor() {
+                    setTimeout(() => this.onopen?.(), 0);
+                }
+                send() {
+                    sendCount++;
+                    // After first send (identify), set readyState to CLOSED
+                    if (sendCount === 1) {
+                        this.readyState = 3; // CLOSED
+                    }
+                }
+                close() {
+                    this.onclose?.();
+                }
+            };
+
+            const client = new CollabClient(mockCore, config);
+            const connectPromise = client.connect();
+            jest.runAllTimers();
+
+            await expect(connectPromise).rejects.toThrow('Failed to send initialization messages');
+
+            // Restore
+            (global as any).WebSocket = OriginalMockWebSocket;
+        });
+    });
+});
+
+describe('CollabClient handleReconnect timer cleanup', () => {
+    let client: CollabClient;
+    let mockCore: any;
+    let config: CollabClientConfig;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        mockCore = new CollabCore();
+        config = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            encryptionKey: new Uint8Array(32),
+        };
+        client = new CollabClient(mockCore, config);
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+        client.disconnect();
+    });
+
+    it('should clear reconnectTimer when max retries exceeded', async () => {
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Set a reconnectTimer to simulate pending timer
+        (client as any).reconnectTimer = setTimeout(() => {}, 1000);
+
+        // Set reconnect attempts to max (5)
+        (client as any).reconnectAttempts = 5;
+
+        // Trigger onclose - should clear timer since max retries exceeded
+        (client as any).ws?.onclose?.();
+
+        expect((client as any).reconnectTimer).toBeNull();
+    });
+});
+
+describe('CollabClient handleYrsUpdate validation', () => {
+    let client: CollabClient;
+    let mockCore: any;
+    let config: CollabClientConfig;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        mockCore = new CollabCore();
+        config = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            encryptionKey: new Uint8Array(32),
+        };
+        client = new CollabClient(mockCore, config);
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+        client.disconnect();
+    });
+
+    it('should invoke onErrorCallback when message.encrypted is missing', async () => {
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Simulate yrs_update message without encrypted field
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({ type: 'yrs_update' }),
+        });
+
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'decryption',
+                message: expect.stringContaining('Invalid yrs_update message'),
+            })
+        );
+    });
+
+    it('should invoke onErrorCallback when message.encrypted is not an array', async () => {
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Simulate yrs_update message with non-array encrypted field
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({ type: 'yrs_update', encrypted: 'not-an-array' }),
+        });
+
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'decryption',
+                message: expect.stringContaining('Invalid yrs_update message'),
+            })
+        );
+    });
+
+    it('should invoke onErrorCallback when message.encrypted is null', async () => {
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Simulate yrs_update message with null encrypted field
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({ type: 'yrs_update', encrypted: null }),
+        });
+
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'decryption',
+                message: expect.stringContaining('Invalid yrs_update message'),
+            })
+        );
+    });
+
+    it('should process valid yrs_update message with encrypted array', async () => {
+        const updateCallback = jest.fn();
+        client.onUpdate(updateCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Simulate valid yrs_update message
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({ type: 'yrs_update', encrypted: [1, 2, 3] }),
+        });
+
+        expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]));
+        expect(updateCallback).toHaveBeenCalled();
     });
 });

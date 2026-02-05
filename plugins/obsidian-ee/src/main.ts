@@ -8,6 +8,7 @@ export default class CollabPlugin extends Plugin {
     private collabClient: CollabClient | null = null;
     private editorSync: EditorSync | null = null;
     private wasmInitialized = false;
+    private editorChangeHandler: ReturnType<typeof this.app.workspace.on> | null = null;
 
     async onload() {
         console.log('Loading Obsidian E2E Collaboration plugin');
@@ -72,6 +73,23 @@ export default class CollabPlugin extends Plugin {
             this.collabClient = new CollabClient(this.collabCore, config);
             this.editorSync = new EditorSync(this.collabClient);
 
+            // Register error and disconnect callbacks
+            this.collabClient.onError((error) => {
+                console.error('[CollabPlugin] Collaboration error:', error);
+                new Notice(`Collaboration error: ${error.message}`);
+            });
+
+            this.collabClient.onDisconnect((reason) => {
+                console.warn('[CollabPlugin] Disconnected:', reason);
+                new Notice(`Collaboration disconnected: ${reason}`);
+                this.stopSession();
+            });
+
+            this.editorSync.setErrorCallback((error) => {
+                console.error('[CollabPlugin] Editor sync error:', error);
+                new Notice(`Sync error: ${error.message}`);
+            });
+
             // Connect to relay server
             await this.collabClient.connect();
 
@@ -79,11 +97,10 @@ export default class CollabPlugin extends Plugin {
             this.editorSync.bindToEditor(activeView);
 
             // Register editor change handler
-            this.registerEvent(
-                this.app.workspace.on('editor-change', () => {
-                    this.editorSync?.onLocalChange();
-                })
-            );
+            this.editorChangeHandler = this.app.workspace.on('editor-change', () => {
+                this.editorSync?.onLocalChange();
+            });
+            this.registerEvent(this.editorChangeHandler);
 
             new Notice('Collaboration session started');
         } catch (error) {
@@ -94,6 +111,12 @@ export default class CollabPlugin extends Plugin {
     }
 
     stopSession(): void {
+        // Unregister editor change handler
+        if (this.editorChangeHandler) {
+            this.app.workspace.offref(this.editorChangeHandler);
+            this.editorChangeHandler = null;
+        }
+
         if (this.editorSync) {
             this.editorSync.unbind();
             this.editorSync = null;
@@ -102,6 +125,16 @@ export default class CollabPlugin extends Plugin {
         if (this.collabClient) {
             this.collabClient.disconnect();
             this.collabClient = null;
+        }
+
+        // Free and recreate CollabCore to prevent memory leak
+        if (this.collabCore) {
+            try {
+                this.collabCore.free();
+            } catch (error) {
+                console.error('[CollabPlugin] Error freeing WASM resources:', error);
+            }
+            this.collabCore = new CollabCore();
         }
 
         new Notice('Collaboration session stopped');

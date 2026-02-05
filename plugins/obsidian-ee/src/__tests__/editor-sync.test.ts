@@ -70,7 +70,7 @@ describe('EditorSync', () => {
             expect(editor.setValue).not.toHaveBeenCalled();
         });
 
-        it('should not update if remote text is empty', () => {
+        it('should sync empty string remote text when local is non-empty', () => {
             const editor = createMockEditor('local text');
             const view = createMockView(editor);
 
@@ -78,7 +78,58 @@ describe('EditorSync', () => {
 
             sync.bindToEditor(view as any);
 
-            expect(editor.setValue).not.toHaveBeenCalled();
+            expect(editor.setValue).toHaveBeenCalledWith('');
+        });
+
+        it('should handle errors during setValue and reset isApplyingRemote', () => {
+            const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const errorCallback = jest.fn();
+            const editor = createMockEditor('local text');
+            editor.setValue.mockImplementation(() => {
+                throw new Error('setValue error');
+            });
+            const view = createMockView(editor);
+
+            client.getText.mockReturnValue('remote text');
+
+            sync.setErrorCallback(errorCallback);
+            sync.bindToEditor(view as any);
+
+            expect(consoleSpy).toHaveBeenCalledWith(
+                '[EditorSync] Error setting initial text:',
+                expect.any(Error)
+            );
+            expect(errorCallback).toHaveBeenCalledWith(expect.any(Error));
+
+            // Verify isApplyingRemote was reset by checking subsequent remote updates work
+            editor.setValue.mockClear();
+            editor.setValue.mockImplementation(() => {}); // Reset to working implementation
+            editor.getValue.mockReturnValue('local text');
+            client._triggerUpdate('new remote');
+
+            expect(editor.setValue).toHaveBeenCalledWith('new remote');
+
+            consoleSpy.mockRestore();
+        });
+
+        it('should not call error callback for non-Error throws in bindToEditor', () => {
+            const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const errorCallback = jest.fn();
+            const editor = createMockEditor('local text');
+            editor.setValue.mockImplementation(() => {
+                throw 'string error'; // Non-Error throw
+            });
+            const view = createMockView(editor);
+
+            client.getText.mockReturnValue('remote text');
+
+            sync.setErrorCallback(errorCallback);
+            sync.bindToEditor(view as any);
+
+            expect(consoleSpy).toHaveBeenCalled();
+            expect(errorCallback).not.toHaveBeenCalled(); // Only called for Error instances
+
+            consoleSpy.mockRestore();
         });
     });
 
@@ -155,6 +206,63 @@ describe('EditorSync', () => {
 
             // sendUpdate should not be called from the remote-triggered change
         });
+
+        it('should notify error callback when sendUpdate returns false', () => {
+            const errorCallback = jest.fn();
+            const editor = createMockEditor('initial');
+            const view = createMockView(editor);
+
+            client.sendUpdate.mockReturnValue(false);
+
+            sync.setErrorCallback(errorCallback);
+            sync.bindToEditor(view as any);
+
+            editor.getValue.mockReturnValue('updated text');
+            sync.onLocalChange();
+
+            jest.advanceTimersByTime(150);
+
+            expect(client.sendUpdate).toHaveBeenCalledWith('updated text');
+            expect(errorCallback).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    message: 'Failed to send update - changes may not be synced'
+                })
+            );
+        });
+
+        it('should not notify error callback when sendUpdate returns true', () => {
+            const errorCallback = jest.fn();
+            const editor = createMockEditor('initial');
+            const view = createMockView(editor);
+
+            client.sendUpdate.mockReturnValue(true);
+
+            sync.setErrorCallback(errorCallback);
+            sync.bindToEditor(view as any);
+
+            editor.getValue.mockReturnValue('updated text');
+            sync.onLocalChange();
+
+            jest.advanceTimersByTime(150);
+
+            expect(client.sendUpdate).toHaveBeenCalledWith('updated text');
+            expect(errorCallback).not.toHaveBeenCalled();
+        });
+
+        it('should not throw when sendUpdate fails and no error callback set', () => {
+            const editor = createMockEditor('initial');
+            const view = createMockView(editor);
+
+            client.sendUpdate.mockReturnValue(false);
+
+            sync.bindToEditor(view as any);
+
+            editor.getValue.mockReturnValue('updated text');
+            sync.onLocalChange();
+
+            // Should not throw
+            expect(() => jest.advanceTimersByTime(150)).not.toThrow();
+        });
     });
 
     describe('applyRemoteUpdate', () => {
@@ -212,9 +320,12 @@ describe('EditorSync', () => {
             const editor = createMockEditor('same content');
             const view = createMockView(editor);
 
+            // Make getText return the same value as the editor so bindToEditor doesn't update
+            client.getText.mockReturnValue('same content');
+
             sync.bindToEditor(view as any);
 
-            // Clear the call from bindToEditor
+            // Clear the call from bindToEditor (should not have been called anyway)
             editor.setValue.mockClear();
 
             client._triggerUpdate('same content');
@@ -263,6 +374,9 @@ describe('EditorSync', () => {
         it('should return editor text when bound', () => {
             const editor = createMockEditor('editor content');
             const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't overwrite
+            client.getText.mockReturnValue('editor content');
 
             sync.bindToEditor(view as any);
 
@@ -389,14 +503,14 @@ describe('EditorSync', () => {
             sync.bindToEditor(view as any);
 
             // Track if onLocalChange is called during remote update
-            let localChangeCalledDuringRemote = false;
+            let _localChangeCalledDuringRemote = false;
             const originalOnLocalChange = sync.onLocalChange.bind(sync);
 
             // Override setValue to call onLocalChange (simulating editor event)
-            editor.setValue.mockImplementation((v: string) => {
+            editor.setValue.mockImplementation((_v: string) => {
                 // Try to trigger local change during remote apply
                 originalOnLocalChange();
-                localChangeCalledDuringRemote = true;
+                _localChangeCalledDuringRemote = true;
             });
 
             client._triggerUpdate('new');
@@ -443,12 +557,17 @@ describe('EditorSync', () => {
         it('should catch and log errors in applyRemoteUpdate', () => {
             const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
             const editor = createMockEditor('initial');
+            const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't try to set
+            client.getText.mockReturnValue('initial');
+
+            sync.bindToEditor(view as any);
+
+            // Now make getValue throw for the remote update
             editor.getValue.mockImplementation(() => {
                 throw new Error('Editor error');
             });
-            const view = createMockView(editor);
-
-            sync.bindToEditor(view as any);
 
             // Trigger remote update - should catch the error
             client._triggerUpdate('new text');
@@ -464,6 +583,14 @@ describe('EditorSync', () => {
         it('should reset isApplyingRemote flag even when error occurs', () => {
             const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
             const editor = createMockEditor('initial');
+            const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't try to set
+            client.getText.mockReturnValue('initial');
+
+            sync.bindToEditor(view as any);
+
+            // Now make getValue throw once, then work
             let callCount = 0;
             editor.getValue.mockImplementation(() => {
                 callCount++;
@@ -472,9 +599,6 @@ describe('EditorSync', () => {
                 }
                 return 'recovered';
             });
-            const view = createMockView(editor);
-
-            sync.bindToEditor(view as any);
 
             // First update throws
             client._triggerUpdate('new text');
@@ -492,13 +616,18 @@ describe('EditorSync', () => {
             const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
             const errorCallback = jest.fn();
             const editor = createMockEditor('initial');
-            editor.getValue.mockImplementation(() => {
-                throw new Error('Test error');
-            });
             const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't try to set
+            client.getText.mockReturnValue('initial');
 
             sync.setErrorCallback(errorCallback);
             sync.bindToEditor(view as any);
+
+            // Now make getValue throw for the remote update
+            editor.getValue.mockImplementation(() => {
+                throw new Error('Test error');
+            });
 
             client._triggerUpdate('new text');
 
@@ -510,12 +639,17 @@ describe('EditorSync', () => {
         it('should not throw if error callback is not set', () => {
             const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
             const editor = createMockEditor('initial');
+            const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't try to set
+            client.getText.mockReturnValue('initial');
+
+            sync.bindToEditor(view as any);
+
+            // Now make getValue throw for the remote update
             editor.getValue.mockImplementation(() => {
                 throw new Error('Test error');
             });
-            const view = createMockView(editor);
-
-            sync.bindToEditor(view as any);
 
             // Should not throw
             expect(() => client._triggerUpdate('new text')).not.toThrow();

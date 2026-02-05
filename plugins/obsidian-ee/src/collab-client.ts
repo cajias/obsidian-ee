@@ -18,6 +18,14 @@ export interface CollabError {
     originalError?: Error;
 }
 
+export interface YrsUpdateMessage {
+    type: 'yrs_update';
+    encrypted: number[];
+    doc_id?: string;
+    epoch?: number;
+    signature?: number[];
+}
+
 export class CollabClient {
     private ws: WebSocket | null = null;
     private collabCore: CollabCore;
@@ -49,8 +57,19 @@ export class CollabClient {
                     console.log('Connected to relay server');
                     this.connectionState = 'connected';
                     this.isInitialConnect = false;
-                    this.sendIdentify();
-                    this.subscribe();
+
+                    // Critical: verify initialization messages are sent
+                    const identified = this.sendIdentify();
+                    const subscribed = this.subscribe();
+
+                    if (!identified || !subscribed) {
+                        const error = new Error('Failed to send initialization messages');
+                        console.error('[CollabClient]', error.message);
+                        this.ws?.close();
+                        reject(error);
+                        return;
+                    }
+
                     this.flushMessageQueue();
                     this.reconnectAttempts = 0;
                     resolve();
@@ -88,15 +107,15 @@ export class CollabClient {
         });
     }
 
-    private sendIdentify(): void {
-        this.send({
+    private sendIdentify(): boolean {
+        return this.send({
             type: 'identify',
             user_id: this.config.userId,
         });
     }
 
-    private subscribe(): void {
-        this.send({
+    private subscribe(): boolean {
+        return this.send({
             type: 'subscribe',
             doc_id: this.config.docId,
         });
@@ -139,7 +158,7 @@ export class CollabClient {
 
             switch (message.type) {
                 case 'yrs_update':
-                    this.handleYrsUpdate(message);
+                    this.handleYrsUpdate(message as YrsUpdateMessage);
                     break;
                 case 'subscribed':
                     console.log('Subscribed to document:', message.doc_id);
@@ -170,8 +189,11 @@ export class CollabClient {
         }
     }
 
-    private handleYrsUpdate(message: any): void {
+    private handleYrsUpdate(message: YrsUpdateMessage): void {
         try {
+            if (!message.encrypted || !Array.isArray(message.encrypted)) {
+                throw new Error('Invalid yrs_update message: missing or invalid encrypted field');
+            }
             const encrypted = new Uint8Array(message.encrypted);
             this.collabCore.apply_update_encrypted(encrypted);
 
@@ -214,6 +236,11 @@ export class CollabClient {
             }, delay);
         } else {
             this.connectionState = 'disconnected';
+            // Clear any pending timer
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer);
+                this.reconnectTimer = null;
+            }
             if (this.onDisconnectCallback) {
                 this.onDisconnectCallback('max_retries_exceeded');
             }

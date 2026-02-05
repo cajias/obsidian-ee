@@ -33,10 +33,18 @@ export class EditorSync {
 
         // Initialize with current remote state
         const remoteText = this.client.getText();
-        if (remoteText && remoteText !== this.editor.getValue()) {
+        if (remoteText !== undefined && remoteText !== this.editor.getValue()) {
             this.isApplyingRemote = true;
-            this.editor.setValue(remoteText);
-            this.isApplyingRemote = false;
+            try {
+                this.editor.setValue(remoteText);
+            } catch (error) {
+                console.error('[EditorSync] Error setting initial text:', error);
+                if (this.errorCallback && error instanceof Error) {
+                    this.errorCallback(error);
+                }
+            } finally {
+                this.isApplyingRemote = false;
+            }
         }
     }
 
@@ -61,7 +69,11 @@ export class EditorSync {
         if (!this.editor) return;
 
         const text = this.editor.getValue();
-        this.client.sendUpdate(text);
+        const sent = this.client.sendUpdate(text);
+
+        if (!sent && this.errorCallback) {
+            this.errorCallback(new Error('Failed to send update - changes may not be synced'));
+        }
     }
 
     private applyRemoteUpdate(text: string): void {
