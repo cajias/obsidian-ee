@@ -87,6 +87,18 @@ describe('EditorSync', () => {
             expect(editor.setValue).toHaveBeenCalledWith('');
         });
 
+        it('should not update if remote text is undefined', () => {
+            const editor = createMockEditor('local text');
+            const view = createMockView(editor);
+
+            client.getText.mockReturnValue(undefined);
+
+            sync.bindToEditor(view as any);
+
+            // setValue should not be called when remote text is undefined
+            expect(editor.setValue).not.toHaveBeenCalled();
+        });
+
         it('should handle errors during setValue and reset isApplyingRemote', () => {
             const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
             const errorCallback = jest.fn();
@@ -444,6 +456,26 @@ describe('EditorSync', () => {
             client._triggerUpdate('');
 
             expect(editor.setValue).toHaveBeenCalledWith('');
+        });
+
+        it('should position cursor at 0,0 when remote update is empty document', () => {
+            const editor = createMockEditor('some text here');
+            editor.getCursor.mockReturnValue({ line: 0, ch: 10 }); // Cursor in middle
+            const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't overwrite
+            client.getText.mockReturnValue('some text here');
+
+            sync.bindToEditor(view as any);
+
+            // Now make getValue return current text so the update is applied
+            editor.getValue.mockReturnValue('some text here');
+
+            // Remote sends empty document
+            client._triggerUpdate('');
+
+            // Cursor should be clamped to 0,0 for empty document
+            expect(editor.setCursor).toHaveBeenCalledWith({ line: 0, ch: 0 });
         });
 
         it('should not send local update when remote overwrites pending local changes', () => {

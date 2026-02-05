@@ -155,6 +155,53 @@ describe('CollabClient', () => {
             await expect(connectPromise).resolves.toBeUndefined();
         });
 
+        it('should reject promise when WebSocket closes during initial connection', async () => {
+            // Create a mock WebSocket that closes immediately (before onopen)
+            const OriginalWebSocket = global.WebSocket;
+
+            (global as any).WebSocket = class ClosingWebSocket {
+                static OPEN = 1;
+                static CONNECTING = 0;
+                static CLOSING = 2;
+                static CLOSED = 3;
+                readyState = 0;
+                onopen: (() => void) | null = null;
+                onclose: (() => void) | null = null;
+                onerror: ((error: any) => void) | null = null;
+                onmessage: ((event: { data: string }) => void) | null = null;
+                sentMessages: string[] = [];
+
+                constructor() {
+                    // Close immediately during initial connection (before onopen)
+                    setTimeout(() => {
+                        this.readyState = 3;
+                        this.onclose?.();
+                    }, 0);
+                }
+                send(data: string) {
+                    this.sentMessages.push(data);
+                }
+                close() {
+                    this.readyState = 3;
+                }
+            };
+
+            const testClient = new CollabClient(mockCore, config);
+            const connectPromise = testClient.connect();
+
+            jest.runAllTimers();
+
+            // Promise should be rejected with specific error message
+            await expect(connectPromise).rejects.toThrow(
+                'WebSocket closed during initial connection'
+            );
+
+            testClient.disconnect();
+
+            // Restore original WebSocket
+            global.WebSocket = OriginalWebSocket;
+        });
+
         it('should deduplicate concurrent connection attempts', async () => {
             // Start first connection (don't await yet)
             const connectPromise1 = client.connect();
