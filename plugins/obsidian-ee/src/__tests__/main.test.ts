@@ -146,6 +146,37 @@ describe('CollabPlugin', () => {
         expect(plugin).toBeDefined();
     });
 
+    it('should throw error when plugin directory is undefined', async () => {
+        const mockApp = {
+            vault: {
+                adapter: {
+                    readBinary: jest.fn().mockResolvedValue(new ArrayBuffer(8)),
+                },
+            },
+            workspace: {
+                getActiveViewOfType: jest.fn(),
+                on: jest.fn(),
+                offref: jest.fn(),
+            },
+        };
+        // Create manifest with undefined dir to trigger the error path
+        const mockManifest = {
+            dir: undefined, // This triggers 'Plugin directory not found' error
+            id: 'obsidian-ee',
+            name: 'Obsidian E2E',
+            version: '0.1.0',
+        };
+        const plugin = new CollabPlugin(mockApp as any, mockManifest as any);
+
+        await plugin.onload();
+
+        // Should show error notice and log error
+        expect(consoleSpy).toHaveBeenCalledWith('Failed to initialize WASM:', expect.any(Error));
+        expect(Notice).toHaveBeenCalledWith('Failed to load collaboration plugin');
+        // WASM should not be initialized
+        expect((plugin as any).wasmInitialized).toBe(false);
+    });
+
     it('should initialize WASM on load', async () => {
         const plugin = createMockPlugin();
         await plugin.onload();

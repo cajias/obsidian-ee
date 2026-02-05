@@ -1,4 +1,4 @@
-import { CollabClient, CollabClientConfig } from '../collab-client';
+import { CollabClient, CollabClientConfig, ConfigValidationError } from '../collab-client';
 
 // Mock WebSocket
 class MockWebSocket {
@@ -83,6 +83,59 @@ describe('CollabClient', () => {
         it('should set encryption key on CollabCore', () => {
             expect(mockCore.set_encryption_key).toHaveBeenCalledWith(config.encryptionKey);
         });
+
+        it('should throw ConfigValidationError for empty relayUrl', () => {
+            const invalidConfig = { ...config, relayUrl: '' };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'relayUrl must be a non-empty string'
+            );
+        });
+
+        it('should throw ConfigValidationError for invalid relayUrl protocol', () => {
+            const invalidConfig = { ...config, relayUrl: 'http://localhost:8080' };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'relayUrl must start with ws:// or wss://'
+            );
+        });
+
+        it('should accept wss:// relayUrl', () => {
+            const secureConfig = { ...config, relayUrl: 'wss://secure.example.com' };
+            expect(() => new CollabClient(mockCore, secureConfig)).not.toThrow();
+        });
+
+        it('should throw ConfigValidationError for empty userId', () => {
+            const invalidConfig = { ...config, userId: '' };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'userId must be a non-empty string'
+            );
+        });
+
+        it('should throw ConfigValidationError for empty docId', () => {
+            const invalidConfig = { ...config, docId: '' };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'docId must be a non-empty string'
+            );
+        });
+
+        it('should throw ConfigValidationError for wrong encryptionKey type', () => {
+            const invalidConfig = { ...config, encryptionKey: [1, 2, 3] as any };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'encryptionKey must be a Uint8Array'
+            );
+        });
+
+        it('should throw ConfigValidationError for wrong encryptionKey length', () => {
+            const invalidConfig = { ...config, encryptionKey: new Uint8Array(16) };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'encryptionKey must be exactly 32 bytes for AES-256, got 16 bytes'
+            );
+        });
     });
 
     describe('connect', () => {
@@ -100,6 +153,97 @@ describe('CollabClient', () => {
             jest.runAllTimers();
 
             await expect(connectPromise).resolves.toBeUndefined();
+        });
+
+        it('should deduplicate concurrent connection attempts', async () => {
+            // Start first connection (don't await yet)
+            const connectPromise1 = client.connect();
+
+            // Start second connection while first is still pending
+            const connectPromise2 = client.connect();
+
+            // Both should return the same promise
+            expect(connectPromise1).toBe(connectPromise2);
+
+            // Complete the connection
+            jest.runAllTimers();
+            await connectPromise1;
+            await connectPromise2;
+        });
+
+        it('should allow new connection after previous completes', async () => {
+            // First connection
+            const connectPromise1 = client.connect();
+            jest.runAllTimers();
+            await connectPromise1;
+
+            // Disconnect
+            client.disconnect();
+
+            // Create new client for fresh connection
+            const newClient = new CollabClient(mockCore, config);
+
+            // Second connection should be allowed (different promise)
+            const connectPromise2 = newClient.connect();
+            jest.runAllTimers();
+            await connectPromise2;
+
+            newClient.disconnect();
+        });
+
+        it('should allow new connection after previous fails', async () => {
+            // Create a new mock WebSocket class that fails
+            const OriginalWebSocket = global.WebSocket;
+
+            let connectionAttempts = 0;
+            (global as any).WebSocket = class FailingWebSocket {
+                static OPEN = 1;
+                static CONNECTING = 0;
+                static CLOSING = 2;
+                static CLOSED = 3;
+                readyState = 0;
+                onopen: (() => void) | null = null;
+                onclose: (() => void) | null = null;
+                onerror: ((error: any) => void) | null = null;
+                onmessage: ((event: { data: string }) => void) | null = null;
+                sentMessages: string[] = [];
+
+                constructor() {
+                    connectionAttempts++;
+                    // Fail first connection, succeed second
+                    setTimeout(() => {
+                        if (connectionAttempts === 1) {
+                            this.onclose?.();
+                        } else {
+                            this.readyState = 1;
+                            this.onopen?.();
+                        }
+                    }, 0);
+                }
+                send(data: string) {
+                    this.sentMessages.push(data);
+                }
+                close() {
+                    this.readyState = 3;
+                }
+            };
+
+            const testClient = new CollabClient(mockCore, config);
+
+            // First connection should fail
+            const connectPromise1 = testClient.connect();
+            jest.runAllTimers();
+            await expect(connectPromise1).rejects.toThrow();
+
+            // Second connection should succeed (connectPromise should be cleared)
+            const connectPromise2 = testClient.connect();
+            jest.runAllTimers();
+            await expect(connectPromise2).resolves.toBeUndefined();
+
+            testClient.disconnect();
+
+            // Restore original WebSocket
+            global.WebSocket = OriginalWebSocket;
         });
     });
 
@@ -875,5 +1019,279 @@ describe('CollabClient handleYrsUpdate validation', () => {
 
         expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]));
         expect(updateCallback).toHaveBeenCalled();
+    });
+
+    it('should properly extract error message from WASM error objects', async () => {
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        // Mock apply_update_encrypted to throw a WASM-style error object
+        // WASM CollabError returns a plain object with {type, message} fields
+        const wasmError = { type: 'decryption', message: 'Ciphertext too short' };
+        mockCore.apply_update_encrypted.mockImplementation(() => {
+            throw wasmError;
+        });
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Simulate valid yrs_update message that will trigger decryption error
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({ type: 'yrs_update', encrypted: [1, 2, 3] }),
+        });
+
+        // Error message should contain the WASM error type and message, not "[object Object]"
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'decryption',
+                message: expect.stringContaining('decryption'),
+            })
+        );
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                message: expect.stringContaining('Ciphertext too short'),
+            })
+        );
+        // Ensure we don't produce "[object Object]"
+        expect(errorCallback.mock.calls[0][0].message).not.toContain('[object Object]');
+    });
+
+    it('should handle standard Error objects in error messages', async () => {
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        mockCore.apply_update_encrypted.mockImplementation(() => {
+            throw new Error('Standard error message');
+        });
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({ type: 'yrs_update', encrypted: [1, 2, 3] }),
+        });
+
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                message: 'Standard error message',
+            })
+        );
+    });
+});
+
+describe('CollabClient applyTextDiff edge cases', () => {
+    let client: CollabClient;
+    let mockCore: any;
+    let config: CollabClientConfig;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        mockCore = new CollabCore();
+        config = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            encryptionKey: new Uint8Array(32),
+        };
+        client = new CollabClient(mockCore, config);
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+        client.disconnect();
+    });
+
+    it('should not call any CRDT operations when old and new text are identical', async () => {
+        mockCore.get_text.mockReturnValue('same content');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('same content');
+
+        expect(mockCore.delete).not.toHaveBeenCalled();
+        expect(mockCore.insert).not.toHaveBeenCalled();
+    });
+
+    it('should handle empty old text (insert all)', async () => {
+        mockCore.get_text.mockReturnValue('');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('new content');
+
+        expect(mockCore.delete).not.toHaveBeenCalled();
+        expect(mockCore.insert).toHaveBeenCalledWith(0, 'new content');
+    });
+
+    it('should handle empty new text (delete all)', async () => {
+        mockCore.get_text.mockReturnValue('old content');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('');
+
+        expect(mockCore.delete).toHaveBeenCalledWith(0, 11); // 'old content'.length
+        expect(mockCore.insert).not.toHaveBeenCalled();
+    });
+
+    it('should handle both old and new text being empty', async () => {
+        mockCore.get_text.mockReturnValue('');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('');
+
+        expect(mockCore.delete).not.toHaveBeenCalled();
+        expect(mockCore.insert).not.toHaveBeenCalled();
+    });
+
+    it('should handle complete replacement (no common prefix or suffix)', async () => {
+        mockCore.get_text.mockReturnValue('abc');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('xyz');
+
+        expect(mockCore.delete).toHaveBeenCalledWith(0, 3);
+        expect(mockCore.insert).toHaveBeenCalledWith(0, 'xyz');
+    });
+
+    it('should find common prefix and only modify suffix', async () => {
+        mockCore.get_text.mockReturnValue('Hello World');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('Hello Universe');
+
+        // Common prefix: 'Hello ' (6 chars)
+        // Delete: 'World' (5 chars starting at index 6)
+        // Insert: 'Universe' at index 6
+        expect(mockCore.delete).toHaveBeenCalledWith(6, 5);
+        expect(mockCore.insert).toHaveBeenCalledWith(6, 'Universe');
+    });
+
+    it('should find common suffix and only modify prefix', async () => {
+        mockCore.get_text.mockReturnValue('Hello World');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('Goodbye World');
+
+        // Common suffix: ' World' (6 chars)
+        // Delete: 'Hello' (5 chars starting at index 0)
+        // Insert: 'Goodbye' at index 0
+        expect(mockCore.delete).toHaveBeenCalledWith(0, 5);
+        expect(mockCore.insert).toHaveBeenCalledWith(0, 'Goodbye');
+    });
+
+    it('should handle insertion in the middle', async () => {
+        mockCore.get_text.mockReturnValue('HelloWorld');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('Hello World');
+
+        // Common prefix: 'Hello' (5 chars)
+        // Common suffix: 'World' (5 chars)
+        // No deletion, insert ' ' at position 5
+        expect(mockCore.delete).not.toHaveBeenCalled();
+        expect(mockCore.insert).toHaveBeenCalledWith(5, ' ');
+    });
+
+    it('should handle deletion in the middle', async () => {
+        mockCore.get_text.mockReturnValue('Hello World');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('HelloWorld');
+
+        // Common prefix: 'Hello' (5 chars)
+        // Common suffix: 'World' (5 chars)
+        // Delete ' ' (1 char at position 5)
+        expect(mockCore.delete).toHaveBeenCalledWith(5, 1);
+        expect(mockCore.insert).not.toHaveBeenCalled();
+    });
+
+    it('should handle Unicode characters correctly', async () => {
+        mockCore.get_text.mockReturnValue('Hello 世界');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('Hello 世界!');
+
+        // Common prefix: 'Hello 世界' (8 chars)
+        // Insert '!' at position 8
+        expect(mockCore.delete).not.toHaveBeenCalled();
+        expect(mockCore.insert).toHaveBeenCalledWith(8, '!');
+    });
+
+    it('should handle emoji characters correctly', async () => {
+        mockCore.get_text.mockReturnValue('Hello 👋');
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        mockCore.insert.mockClear();
+        mockCore.delete.mockClear();
+
+        client.sendUpdate('Hello 👋 World');
+
+        // Common prefix: 'Hello 👋' (8 chars - emoji is 2 code units)
+        // Insert ' World' at position 8
+        expect(mockCore.delete).not.toHaveBeenCalled();
+        expect(mockCore.insert).toHaveBeenCalledWith(8, ' World');
     });
 });

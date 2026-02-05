@@ -330,8 +330,10 @@ describe('Encrypted Collaboration Integration', () => {
                 encryptionKey: new Uint8Array(0), // Empty key
             };
 
-            // Should not throw during construction
-            expect(() => new CollabClient(core, config)).not.toThrow();
+            // Should throw ConfigValidationError for invalid key length
+            expect(() => new CollabClient(core, config)).toThrow(
+                'encryptionKey must be exactly 32 bytes for AES-256, got 0 bytes'
+            );
         });
     });
 

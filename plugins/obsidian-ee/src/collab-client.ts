@@ -26,6 +26,87 @@ export interface YrsUpdateMessage {
     signature?: number[];
 }
 
+/**
+ * Interface for WASM CollabError objects returned from Rust.
+ * These are plain JS objects with type and message fields.
+ */
+interface WasmCollabError {
+    type: string;
+    message: string;
+}
+
+/**
+ * Type guard to check if an error is a WASM CollabError object.
+ */
+function isWasmCollabError(error: unknown): error is WasmCollabError {
+    return (
+        typeof error === 'object' &&
+        error !== null &&
+        'type' in error &&
+        'message' in error &&
+        typeof (error as WasmCollabError).type === 'string' &&
+        typeof (error as WasmCollabError).message === 'string'
+    );
+}
+
+/**
+ * Extract error message from various error types including WASM errors.
+ * WASM errors are plain objects that would produce "[object Object]" with String().
+ */
+function extractErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message;
+    }
+    if (isWasmCollabError(error)) {
+        return `[${error.type}] ${error.message}`;
+    }
+    return String(error);
+}
+
+/**
+ * Validation error thrown when CollabClientConfig has invalid values.
+ */
+export class ConfigValidationError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'ConfigValidationError';
+    }
+}
+
+/**
+ * Validate CollabClientConfig values at runtime.
+ * Throws ConfigValidationError if validation fails.
+ */
+function validateConfig(config: CollabClientConfig): void {
+    // Validate relayUrl
+    if (!config.relayUrl || typeof config.relayUrl !== 'string') {
+        throw new ConfigValidationError('relayUrl must be a non-empty string');
+    }
+    if (!config.relayUrl.startsWith('ws://') && !config.relayUrl.startsWith('wss://')) {
+        throw new ConfigValidationError('relayUrl must start with ws:// or wss://');
+    }
+
+    // Validate userId
+    if (!config.userId || typeof config.userId !== 'string') {
+        throw new ConfigValidationError('userId must be a non-empty string');
+    }
+
+    // Validate docId
+    if (!config.docId || typeof config.docId !== 'string') {
+        throw new ConfigValidationError('docId must be a non-empty string');
+    }
+
+    // Validate encryptionKey
+    if (!(config.encryptionKey instanceof Uint8Array)) {
+        throw new ConfigValidationError('encryptionKey must be a Uint8Array');
+    }
+    if (config.encryptionKey.length !== 32) {
+        throw new ConfigValidationError(
+            `encryptionKey must be exactly 32 bytes for AES-256, got ${config.encryptionKey.length} bytes`
+        );
+    }
+}
+
 export class CollabClient {
     private ws: WebSocket | null = null;
     private collabCore: CollabCore;
@@ -44,6 +125,7 @@ export class CollabClient {
     private connectPromise: Promise<void> | null = null;
 
     constructor(collabCore: CollabCore, config: CollabClientConfig) {
+        validateConfig(config);
         this.collabCore = collabCore;
         this.config = config;
         this.collabCore.set_encryption_key(config.encryptionKey);
@@ -199,7 +281,7 @@ export class CollabClient {
             if (this.onErrorCallback) {
                 const collabError: CollabError = {
                     type: 'sync',
-                    message: `Failed to parse message: ${error instanceof Error ? error.message : String(error)}`,
+                    message: `Failed to parse message: ${extractErrorMessage(error)}`,
                     docId: this.config.docId,
                     originalError: error instanceof Error ? error : undefined,
                 };
@@ -224,7 +306,7 @@ export class CollabClient {
             if (this.onErrorCallback) {
                 const collabError: CollabError = {
                     type: 'decryption',
-                    message: error instanceof Error ? error.message : String(error),
+                    message: extractErrorMessage(error),
                     docId: this.config.docId,
                     originalError: error instanceof Error ? error : undefined,
                 };
@@ -337,7 +419,7 @@ export class CollabClient {
             if (this.onErrorCallback) {
                 const collabError: CollabError = {
                     type: 'sync',
-                    message: error instanceof Error ? error.message : String(error),
+                    message: extractErrorMessage(error),
                     docId: this.config.docId,
                     originalError: error instanceof Error ? error : undefined,
                 };
