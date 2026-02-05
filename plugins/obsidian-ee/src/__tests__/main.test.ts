@@ -17,8 +17,33 @@ jest.mock('obsidian', () => ({
             this.manifest = manifest;
         }
         addCommand(_cmd: any): void {}
+        addSettingTab(_tab: any): void {}
         registerEvent(_event: any): void {}
+        loadData(): Promise<any> {
+            return Promise.resolve({});
+        }
+        saveData(_data: any): Promise<void> {
+            return Promise.resolve();
+        }
     },
+    PluginSettingTab: class {
+        app: any;
+        plugin: any;
+        containerEl: any;
+        constructor(app: any, plugin: any) {
+            this.app = app;
+            this.plugin = plugin;
+            this.containerEl = {
+                empty: jest.fn(),
+                createEl: jest.fn(),
+            };
+        }
+    },
+    Setting: jest.fn().mockImplementation(() => ({
+        setName: jest.fn().mockReturnThis(),
+        setDesc: jest.fn().mockReturnThis(),
+        addText: jest.fn().mockReturnThis(),
+    })),
     Notice: jest.fn(),
     MarkdownView: class {},
 }));

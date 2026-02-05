@@ -3,18 +3,64 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use getrandom::getrandom;
+use js_sys;
 use wasm_bindgen::prelude::*;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, Text, TextRef, Transact};
 
-/// Internal error type for encryption operations.
+/// Error types for WASM operations.
 #[derive(Debug, Clone)]
-pub struct CollabError(String);
+pub enum CollabErrorType {
+    Encryption,
+    Decryption,
+    KeyError,
+    SyncError,
+}
+
+impl CollabErrorType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CollabErrorType::Encryption => "encryption",
+            CollabErrorType::Decryption => "decryption",
+            CollabErrorType::KeyError => "key_error",
+            CollabErrorType::SyncError => "sync_error",
+        }
+    }
+}
+
+/// Internal error type for WASM operations.
+#[derive(Debug, Clone)]
+pub struct CollabError {
+    error_type: CollabErrorType,
+    message: String,
+}
+
+impl CollabError {
+    fn new(error_type: CollabErrorType, message: impl Into<String>) -> Self {
+        Self { error_type, message: message.into() }
+    }
+
+    fn encryption(message: impl Into<String>) -> Self {
+        Self::new(CollabErrorType::Encryption, message)
+    }
+
+    fn decryption(message: impl Into<String>) -> Self {
+        Self::new(CollabErrorType::Decryption, message)
+    }
+
+    fn key_error(message: impl Into<String>) -> Self {
+        Self::new(CollabErrorType::KeyError, message)
+    }
+
+    fn sync_error(message: impl Into<String>) -> Self {
+        Self::new(CollabErrorType::SyncError, message)
+    }
+}
 
 impl std::fmt::Display for CollabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "[{}] {}", self.error_type.as_str(), self.message)
     }
 }
 
@@ -22,7 +68,11 @@ impl std::error::Error for CollabError {}
 
 impl From<CollabError> for JsValue {
     fn from(err: CollabError) -> Self {
-        JsValue::from_str(&err.0)
+        // Create a structured JS object with type and message fields
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &"type".into(), &err.error_type.as_str().into()).unwrap();
+        js_sys::Reflect::set(&obj, &"message".into(), &err.message.into()).unwrap();
+        obj.into()
     }
 }
 
@@ -39,7 +89,7 @@ impl CollabCore {
     /// This is an MVP implementation - will be replaced with MLS later.
     pub fn set_encryption_key_internal(&mut self, key: &[u8]) -> Result<(), CollabError> {
         if key.len() != 32 {
-            return Err(CollabError("Key must be 32 bytes".to_string()));
+            return Err(CollabError::key_error("Key must be 32 bytes"));
         }
         self.encryption_key = Some(key.to_vec());
         Ok(())
@@ -51,17 +101,19 @@ impl CollabCore {
         let key = self
             .encryption_key
             .as_ref()
-            .ok_or_else(|| CollabError("No encryption key set".to_string()))?;
+            .ok_or_else(|| CollabError::key_error("No encryption key set"))?;
 
-        let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CollabError(e.to_string()))?;
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|e| CollabError::encryption(e.to_string()))?;
 
         let mut nonce_bytes = [0u8; 12];
         getrandom(&mut nonce_bytes)
-            .map_err(|e| CollabError(format!("Failed to generate nonce: {}", e)))?;
+            .map_err(|e| CollabError::encryption(format!("Failed to generate nonce: {}", e)))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext =
-            cipher.encrypt(nonce, plaintext).map_err(|e| CollabError(e.to_string()))?;
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| CollabError::encryption(e.to_string()))?;
 
         // Prepend nonce to ciphertext
         let mut result = nonce_bytes.to_vec();
@@ -73,27 +125,32 @@ impl CollabCore {
     /// Expects nonce (12 bytes) prepended to ciphertext.
     pub fn decrypt_internal(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CollabError> {
         if ciphertext.len() < 12 {
-            return Err(CollabError("Ciphertext too short".to_string()));
+            return Err(CollabError::decryption("Ciphertext too short"));
         }
 
         let key = self
             .encryption_key
             .as_ref()
-            .ok_or_else(|| CollabError("No encryption key set".to_string()))?;
+            .ok_or_else(|| CollabError::key_error("No encryption key set"))?;
 
-        let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CollabError(e.to_string()))?;
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|e| CollabError::decryption(e.to_string()))?;
 
         let (nonce_bytes, encrypted) = ciphertext.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        cipher.decrypt(nonce, encrypted).map_err(|e| CollabError(e.to_string()))
+        cipher
+            .decrypt(nonce, encrypted)
+            .map_err(|e| CollabError::decryption(e.to_string()))
     }
 
     /// Apply an update from another document (internal).
     pub fn apply_update_internal(&mut self, update: &[u8]) -> Result<(), CollabError> {
-        let update = yrs::Update::decode_v1(update).map_err(|e| CollabError(e.to_string()))?;
+        let update = yrs::Update::decode_v1(update)
+            .map_err(|e| CollabError::sync_error(e.to_string()))?;
         let mut txn = self.doc.transact_mut();
-        txn.apply_update(update).map_err(|e| CollabError(e.to_string()))?;
+        txn.apply_update(update)
+            .map_err(|e| CollabError::sync_error(e.to_string()))?;
         Ok(())
     }
 

@@ -22,6 +22,11 @@ rust-version = "1.75"
 yrs = "0.21"
 
 # MLS (Messaging Layer Security)
+# Note: default-features = false is required because:
+# 1. The default "backtrace" feature requires std::backtrace which is unstable
+# 2. WASM targets don't support all default features (threading, filesystem)
+# 3. Reduces binary size by only including required features
+# Individual crates can opt-in to specific features if needed.
 openmls = { version = "0.7", default-features = false }
 openmls_rust_crypto = "0.4"
 openmls_basic_credential = "0.4"

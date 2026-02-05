@@ -1,9 +1,18 @@
-import { Plugin, Notice, MarkdownView } from 'obsidian';
+import { Plugin, Notice, MarkdownView, PluginSettingTab, App, Setting } from 'obsidian';
 import init, { CollabCore } from './wasm/collab_wasm';
 import { CollabClient, CollabClientConfig } from './collab-client';
 import { EditorSync } from './editor-sync';
 
+interface CollabPluginSettings {
+    relayUrl: string;
+}
+
+const DEFAULT_SETTINGS: CollabPluginSettings = {
+    relayUrl: 'ws://localhost:8080',
+};
+
 export default class CollabPlugin extends Plugin {
+    settings: CollabPluginSettings = DEFAULT_SETTINGS;
     private collabCore: CollabCore | null = null;
     private collabClient: CollabClient | null = null;
     private editorSync: EditorSync | null = null;
@@ -12,6 +21,8 @@ export default class CollabPlugin extends Plugin {
 
     async onload() {
         console.log('Loading Obsidian E2E Collaboration plugin');
+
+        await this.loadSettings();
 
         try {
             await this.initWasm();
@@ -26,10 +37,21 @@ export default class CollabPlugin extends Plugin {
                 name: 'Stop Collaboration Session',
                 callback: () => this.stopSession(),
             });
+
+            // Add settings tab
+            this.addSettingTab(new CollabSettingTab(this.app, this));
         } catch (error) {
             console.error('Failed to initialize WASM:', error);
             new Notice('Failed to load collaboration plugin');
         }
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
     }
 
     async initWasm(): Promise<void> {
@@ -65,9 +87,8 @@ export default class CollabPlugin extends Plugin {
             return;
         }
 
-        // TODO: Get these from settings or modal
         const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
+            relayUrl: this.settings.relayUrl,
             userId: `user-${Date.now()}`,
             docId: activeView.file?.path || 'unknown',
             // SECURITY: This is a PLACEHOLDER key - all zeros, completely insecure!
@@ -174,5 +195,34 @@ export default class CollabPlugin extends Plugin {
             }
             this.collabCore = null;
         }
+    }
+}
+
+class CollabSettingTab extends PluginSettingTab {
+    plugin: CollabPlugin;
+
+    constructor(app: App, plugin: CollabPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display(): void {
+        const { containerEl, plugin } = this;
+        containerEl.empty();
+
+        containerEl.createEl('h2', { text: 'E2E Collaboration Settings' });
+
+        new Setting(containerEl)
+            .setName('Relay Server URL')
+            .setDesc('WebSocket URL of the collaboration relay server')
+            .addText((text) =>
+                text
+                    .setPlaceholder('ws://localhost:8080')
+                    .setValue(plugin.settings.relayUrl)
+                    .onChange(async (value) => {
+                        plugin.settings.relayUrl = value;
+                        await plugin.saveSettings();
+                    })
+            );
     }
 }
