@@ -1,0 +1,22 @@
+[package]
+name = "collab-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for collaborative editing"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+yrs.workspace = true
+js-sys = "0.3"
+# For simplified encryption (MVP) - will be replaced with MLS later
+aes-gcm = "0.10"
+
+[dependencies.web-sys]
+workspace = true
+features = ["console", "Crypto", "SubtleCrypto"]
+
+[dependencies.getrandom]
+workspace = true
