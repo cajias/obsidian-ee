@@ -8,7 +8,9 @@ jest.mock('../collab-client', () => ({
         return {
             getText: jest.fn().mockReturnValue(''),
             sendUpdate: jest.fn(),
-            onUpdate: jest.fn((cb) => { updateCallback = cb; }),
+            onUpdate: jest.fn((cb) => {
+                updateCallback = cb;
+            }),
             // Helper to trigger updates in tests
             _triggerUpdate: (text: string) => updateCallback?.(text),
         };
@@ -22,9 +24,13 @@ const createMockEditor = (initialValue = '') => {
 
     return {
         getValue: jest.fn(() => value),
-        setValue: jest.fn((v: string) => { value = v; }),
+        setValue: jest.fn((v: string) => {
+            value = v;
+        }),
         getCursor: jest.fn(() => cursor),
-        setCursor: jest.fn((c: { line: number; ch: number }) => { cursor = c; }),
+        setCursor: jest.fn((c: { line: number; ch: number }) => {
+            cursor = c;
+        }),
     };
 };
 
@@ -117,7 +123,9 @@ describe('EditorSync', () => {
             const errorCallback = jest.fn();
             const editor = createMockEditor('local text');
             editor.setValue.mockImplementation(() => {
-                throw 'string error'; // Non-Error throw
+                // Create an object that looks like an error but isn't instanceof Error
+                // This tests that our code handles non-Error throws correctly
+                throw Object.assign({}, { message: 'string error' });
             });
             const view = createMockView(editor);
 
@@ -225,7 +233,7 @@ describe('EditorSync', () => {
             expect(client.sendUpdate).toHaveBeenCalledWith('updated text');
             expect(errorCallback).toHaveBeenCalledWith(
                 expect.objectContaining({
-                    message: 'Failed to send update - changes may not be synced'
+                    message: 'Failed to send update - changes may not be synced',
                 })
             );
         });

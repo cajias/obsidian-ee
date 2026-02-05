@@ -164,7 +164,7 @@ describe('CollabPlugin', () => {
             // Should show console warning
             expect(consoleWarnSpy).toHaveBeenCalledWith(
                 '[CollabPlugin] SECURITY WARNING: Using placeholder encryption key. ' +
-                'This is insecure and should only be used for development.'
+                    'This is insecure and should only be used for development.'
             );
 
             // Should show Notice to user

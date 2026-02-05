@@ -64,7 +64,7 @@ export default class CollabPlugin extends Plugin {
         // Warn about insecure placeholder key
         console.warn(
             '[CollabPlugin] SECURITY WARNING: Using placeholder encryption key. ' +
-            'This is insecure and should only be used for development.'
+                'This is insecure and should only be used for development.'
         );
         new Notice('Warning: Using insecure placeholder encryption key', 5000);
 

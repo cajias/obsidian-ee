@@ -96,7 +96,10 @@ export class EditorSync {
                 const newLineCount = text.split('\n').length;
                 const newCursor = {
                     line: Math.min(cursor.line, newLineCount - 1),
-                    ch: Math.min(cursor.ch, (text.split('\n')[Math.min(cursor.line, newLineCount - 1)] || '').length),
+                    ch: Math.min(
+                        cursor.ch,
+                        (text.split('\n')[Math.min(cursor.line, newLineCount - 1)] || '').length
+                    ),
                 };
                 this.editor.setCursor(newCursor);
             }

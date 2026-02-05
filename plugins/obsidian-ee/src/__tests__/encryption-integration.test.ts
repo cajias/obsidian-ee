@@ -152,7 +152,7 @@ describe('Encrypted Collaboration Integration', () => {
             expect(core.encode_state_encrypted).toHaveBeenCalled();
 
             const ws = MockWebSocket.instances[0];
-            const updateMsg = ws.sentMessages.find(m => m.type === 'yrs_update');
+            const updateMsg = ws.sentMessages.find((m) => m.type === 'yrs_update');
 
             expect(updateMsg).toBeDefined();
             expect(updateMsg.encrypted).toBeDefined();
@@ -182,7 +182,7 @@ describe('Encrypted Collaboration Integration', () => {
             client.sendUpdate('Test message');
 
             const ws = MockWebSocket.instances[0];
-            const updateMsg = ws.sentMessages.find(m => m.type === 'yrs_update');
+            const updateMsg = ws.sentMessages.find((m) => m.type === 'yrs_update');
 
             expect(updateMsg).toMatchObject({
                 type: 'yrs_update',
@@ -378,7 +378,7 @@ describe('Encrypted Collaboration Integration', () => {
 
             // Get the encrypted message sent by client1
             const ws1 = MockWebSocket.instances[0];
-            const sentUpdate = ws1.sentMessages.find(m => m.type === 'yrs_update');
+            const sentUpdate = ws1.sentMessages.find((m) => m.type === 'yrs_update');
             expect(sentUpdate).toBeDefined();
 
             // Simulate client2 receiving this encrypted update

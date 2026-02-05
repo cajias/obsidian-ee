@@ -97,35 +97,42 @@ const createMockCollabCore = () => {
             if (!encryptionKey || encryptionKey.length === 0) {
                 throw new Error('No encryption key set');
             }
+            // Capture key after null check for TypeScript
+            const key = encryptionKey;
             // Simulate encryption: marker bytes + XOR with key + text
             const encodedText = new TextEncoder().encode(text);
             const result = new Uint8Array(4 + encodedText.length);
             // Use first 4 bytes of key as "marker" to verify decryption
-            result.set(encryptionKey.slice(0, 4), 0);
+            result.set(key.slice(0, 4), 0);
             // XOR text with key for simple "encryption"
-            for (let i = 0; i < encodedText.length; i++) {
-                result[4 + i] = encodedText[i] ^ encryptionKey[i % encryptionKey.length];
-            }
+            encodedText.forEach((byte, idx) => {
+                const keyByte = key.at(idx % key.length) ?? 0;
+                result.set([byte ^ keyByte], 4 + idx);
+            });
             return result;
         }),
         apply_update_encrypted: jest.fn((encrypted: Uint8Array) => {
             if (!encryptionKey || encryptionKey.length === 0) {
                 throw new Error('No encryption key set');
             }
+            // Capture key after null check for TypeScript
+            const key = encryptionKey;
             // Verify marker bytes match
             const marker = encrypted.slice(0, 4);
-            const expectedMarker = encryptionKey.slice(0, 4);
-            for (let i = 0; i < 4; i++) {
-                if (marker[i] !== expectedMarker[i]) {
-                    throw new Error('Decryption failed: key mismatch');
-                }
+            const expectedMarker = key.slice(0, 4);
+            const markerMatches = marker.every(
+                (byte, idx) => byte === (expectedMarker.at(idx) ?? -1)
+            );
+            if (!markerMatches) {
+                throw new Error('Decryption failed: key mismatch');
             }
             // XOR to decrypt
             const encryptedText = encrypted.slice(4);
             const decrypted = new Uint8Array(encryptedText.length);
-            for (let i = 0; i < encryptedText.length; i++) {
-                decrypted[i] = encryptedText[i] ^ encryptionKey[i % encryptionKey.length];
-            }
+            encryptedText.forEach((byte, idx) => {
+                const keyByte = key.at(idx % key.length) ?? 0;
+                decrypted.set([byte ^ keyByte], idx);
+            });
             text = new TextDecoder().decode(decrypted);
         }),
         free: jest.fn(),
@@ -430,10 +437,7 @@ describe('Two User Collaboration Integration', () => {
         await new Promise((r) => setTimeout(r, 200));
 
         // User2 should fail to decrypt (key mismatch)
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
-            'Failed to apply update:',
-            expect.any(Error)
-        );
+        expect(consoleErrorSpy).toHaveBeenCalledWith('Failed to apply update:', expect.any(Error));
 
         consoleErrorSpy.mockRestore();
 

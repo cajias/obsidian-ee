@@ -37,7 +37,8 @@ export class CollabClient {
     private maxReconnectAttempts = 5;
     private reconnectDelay = 1000;
     private messageQueue: object[] = [];
-    private connectionState: 'connected' | 'connecting' | 'disconnected' | 'reconnecting' = 'disconnected';
+    private connectionState: 'connected' | 'connecting' | 'disconnected' | 'reconnecting' =
+        'disconnected';
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private isInitialConnect = true;
 
