@@ -66,6 +66,7 @@ export class EditorSync {
     }
 
     private sendLocalUpdate(): void {
+        // Guard against execution after unbind - both editor and timer should be valid
         if (!this.editor) return;
 
         const text = this.editor.getValue();
@@ -119,13 +120,18 @@ export class EditorSync {
      * Flushes any pending updates before disconnecting to prevent data loss
      */
     unbind(): void {
-        // Flush pending updates before clearing the timer
-        if (this.debounceTimer && this.editor) {
+        // Clear timer first to prevent any queued callbacks from executing
+        if (this.debounceTimer) {
             clearTimeout(this.debounceTimer);
             this.debounceTimer = null;
-            // Send any pending changes immediately
+        }
+
+        // Flush any pending changes while editor is still valid
+        if (this.editor) {
+            // Send final update synchronously before nulling editor
             this.sendLocalUpdate();
         }
+
         this.editor = null;
     }
 

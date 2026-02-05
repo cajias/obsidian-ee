@@ -67,8 +67,25 @@ export default class CollabPlugin extends Plugin {
         const wasmBuffer = await this.app.vault.adapter.readBinary(wasmPath);
 
         // Compile the WASM module first - init() expects a compiled module, not raw bytes
-        const wasmModule = await WebAssembly.compile(wasmBuffer);
-        await init(wasmModule);
+        let wasmModule: WebAssembly.Module;
+        try {
+            wasmModule = await WebAssembly.compile(wasmBuffer);
+        } catch (error) {
+            if (error instanceof WebAssembly.CompileError) {
+                throw new Error(`WASM compilation failed: ${error.message}`);
+            }
+            throw new Error(
+                `Failed to load WASM module: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+
+        try {
+            await init(wasmModule);
+        } catch (error) {
+            throw new Error(
+                `WASM initialization failed: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
 
         this.collabCore = new CollabCore();
         this.wasmInitialized = true;

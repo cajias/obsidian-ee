@@ -316,6 +316,12 @@ export class CollabClient {
     }
 
     private handleReconnect(): void {
+        // Clear any existing timer to prevent old timers from interfering
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
             this.connectionState = 'reconnecting';
             this.reconnectAttempts++;
