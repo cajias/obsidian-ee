@@ -86,7 +86,10 @@ export class EditorSync {
 
     private sendLocalUpdate(): void {
         // Guard against execution after unbind - both editor and timer should be valid
-        if (!this.editor) return;
+        if (!this.editor) {
+            console.debug('[EditorSync] sendLocalUpdate called after unbind, skipping');
+            return;
+        }
 
         const text = this.editor.getValue();
         const sent = this.client.sendUpdate(text);

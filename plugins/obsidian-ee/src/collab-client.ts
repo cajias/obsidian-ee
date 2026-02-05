@@ -281,6 +281,12 @@ export class CollabClient {
                         this.onErrorCallback(collabError);
                     }
                     break;
+                default:
+                    console.warn(
+                        `[CollabClient] Unknown message type received: ${message.type}`,
+                        message
+                    );
+                    break;
             }
         } catch (error) {
             console.error('Failed to parse message:', error);
