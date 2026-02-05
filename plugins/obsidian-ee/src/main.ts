@@ -7,6 +7,8 @@ interface CollabPluginSettings {
     relayUrl: string;
 }
 
+// SECURITY: Default uses ws:// for local development only.
+// Production deployments MUST use wss:// (TLS-encrypted WebSocket).
 const DEFAULT_SETTINGS: CollabPluginSettings = {
     relayUrl: 'ws://localhost:8080',
 };
@@ -256,7 +258,7 @@ class CollabSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Relay Server URL')
-            .setDesc('WebSocket URL of the collaboration relay server')
+            .setDesc('WebSocket URL of the relay server. Use wss:// for production.')
             .addText((text) =>
                 text
                     .setPlaceholder('ws://localhost:8080')
