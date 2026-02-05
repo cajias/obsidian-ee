@@ -217,21 +217,40 @@ class IntegrationMockRelay {
     }
 
     async stop(): Promise<void> {
-        return new Promise((resolve) => {
-            if (this.wss) {
-                // Close all client connections first
-                this.clients.forEach((client) => {
-                    client.close();
-                });
-                this.clients.clear();
+        if (!this.wss) {
+            return;
+        }
 
-                this.wss.close(() => {
-                    this.wss = null;
-                    resolve();
-                });
-            } else {
-                resolve();
+        // Wait for all client connections to close
+        const closePromises: Promise<void>[] = [];
+        this.clients.forEach((client) => {
+            if (
+                client.readyState === WebSocket.OPEN ||
+                client.readyState === WebSocket.CONNECTING
+            ) {
+                closePromises.push(
+                    new Promise((resolve) => {
+                        client.once('close', () => resolve());
+                        client.close();
+                    })
+                );
             }
+        });
+
+        // Wait for all clients to close (with timeout)
+        await Promise.race([
+            Promise.all(closePromises),
+            new Promise((resolve) => setTimeout(resolve, 1000)), // 1s timeout
+        ]);
+
+        this.clients.clear();
+
+        // Close the server
+        return new Promise((resolve) => {
+            this.wss!.close(() => {
+                this.wss = null;
+                resolve();
+            });
         });
     }
 }
@@ -425,8 +444,16 @@ describe('Two User Collaboration Integration', () => {
         const client1 = new CollabClient(core1, config1);
         const client2 = new CollabClient(core2, config2);
 
-        // Track errors
+        // Track errors via console and callback
         const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const errorCallback = jest.fn();
+        client2.onError(errorCallback);
+
+        // Track any updates that client2 might receive
+        const receivedUpdates: string[] = [];
+        client2.onUpdate((text) => {
+            receivedUpdates.push(text);
+        });
 
         // Connect both clients
         await Promise.all([client1.connect(), client2.connect()]);
@@ -438,6 +465,20 @@ describe('Two User Collaboration Integration', () => {
 
         // User2 should fail to decrypt (key mismatch)
         expect(consoleErrorSpy).toHaveBeenCalledWith('Failed to apply update:', expect.any(Error));
+
+        // Error callback should be invoked with decryption error
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'decryption',
+                message: expect.stringContaining('key mismatch'),
+            })
+        );
+
+        // User2 should NOT have received any successful updates
+        expect(receivedUpdates).toHaveLength(0);
+
+        // User2's document should still be empty (wrong key = no content applied)
+        expect(client2.getText()).toBe('');
 
         consoleErrorSpy.mockRestore();
 

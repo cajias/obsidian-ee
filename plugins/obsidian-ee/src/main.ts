@@ -70,10 +70,15 @@ export default class CollabPlugin extends Plugin {
             relayUrl: 'ws://localhost:8080',
             userId: `user-${Date.now()}`,
             docId: activeView.file?.path || 'unknown',
-            encryptionKey: new Uint8Array(32), // TODO: Generate/share proper key
+            // SECURITY: This is a PLACEHOLDER key - all zeros, completely insecure!
+            // Production MUST use:
+            // 1. Cryptographically-secure random key generation (crypto.getRandomValues)
+            // 2. Secure key exchange mechanism (e.g., via MLS handshake)
+            // 3. Key stored securely, never hardcoded
+            encryptionKey: new Uint8Array(32),
         };
 
-        // Warn about insecure placeholder key
+        // SECURITY WARNING: Warn about insecure placeholder key
         console.warn(
             '[CollabPlugin] SECURITY WARNING: Using placeholder encryption key. ' +
                 'This is insecure and should only be used for development.'

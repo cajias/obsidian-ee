@@ -109,11 +109,13 @@ describe('CollabClient', () => {
             jest.runAllTimers();
             await connectPromise;
 
+            // Delta-diff: "old content" → "new content"
+            // Common suffix is " content", so only "old" → "new" changes
             mockCore.get_text.mockReturnValue('old content');
             client.sendUpdate('new content');
 
-            expect(mockCore.delete).toHaveBeenCalledWith(0, 11); // 'old content'.length
-            expect(mockCore.insert).toHaveBeenCalledWith(0, 'new content');
+            expect(mockCore.delete).toHaveBeenCalledWith(0, 3); // delete "old"
+            expect(mockCore.insert).toHaveBeenCalledWith(0, 'new'); // insert "new"
             expect(mockCore.encode_state_encrypted).toHaveBeenCalled();
         });
 
@@ -179,7 +181,6 @@ describe('CollabClient', () => {
 describe('CollabClient message handling', () => {
     let client: CollabClient;
     let mockCore: any;
-    let _mockWs: MockWebSocket;
 
     beforeEach(() => {
         jest.useFakeTimers();

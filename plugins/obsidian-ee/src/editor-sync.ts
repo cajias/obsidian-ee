@@ -93,13 +93,14 @@ export class EditorSync {
                 this.editor.setValue(text);
 
                 // Restore cursor (clamped to valid range)
-                const newLineCount = text.split('\n').length;
+                const lines = text.split('\n');
+                const newLineCount = lines.length;
+                // Handle empty document case - ensure targetLine is at least 0
+                const targetLine = Math.max(0, Math.min(cursor.line, newLineCount - 1));
+                const targetLineContent = lines.at(targetLine) ?? '';
                 const newCursor = {
-                    line: Math.min(cursor.line, newLineCount - 1),
-                    ch: Math.min(
-                        cursor.ch,
-                        (text.split('\n')[Math.min(cursor.line, newLineCount - 1)] || '').length
-                    ),
+                    line: targetLine,
+                    ch: Math.min(cursor.ch, targetLineContent.length),
                 };
                 this.editor.setCursor(newCursor);
             }
@@ -115,10 +116,15 @@ export class EditorSync {
 
     /**
      * Unbind from the current editor
+     * Flushes any pending updates before disconnecting to prevent data loss
      */
     unbind(): void {
-        if (this.debounceTimer) {
+        // Flush pending updates before clearing the timer
+        if (this.debounceTimer && this.editor) {
             clearTimeout(this.debounceTimer);
+            this.debounceTimer = null;
+            // Send any pending changes immediately
+            this.sendLocalUpdate();
         }
         this.editor = null;
     }

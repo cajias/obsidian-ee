@@ -362,19 +362,21 @@ describe('EditorSync', () => {
             expect(sync.getText()).toBe('');
         });
 
-        it('should prevent pending updates from being sent', () => {
+        it('should flush pending updates when unbinding to prevent data loss', () => {
             const editor = createMockEditor('some text');
             const view = createMockView(editor);
+
+            // Make getText return same value so bindToEditor doesn't overwrite local
+            client.getText.mockReturnValue('some text');
 
             sync.bindToEditor(view as any);
             sync.onLocalChange();
 
-            // Unbind before debounce fires
+            // Unbind before debounce fires - pending update should be sent immediately
             sync.unbind();
 
-            jest.advanceTimersByTime(150);
-
-            expect(client.sendUpdate).not.toHaveBeenCalled();
+            // Update should have been sent during unbind, not after timer
+            expect(client.sendUpdate).toHaveBeenCalledWith('some text');
         });
     });
 

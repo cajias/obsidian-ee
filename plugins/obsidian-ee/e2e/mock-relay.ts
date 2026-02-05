@@ -12,6 +12,9 @@ export class MockRelay {
                     const msg = JSON.parse(data.toString());
                     if (msg.type === 'identify') {
                         this.clients.set(msg.user_id, ws);
+                    } else if (msg.type === 'subscribe') {
+                        // Send subscription acknowledgment like the real server
+                        ws.send(JSON.stringify({ type: 'subscribed', doc_id: msg.doc_id }));
                     } else {
                         // Broadcast to other clients
                         this.broadcast(ws, data.toString());

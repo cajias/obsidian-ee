@@ -41,6 +41,7 @@ export class CollabClient {
         'disconnected';
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private isInitialConnect = true;
+    private connectPromise: Promise<void> | null = null;
 
     constructor(collabCore: CollabCore, config: CollabClientConfig) {
         this.collabCore = collabCore;
@@ -49,8 +50,13 @@ export class CollabClient {
     }
 
     connect(): Promise<void> {
+        // Prevent concurrent connection attempts
+        if (this.connectPromise) {
+            return this.connectPromise;
+        }
+
         this.connectionState = 'connecting';
-        return new Promise((resolve, reject) => {
+        this.connectPromise = new Promise<void>((resolve, reject) => {
             try {
                 this.ws = new WebSocket(this.config.relayUrl);
 
@@ -58,6 +64,7 @@ export class CollabClient {
                     console.log('Connected to relay server');
                     this.connectionState = 'connected';
                     this.isInitialConnect = false;
+                    this.connectPromise = null;
 
                     // Critical: verify initialization messages are sent
                     const identified = this.sendIdentify();
@@ -110,7 +117,12 @@ export class CollabClient {
             } catch (error) {
                 reject(error);
             }
+        }).finally(() => {
+            // Clear promise tracking on completion (success or failure)
+            this.connectPromise = null;
         });
+
+        return this.connectPromise;
     }
 
     private sendIdentify(): boolean {
@@ -257,14 +269,58 @@ export class CollabClient {
         }
     }
 
+    /**
+     * Apply a minimal text diff between the current CRDT text and the new text.
+     * This avoids clearing and reinserting the entire document, which is
+     * critical for proper CRDT collaborative behavior.
+     */
+    private applyTextDiff(oldText: string, newText: string): void {
+        if (oldText === newText) {
+            return;
+        }
+
+        const oldLen = oldText.length;
+        const newLen = newText.length;
+
+        // Find common prefix length
+        let prefixLen = 0;
+        const maxPrefix = Math.min(oldLen, newLen);
+        while (prefixLen < maxPrefix && oldText.charAt(prefixLen) === newText.charAt(prefixLen)) {
+            prefixLen++;
+        }
+
+        // Find common suffix length (after the prefix)
+        let oldEnd = oldLen;
+        let newEnd = newLen;
+        while (
+            oldEnd > prefixLen &&
+            newEnd > prefixLen &&
+            oldText.charAt(oldEnd - 1) === newText.charAt(newEnd - 1)
+        ) {
+            oldEnd--;
+            newEnd--;
+        }
+
+        // Calculate what to delete and insert
+        const deleteLen = oldEnd - prefixLen;
+        const insertText = newText.slice(prefixLen, newEnd);
+
+        // Apply minimal operations
+        if (deleteLen > 0) {
+            this.collabCore.delete(prefixLen, deleteLen);
+        }
+        if (insertText.length > 0) {
+            this.collabCore.insert(prefixLen, insertText);
+        }
+    }
+
     sendUpdate(text: string): boolean {
         try {
-            // Insert the text at the end (simple append for MVP)
             const currentText = this.collabCore.get_text();
+
             if (text !== currentText) {
-                // Clear and reinsert (simple approach for MVP)
-                this.collabCore.delete(0, currentText.length);
-                this.collabCore.insert(0, text);
+                // Apply minimal diff instead of clearing and reinserting
+                this.applyTextDiff(currentText, text);
             }
 
             const encrypted = this.collabCore.encode_state_encrypted();
@@ -312,6 +368,8 @@ export class CollabClient {
 
     disconnect(): void {
         this.maxReconnectAttempts = 0; // Prevent reconnection
+        this.connectPromise = null; // Clear any pending connection promise
+        this.connectionState = 'disconnected';
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;

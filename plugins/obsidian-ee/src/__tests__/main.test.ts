@@ -1,22 +1,44 @@
 import { Notice } from 'obsidian';
 
+// Mock WebAssembly.compile for WASM loading
+const mockWasmModule = {};
+const mockCompile = jest.fn().mockResolvedValue(mockWasmModule);
+(global as unknown as { WebAssembly: typeof WebAssembly }).WebAssembly = {
+    ...WebAssembly,
+    compile: mockCompile,
+};
+
 jest.mock('obsidian', () => ({
-    Plugin: class {},
+    Plugin: class {
+        app: any;
+        manifest: any;
+        constructor(app: any, manifest: any) {
+            this.app = app;
+            this.manifest = manifest;
+        }
+        addCommand(_cmd: any): void {}
+        registerEvent(_event: any): void {}
+    },
     Notice: jest.fn(),
     MarkdownView: class {},
 }));
 
+const mockWasmInit = jest.fn().mockResolvedValue(undefined);
+const mockCollabCore = jest.fn().mockImplementation(() => ({
+    insert: jest.fn(),
+    delete: jest.fn(),
+    get_text: jest.fn().mockReturnValue(''),
+    encode_state: jest.fn().mockReturnValue(new Uint8Array()),
+    encode_state_encrypted: jest.fn().mockReturnValue(new Uint8Array()),
+    apply_update: jest.fn(),
+    set_encryption_key: jest.fn(),
+    free: jest.fn(),
+}));
+
 jest.mock('../wasm/collab_wasm', () => ({
     __esModule: true,
-    default: jest.fn().mockResolvedValue(undefined),
-    CollabCore: jest.fn().mockImplementation(() => ({
-        insert: jest.fn(),
-        delete: jest.fn(),
-        get_text: jest.fn().mockReturnValue(''),
-        encode_state: jest.fn().mockReturnValue(new Uint8Array()),
-        apply_update: jest.fn(),
-        free: jest.fn(),
-    })),
+    default: mockWasmInit,
+    CollabCore: mockCollabCore,
 }));
 
 jest.mock('../collab-client', () => ({
@@ -43,6 +65,29 @@ jest.mock('../editor-sync', () => ({
 
 import CollabPlugin from '../main';
 
+// Helper to create a properly mocked plugin instance
+function createMockPlugin(): CollabPlugin {
+    const mockApp = {
+        vault: {
+            adapter: {
+                readBinary: jest.fn().mockResolvedValue(new ArrayBuffer(8)),
+            },
+        },
+        workspace: {
+            getActiveViewOfType: jest.fn(),
+            on: jest.fn(),
+            offref: jest.fn(),
+        },
+    };
+    const mockManifest = {
+        dir: '/test/plugin/dir',
+        id: 'obsidian-ee',
+        name: 'Obsidian E2E',
+        version: '0.1.0',
+    };
+    return new CollabPlugin(mockApp as any, mockManifest as any);
+}
+
 describe('CollabPlugin', () => {
     let consoleSpy: jest.SpyInstance;
     let consoleWarnSpy: jest.SpyInstance;
@@ -51,6 +96,19 @@ describe('CollabPlugin', () => {
         consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
         consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
         jest.clearAllMocks();
+        // Restore mocks after clearAllMocks
+        mockCompile.mockResolvedValue(mockWasmModule);
+        mockWasmInit.mockResolvedValue(undefined);
+        mockCollabCore.mockImplementation(() => ({
+            insert: jest.fn(),
+            delete: jest.fn(),
+            get_text: jest.fn().mockReturnValue(''),
+            encode_state: jest.fn().mockReturnValue(new Uint8Array()),
+            encode_state_encrypted: jest.fn().mockReturnValue(new Uint8Array()),
+            apply_update: jest.fn(),
+            set_encryption_key: jest.fn(),
+            free: jest.fn(),
+        }));
     });
 
     afterEach(() => {
@@ -59,19 +117,24 @@ describe('CollabPlugin', () => {
     });
 
     it('should instantiate without error', () => {
-        const plugin = new CollabPlugin({} as any, {} as any);
+        const plugin = createMockPlugin();
         expect(plugin).toBeDefined();
     });
 
     it('should initialize WASM on load', async () => {
-        const plugin = new CollabPlugin({} as any, {} as any);
+        const plugin = createMockPlugin();
         await plugin.onload();
-        // WASM init should have been called
+
+        // Verify WASM was initialized
+        expect(mockWasmInit).toHaveBeenCalled();
+        expect(mockCollabCore).toHaveBeenCalled();
+        expect((plugin as any).collabCore).not.toBeNull();
+        expect((plugin as any).wasmInitialized).toBe(true);
     });
 
     describe('onunload', () => {
         it('should handle errors in stopSession gracefully', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             await plugin.onload();
 
             // Mock stopSession to throw
@@ -91,7 +154,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should handle errors in collabCore.free gracefully', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             await plugin.onload();
 
             // Access private collabCore and mock free to throw
@@ -111,7 +174,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should continue cleanup even if stopSession fails', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             await plugin.onload();
 
             const collabCore = (plugin as any).collabCore;
@@ -129,7 +192,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should set collabCore to null after freeing', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             await plugin.onload();
 
             plugin.onunload();
@@ -140,21 +203,20 @@ describe('CollabPlugin', () => {
 
     describe('startSession', () => {
         it('should warn about insecure placeholder encryption key', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
-            // Mock workspace to return an active view
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue({ unload: jest.fn() }),
-                },
+            const plugin = createMockPlugin();
+            // Add workspace mock while keeping vault adapter
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: jest.fn(),
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -175,22 +237,20 @@ describe('CollabPlugin', () => {
         });
 
         it('should register onError and onDisconnect callbacks', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             // Mock workspace to return an active view
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue({ unload: jest.fn() }),
-                    offref: jest.fn(),
-                },
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: jest.fn(),
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -203,21 +263,19 @@ describe('CollabPlugin', () => {
         });
 
         it('should register EditorSync error callback', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue({ unload: jest.fn() }),
-                    offref: jest.fn(),
-                },
+            const plugin = createMockPlugin();
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: jest.fn(),
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -229,22 +287,20 @@ describe('CollabPlugin', () => {
         });
 
         it('should store editor change handler reference', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             const mockHandler = { unload: jest.fn() };
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue(mockHandler),
-                    offref: jest.fn(),
-                },
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue(mockHandler),
+                offref: jest.fn(),
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -257,23 +313,21 @@ describe('CollabPlugin', () => {
 
     describe('stopSession', () => {
         it('should unregister editor change handler', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             const mockHandler = { unload: jest.fn() };
             const offrefMock = jest.fn();
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue(mockHandler),
-                    offref: offrefMock,
-                },
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue(mockHandler),
+                offref: offrefMock,
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -286,22 +340,20 @@ describe('CollabPlugin', () => {
         });
 
         it('should free and recreate CollabCore to prevent memory leak', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             const offrefMock = jest.fn();
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue({ unload: jest.fn() }),
-                    offref: offrefMock,
-                },
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: offrefMock,
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -320,22 +372,20 @@ describe('CollabPlugin', () => {
         });
 
         it('should handle errors when freeing CollabCore during stopSession', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             const offrefMock = jest.fn();
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue({ unload: jest.fn() }),
-                    offref: offrefMock,
-                },
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: offrefMock,
             };
             (plugin as any).registerEvent = jest.fn();
 
@@ -362,23 +412,21 @@ describe('CollabPlugin', () => {
         });
 
         it('should call stopSession when disconnect callback is invoked', async () => {
-            const plugin = new CollabPlugin({} as any, {} as any);
+            const plugin = createMockPlugin();
             let disconnectCallback: ((reason: string) => void) | null = null;
             const offrefMock = jest.fn();
-            (plugin as any).app = {
-                workspace: {
-                    getActiveViewOfType: jest.fn().mockReturnValue({
-                        file: { path: 'test.md' },
-                        editor: {
-                            getValue: jest.fn().mockReturnValue(''),
-                            setValue: jest.fn(),
-                            getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
-                            setCursor: jest.fn(),
-                        },
-                    }),
-                    on: jest.fn().mockReturnValue({ unload: jest.fn() }),
-                    offref: offrefMock,
-                },
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: offrefMock,
             };
             (plugin as any).registerEvent = jest.fn();
 
