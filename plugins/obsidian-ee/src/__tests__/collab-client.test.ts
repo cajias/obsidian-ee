@@ -760,6 +760,26 @@ describe('CollabClient error handling', () => {
                 })
             );
         });
+
+        it('should log warning for unknown message types', async () => {
+            const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            const connectPromise = client.connect();
+            jest.runAllTimers();
+            await connectPromise;
+
+            // Simulate unknown message type
+            (client as any).ws?.onmessage?.({
+                data: JSON.stringify({ type: 'unknown_future_type', payload: 'data' }),
+            });
+
+            expect(warnSpy).toHaveBeenCalledWith(
+                '[CollabClient] Unknown message type received: unknown_future_type',
+                expect.objectContaining({ type: 'unknown_future_type' })
+            );
+
+            warnSpy.mockRestore();
+        });
     });
 
     describe('flushMessageQueue error handling', () => {
