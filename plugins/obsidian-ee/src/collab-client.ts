@@ -64,7 +64,8 @@ export class CollabClient {
                     console.log('Connected to relay server');
                     this.connectionState = 'connected';
                     this.isInitialConnect = false;
-                    this.connectPromise = null;
+                    // Note: Don't clear connectPromise here - the finally block handles that
+                    // to avoid race conditions with concurrent connection attempts
 
                     // Critical: verify initialization messages are sent
                     const identified = this.sendIdentify();

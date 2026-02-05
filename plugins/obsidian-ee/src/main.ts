@@ -172,7 +172,15 @@ export default class CollabPlugin extends Plugin {
             } catch (error) {
                 console.error('[CollabPlugin] Error freeing WASM resources:', error);
             }
-            this.collabCore = new CollabCore();
+            // Always null out the reference before recreating to prevent
+            // use-after-free if CollabCore constructor throws
+            this.collabCore = null;
+            try {
+                this.collabCore = new CollabCore();
+            } catch (error) {
+                console.error('[CollabPlugin] Error recreating CollabCore:', error);
+                // collabCore remains null - plugin will need reinitialization
+            }
         }
 
         new Notice('Collaboration session stopped');
