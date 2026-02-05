@@ -46,12 +46,24 @@ export default class CollabPlugin extends Plugin {
         }
     }
 
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    async loadSettings(): Promise<void> {
+        try {
+            const loadedData = await this.loadData();
+            this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+        } catch (error) {
+            console.error('[CollabPlugin] Failed to load settings, using defaults:', error);
+            this.settings = { ...DEFAULT_SETTINGS };
+            new Notice('Collaboration settings could not be loaded, using defaults');
+        }
     }
 
-    async saveSettings() {
-        await this.saveData(this.settings);
+    async saveSettings(): Promise<void> {
+        try {
+            await this.saveData(this.settings);
+        } catch (error) {
+            console.error('[CollabPlugin] Failed to save settings:', error);
+            new Notice('Failed to save collaboration settings');
+        }
     }
 
     async initWasm(): Promise<void> {
@@ -196,7 +208,12 @@ export default class CollabPlugin extends Plugin {
                 this.collabCore = new CollabCore();
             } catch (error) {
                 console.error('[CollabPlugin] Error recreating CollabCore:', error);
-                // collabCore remains null - plugin will need reinitialization
+                // collabCore remains null and wasmInitialized reset - plugin will need reinitialization
+                this.wasmInitialized = false;
+                new Notice(
+                    'Warning: Plugin needs to be reloaded before starting another session',
+                    10000
+                );
             }
         }
 
@@ -246,6 +263,7 @@ class CollabSettingTab extends PluginSettingTab {
                     .setValue(plugin.settings.relayUrl)
                     .onChange(async (value) => {
                         plugin.settings.relayUrl = value;
+                        // saveSettings already handles errors internally
                         await plugin.saveSettings();
                     })
             );

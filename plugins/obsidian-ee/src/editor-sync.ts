@@ -1,6 +1,25 @@
 import { MarkdownView, Editor } from 'obsidian';
 import { CollabClient } from './collab-client';
 
+/**
+ * Wrap any throwable in an Error instance for consistent error handling.
+ * WASM errors are plain objects with {type, message} structure.
+ */
+function wrapError(error: unknown): Error {
+    if (error instanceof Error) {
+        return error;
+    }
+    if (
+        typeof error === 'object' &&
+        error !== null &&
+        'message' in error &&
+        typeof (error as { message: unknown }).message === 'string'
+    ) {
+        return new Error((error as { message: string }).message);
+    }
+    return new Error(String(error));
+}
+
 export class EditorSync {
     private client: CollabClient;
     private editor: Editor | null = null;
@@ -39,8 +58,8 @@ export class EditorSync {
                 this.editor.setValue(remoteText);
             } catch (error) {
                 console.error('[EditorSync] Error setting initial text:', error);
-                if (this.errorCallback && error instanceof Error) {
-                    this.errorCallback(error);
+                if (this.errorCallback) {
+                    this.errorCallback(wrapError(error));
                 }
             } finally {
                 this.isApplyingRemote = false;
@@ -107,8 +126,8 @@ export class EditorSync {
             }
         } catch (error) {
             console.error('[EditorSync] Error applying remote update:', error);
-            if (this.errorCallback && error instanceof Error) {
-                this.errorCallback(error);
+            if (this.errorCallback) {
+                this.errorCallback(wrapError(error));
             }
         } finally {
             this.isApplyingRemote = false;

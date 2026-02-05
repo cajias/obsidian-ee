@@ -118,6 +118,7 @@ export class CollabClient {
     private maxReconnectAttempts = 5;
     private reconnectDelay = 1000;
     private messageQueue: object[] = [];
+    private readonly maxQueueSize = 1000;
     private connectionState: 'connected' | 'connecting' | 'disconnected' | 'reconnecting' =
         'disconnected';
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -227,7 +228,11 @@ export class CollabClient {
             this.ws.send(JSON.stringify(message));
             return true;
         }
-        // Queue message instead of silently dropping it
+        // Queue message instead of silently dropping it, with FIFO eviction at max size
+        if (this.messageQueue.length >= this.maxQueueSize) {
+            const dropped = this.messageQueue.shift();
+            console.warn('[CollabClient] Message queue full, dropping oldest message:', dropped);
+        }
         this.messageQueue.push(message);
         return false;
     }

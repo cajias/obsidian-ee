@@ -130,14 +130,14 @@ describe('EditorSync', () => {
             consoleSpy.mockRestore();
         });
 
-        it('should not call error callback for non-Error throws in bindToEditor', () => {
+        it('should wrap non-Error throws and forward to error callback', () => {
             const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
             const errorCallback = jest.fn();
             const editor = createMockEditor('local text');
             editor.setValue.mockImplementation(() => {
-                // Create an object that looks like an error but isn't instanceof Error
-                // This tests that our code handles non-Error throws correctly
-                throw Object.assign({}, { message: 'string error' });
+                // Create an object that looks like a WASM error but isn't instanceof Error
+                // The code should wrap this and still call the error callback
+                throw Object.assign({}, { message: 'WASM error message' });
             });
             const view = createMockView(editor);
 
@@ -147,7 +147,11 @@ describe('EditorSync', () => {
             sync.bindToEditor(view as any);
 
             expect(consoleSpy).toHaveBeenCalled();
-            expect(errorCallback).not.toHaveBeenCalled(); // Only called for Error instances
+            // Should now be called with a wrapped Error
+            expect(errorCallback).toHaveBeenCalledTimes(1);
+            const wrappedError = errorCallback.mock.calls[0][0];
+            expect(wrappedError).toBeInstanceOf(Error);
+            expect(wrappedError.message).toBe('WASM error message');
 
             consoleSpy.mockRestore();
         });

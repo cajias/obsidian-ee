@@ -484,6 +484,26 @@ describe('CollabClient message queueing', () => {
             // Message should be sent immediately, not queued
             expect(client.getQueueLength()).toBe(0);
         });
+
+        it('should evict oldest messages when queue exceeds max size', () => {
+            // Fill queue beyond the limit (maxQueueSize = 1000)
+            mockCore.get_text.mockReturnValue('');
+            const consoleSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            // Queue 1001 messages while disconnected
+            for (let i = 0; i < 1001; i++) {
+                client.sendUpdate(`message ${i}`);
+            }
+
+            // Should have evicted one message (FIFO)
+            expect(client.getQueueLength()).toBe(1000);
+            expect(consoleSpy).toHaveBeenCalledWith(
+                '[CollabClient] Message queue full, dropping oldest message:',
+                expect.any(Object)
+            );
+
+            consoleSpy.mockRestore();
+        });
     });
 
     describe('send return value', () => {
