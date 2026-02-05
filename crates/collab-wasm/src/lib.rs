@@ -3,7 +3,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use getrandom::getrandom;
-use js_sys;
 use wasm_bindgen::prelude::*;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
