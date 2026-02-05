@@ -10,6 +10,7 @@ export interface CollabClientConfig {
 export type UpdateCallback = (text: string) => void;
 export type DisconnectCallback = (reason: string) => void;
 export type ErrorCallback = (error: CollabError) => void;
+export type ConnectionState = 'connected' | 'connecting' | 'disconnected' | 'reconnecting';
 
 export interface CollabError {
     type: 'decryption' | 'connection' | 'sync';
@@ -119,8 +120,7 @@ export class CollabClient {
     private reconnectDelay = 1000;
     private messageQueue: object[] = [];
     private readonly maxQueueSize = 1000;
-    private connectionState: 'connected' | 'connecting' | 'disconnected' | 'reconnecting' =
-        'disconnected';
+    private connectionState: ConnectionState = 'disconnected';
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private isInitialConnect = true;
     private connectPromise: Promise<void> | null = null;
@@ -459,7 +459,7 @@ export class CollabClient {
         this.onErrorCallback = callback;
     }
 
-    getConnectionState(): string {
+    getConnectionState(): ConnectionState {
         return this.connectionState;
     }
 
