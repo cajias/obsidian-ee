@@ -271,7 +271,7 @@ export class CollabClient {
             return this.send({
                 type: 'yrs_update',
                 doc_id: this.config.docId,
-                encrypted: Array.from(encrypted),
+                encrypted: [...encrypted],
                 epoch: 0,
                 signature: [],
             });

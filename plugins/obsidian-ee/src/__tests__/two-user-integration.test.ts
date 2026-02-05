@@ -192,8 +192,8 @@ class IntegrationMockRelay {
                                     }
                                 });
                             }
-                        } catch (err) {
-                            console.error('Failed to parse message:', err);
+                        } catch (error) {
+                            console.error('Failed to parse message:', error);
                         }
                     });
 
@@ -206,8 +206,8 @@ class IntegrationMockRelay {
 
                 this.wss.on('listening', () => resolve());
                 this.wss.on('error', (err) => reject(err));
-            } catch (err) {
-                reject(err);
+            } catch (error) {
+                reject(error);
             }
         });
     }
