@@ -32,3 +32,6 @@ infra/cdk.out/
 *.profraw
 lcov.info
 coverage/
+
+# Worktrees
+.worktrees/
