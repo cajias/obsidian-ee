@@ -2,7 +2,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use rand::Rng;
+use getrandom::getrandom;
 use wasm_bindgen::prelude::*;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
@@ -55,8 +55,9 @@ impl CollabCore {
 
         let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CollabError(e.to_string()))?;
 
-        let mut rng = rand::thread_rng();
-        let nonce_bytes: [u8; 12] = rng.gen();
+        let mut nonce_bytes = [0u8; 12];
+        getrandom(&mut nonce_bytes)
+            .map_err(|e| CollabError(format!("Failed to generate nonce: {}", e)))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext =
@@ -318,5 +319,28 @@ mod tests {
 
         // Should fail to decrypt with wrong key
         assert!(core2.apply_update_encrypted_internal(&encrypted).is_err());
+    }
+
+    #[test]
+    fn test_nonces_are_unique() {
+        // Verifies that the entropy source produces unique nonces
+        // If entropy fails, we'd get repeated nonces which is catastrophic for AES-GCM
+        let mut core = CollabCore::new();
+        let key = [0u8; 32];
+        core.set_encryption_key_internal(&key).unwrap();
+
+        let plaintext = b"test data";
+        let mut nonces = std::collections::HashSet::new();
+
+        // Generate 100 encryptions and verify all nonces are unique
+        for _ in 0..100 {
+            let encrypted = core.encrypt_internal(plaintext).unwrap();
+            // Nonce is the first 12 bytes
+            let nonce: [u8; 12] = encrypted[..12].try_into().unwrap();
+            assert!(
+                nonces.insert(nonce),
+                "Duplicate nonce detected! Entropy source may be broken."
+            );
+        }
     }
 }

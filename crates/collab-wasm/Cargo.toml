@@ -13,7 +13,6 @@ yrs = "0.22"
 js-sys = "0.3"
 # For simplified encryption (MVP) - will be replaced with MLS later
 aes-gcm = "0.10"
-rand = { version = "0.8", features = ["getrandom"] }
 
 [dependencies.web-sys]
 version = "0.3"

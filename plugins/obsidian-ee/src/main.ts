@@ -60,6 +60,13 @@ export default class CollabPlugin extends Plugin {
             encryptionKey: new Uint8Array(32), // TODO: Generate/share proper key
         };
 
+        // Warn about insecure placeholder key
+        console.warn(
+            '[CollabPlugin] SECURITY WARNING: Using placeholder encryption key. ' +
+            'This is insecure and should only be used for development.'
+        );
+        new Notice('Warning: Using insecure placeholder encryption key', 5000);
+
         try {
             // Create client and editor sync
             this.collabClient = new CollabClient(this.collabCore, config);
@@ -103,10 +110,18 @@ export default class CollabPlugin extends Plugin {
     onunload() {
         console.log('Unloading Obsidian E2E Collaboration plugin');
 
-        this.stopSession();
+        try {
+            this.stopSession();
+        } catch (error) {
+            console.error('[CollabPlugin] Error stopping session during unload:', error);
+        }
 
         if (this.collabCore) {
-            this.collabCore.free();
+            try {
+                this.collabCore.free();
+            } catch (error) {
+                console.error('[CollabPlugin] Error freeing WASM resources:', error);
+            }
             this.collabCore = null;
         }
     }

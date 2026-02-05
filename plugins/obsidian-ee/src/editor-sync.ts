@@ -7,6 +7,7 @@ export class EditorSync {
     private isApplyingRemote = false;
     private debounceTimer: NodeJS.Timeout | null = null;
     private debounceMs = 100;
+    private errorCallback: ((error: Error) => void) | null = null;
 
     constructor(client: CollabClient) {
         this.client = client;
@@ -15,6 +16,13 @@ export class EditorSync {
         this.client.onUpdate((text) => {
             this.applyRemoteUpdate(text);
         });
+    }
+
+    /**
+     * Set an error callback to be notified of errors during sync operations
+     */
+    setErrorCallback(callback: (error: Error) => void): void {
+        this.errorCallback = callback;
     }
 
     /**
@@ -79,6 +87,11 @@ export class EditorSync {
                     ch: Math.min(cursor.ch, (text.split('\n')[Math.min(cursor.line, newLineCount - 1)] || '').length),
                 };
                 this.editor.setCursor(newCursor);
+            }
+        } catch (error) {
+            console.error('[EditorSync] Error applying remote update:', error);
+            if (this.errorCallback && error instanceof Error) {
+                this.errorCallback(error);
             }
         } finally {
             this.isApplyingRemote = false;

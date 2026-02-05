@@ -438,4 +438,89 @@ describe('EditorSync', () => {
             expect(editor.setCursor).toHaveBeenCalledWith({ line: 1, ch: 0 });
         });
     });
+
+    describe('error handling', () => {
+        it('should catch and log errors in applyRemoteUpdate', () => {
+            const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const editor = createMockEditor('initial');
+            editor.getValue.mockImplementation(() => {
+                throw new Error('Editor error');
+            });
+            const view = createMockView(editor);
+
+            sync.bindToEditor(view as any);
+
+            // Trigger remote update - should catch the error
+            client._triggerUpdate('new text');
+
+            expect(consoleSpy).toHaveBeenCalledWith(
+                '[EditorSync] Error applying remote update:',
+                expect.any(Error)
+            );
+
+            consoleSpy.mockRestore();
+        });
+
+        it('should reset isApplyingRemote flag even when error occurs', () => {
+            const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const editor = createMockEditor('initial');
+            let callCount = 0;
+            editor.getValue.mockImplementation(() => {
+                callCount++;
+                if (callCount === 1) {
+                    throw new Error('Editor error');
+                }
+                return 'recovered';
+            });
+            const view = createMockView(editor);
+
+            sync.bindToEditor(view as any);
+
+            // First update throws
+            client._triggerUpdate('new text');
+
+            // Second update should work (flag was reset)
+            client._triggerUpdate('another text');
+
+            // Second update should have proceeded (getValue called again)
+            expect(callCount).toBe(2);
+
+            consoleSpy.mockRestore();
+        });
+
+        it('should call error callback when provided and error occurs', () => {
+            const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const errorCallback = jest.fn();
+            const editor = createMockEditor('initial');
+            editor.getValue.mockImplementation(() => {
+                throw new Error('Test error');
+            });
+            const view = createMockView(editor);
+
+            sync.setErrorCallback(errorCallback);
+            sync.bindToEditor(view as any);
+
+            client._triggerUpdate('new text');
+
+            expect(errorCallback).toHaveBeenCalledWith(expect.any(Error));
+
+            consoleSpy.mockRestore();
+        });
+
+        it('should not throw if error callback is not set', () => {
+            const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const editor = createMockEditor('initial');
+            editor.getValue.mockImplementation(() => {
+                throw new Error('Test error');
+            });
+            const view = createMockView(editor);
+
+            sync.bindToEditor(view as any);
+
+            // Should not throw
+            expect(() => client._triggerUpdate('new text')).not.toThrow();
+
+            consoleSpy.mockRestore();
+        });
+    });
 });
