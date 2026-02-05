@@ -99,7 +99,12 @@ export class CollabClient {
 
                 this.ws.onclose = () => {
                     console.log('WebSocket closed');
-                    this.handleReconnect();
+                    if (this.isInitialConnect) {
+                        // Connection closed during initial connect - reject the promise
+                        reject(new Error('WebSocket closed during initial connection'));
+                    } else {
+                        this.handleReconnect();
+                    }
                 };
             } catch (error) {
                 reject(error);
@@ -221,6 +226,10 @@ export class CollabClient {
             const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
             console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
             this.reconnectTimer = setTimeout(() => {
+                // Check if disconnect() was called while waiting
+                if (this.maxReconnectAttempts === 0) {
+                    return;
+                }
                 this.connect().catch((error) => {
                     console.error('Reconnect failed:', error);
                     if (this.onErrorCallback) {
