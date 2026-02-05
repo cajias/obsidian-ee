@@ -158,6 +158,7 @@ export class CollabClient {
                         const error = new Error('Failed to send initialization messages');
                         console.error('[CollabClient]', error.message);
                         this.ws?.close();
+                        this.ws = null;
                         reject(error);
                         return;
                     }
