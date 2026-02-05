@@ -35,7 +35,19 @@ export default class CollabPlugin extends Plugin {
     async initWasm(): Promise<void> {
         if (this.wasmInitialized) return;
 
-        await init();
+        // Load WASM from plugin directory (import.meta.url doesn't work in Obsidian)
+        const pluginDir = this.manifest.dir;
+        if (!pluginDir) {
+            throw new Error('Plugin directory not found');
+        }
+
+        const wasmPath = `${pluginDir}/collab_wasm_bg.wasm`;
+        const wasmBuffer = await this.app.vault.adapter.readBinary(wasmPath);
+
+        // Compile the WASM module first - init() expects a compiled module, not raw bytes
+        const wasmModule = await WebAssembly.compile(wasmBuffer);
+        await init(wasmModule);
+
         this.collabCore = new CollabCore();
         this.wasmInitialized = true;
         console.log('WASM initialized successfully');
