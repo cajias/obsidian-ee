@@ -6,6 +6,7 @@ members = [
     "crates/collab-cli",
     "crates/collab-proto",
     "crates/collab-wasm",
+    "crates/collab-watcher",
     "tests/e2e-tests",
     "xtask",
 ]
@@ -62,6 +63,10 @@ aws-sdk-lambda = "1.97"
 # Testing
 pretty_assertions = "1.4"
 tokio-test = "0.4"
+
+# File watching
+notify = "7.0"
+notify-debouncer-mini = "0.5"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
