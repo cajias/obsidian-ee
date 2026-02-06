@@ -713,3 +713,80 @@ fn test_registry_process_invalid_commit() {
         "Epoch should remain unchanged after rejected wrong-group commit"
     );
 }
+
+// =============================================================================
+// PERFORMANCE & SCALABILITY
+// =============================================================================
+
+/// Test that encryption works with large documents (~1MB).
+///
+/// This test verifies that MLS encryption doesn't fail or timeout on realistic
+/// data sizes. Many collaborative editing sessions involve documents with
+/// thousands of lines of text.
+#[test]
+fn test_registry_large_document_encryption() {
+    let mut alice_registry = DocumentRegistry::new();
+    let mut bob_registry = DocumentRegistry::new();
+
+    // Alice creates document
+    alice_registry.create_encrypted("large-doc", "alice").unwrap();
+
+    // Bob joins
+    let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+    let bob_invite = alice_registry
+        .create_invite("large-doc", bob_pending.key_package())
+        .unwrap();
+    bob_registry.join_encrypted(&bob_invite, bob_pending).unwrap();
+
+    // Create a large document (~1MB of text)
+    // Simulate a realistic document with multiple paragraphs
+    let paragraph = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
+                     Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \
+                     Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris. \
+                     Nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in \
+                     reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.\n\n";
+
+    // Repeat to create ~1MB (paragraph is ~330 bytes, so ~3000 repetitions)
+    let large_text = paragraph.repeat(3000);
+    assert!(
+        large_text.len() > 900_000,
+        "Document should be close to 1MB"
+    );
+
+    // Alice inserts large text
+    let alice_doc = alice_registry.get_encrypted_mut("large-doc").unwrap();
+    alice_doc.insert(0, &large_text);
+
+    // Get encrypted update
+    let alice_op = alice_doc.get_encrypted_update().unwrap();
+
+    // Verify the ciphertext doesn't leak plaintext
+    assert!(
+        !alice_op
+            .ciphertext
+            .windows(5)
+            .any(|w| w == b"Lorem"),
+        "Ciphertext should not contain plaintext"
+    );
+
+    // Bob decrypts the large document
+    let bob_doc = bob_registry.get_encrypted_mut("large-doc").unwrap();
+    bob_doc.apply_encrypted_update(&alice_op).unwrap();
+
+    // Verify content matches
+    assert_eq!(
+        bob_doc.get_content(),
+        large_text,
+        "Large document should decrypt correctly"
+    );
+
+    // Verify we can make incremental updates after large document
+    alice_doc.insert(0, "HEADER: ");
+    let update2 = alice_doc.get_encrypted_update().unwrap();
+
+    bob_doc.apply_encrypted_update(&update2).unwrap();
+    assert!(
+        bob_doc.get_content().starts_with("HEADER: "),
+        "Incremental updates should work after large document"
+    );
+}

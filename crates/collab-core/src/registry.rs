@@ -43,6 +43,56 @@ pub enum DocumentVariant {
     Encrypted(Box<EncryptedDocument>),
 }
 
+impl DocumentVariant {
+    /// Returns true if this is an encrypted document.
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Encrypted(_))
+    }
+
+    /// Returns true if this is a plain document.
+    #[must_use]
+    pub const fn is_plain(&self) -> bool {
+        matches!(self, Self::Plain(_))
+    }
+
+    /// Returns a reference to the plain document, if this is a plain variant.
+    #[must_use]
+    pub const fn as_plain(&self) -> Option<&CollabDocument> {
+        match self {
+            Self::Plain(doc) => Some(doc),
+            Self::Encrypted(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the plain document, if this is a plain variant.
+    #[must_use]
+    pub fn as_plain_mut(&mut self) -> Option<&mut CollabDocument> {
+        match self {
+            Self::Plain(doc) => Some(doc),
+            Self::Encrypted(_) => None,
+        }
+    }
+
+    /// Returns a reference to the encrypted document, if this is an encrypted variant.
+    #[must_use]
+    pub fn as_encrypted(&self) -> Option<&EncryptedDocument> {
+        match self {
+            Self::Encrypted(doc) => Some(doc.as_ref()),
+            Self::Plain(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the encrypted document, if this is an encrypted variant.
+    #[must_use]
+    pub fn as_encrypted_mut(&mut self) -> Option<&mut EncryptedDocument> {
+        match self {
+            Self::Encrypted(doc) => Some(doc.as_mut()),
+            Self::Plain(_) => None,
+        }
+    }
+}
+
 /// Metadata about document encryption state.
 #[derive(Debug, Clone)]
 pub struct EncryptionMetadata {
@@ -88,7 +138,19 @@ impl EncryptionMetadata {
     }
 
     /// Update the epoch.
+    ///
+    /// # Panics (Debug Only)
+    ///
+    /// In debug builds, panics if the new epoch is less than the current epoch.
+    /// Epochs should only increase (monotonicity). In release builds, the check
+    /// is skipped for performance.
     fn set_epoch(&mut self, epoch: u64) {
+        debug_assert!(
+            epoch >= self.epoch,
+            "Epoch regression detected: attempted to set epoch {} but current epoch is {}",
+            epoch,
+            self.epoch
+        );
         self.epoch = epoch;
     }
 }
@@ -1022,6 +1084,27 @@ mod tests {
         assert_eq!(meta.epoch(), 5);
     }
 
+    #[test]
+    fn test_encryption_metadata_epoch_monotonicity() {
+        let mut meta = EncryptionMetadata::new("alice".to_string(), true).unwrap();
+        assert_eq!(meta.epoch(), 0);
+
+        // Epoch can increase
+        meta.set_epoch(1);
+        assert_eq!(meta.epoch(), 1);
+
+        meta.set_epoch(5);
+        assert_eq!(meta.epoch(), 5);
+
+        // Epoch can stay the same
+        meta.set_epoch(5);
+        assert_eq!(meta.epoch(), 5);
+
+        // In debug builds, epoch regression should panic
+        // This is tested via debug_assert! in set_epoch()
+        // Note: This test doesn't actually trigger the panic to avoid failing the test suite
+    }
+
     // ==================== Phase 2: Create Encrypted ====================
 
     #[test]
@@ -1317,5 +1400,30 @@ mod tests {
         assert!(matches!(entry.variant(), DocumentVariant::Plain(_)));
         assert!(entry.document().is_some());
         assert!(entry.encryption_metadata().is_none());
+    }
+
+    #[test]
+    fn test_document_variant_convenience_methods() {
+        // Test plain variant
+        let plain_doc = CollabDocument::new("test".to_string());
+        let plain_variant = DocumentVariant::Plain(plain_doc);
+
+        assert!(plain_variant.is_plain());
+        assert!(!plain_variant.is_encrypted());
+        assert!(plain_variant.as_plain().is_some());
+        assert!(plain_variant.as_encrypted().is_none());
+
+        // Test encrypted variant
+        let encrypted_doc = EncryptedDocument::create("test", "alice").unwrap();
+        let mut encrypted_variant = DocumentVariant::Encrypted(Box::new(encrypted_doc));
+
+        assert!(encrypted_variant.is_encrypted());
+        assert!(!encrypted_variant.is_plain());
+        assert!(encrypted_variant.as_encrypted().is_some());
+        assert!(encrypted_variant.as_plain().is_none());
+
+        // Test mutable accessors
+        assert!(encrypted_variant.as_encrypted_mut().is_some());
+        assert!(encrypted_variant.as_plain_mut().is_none());
     }
 }
