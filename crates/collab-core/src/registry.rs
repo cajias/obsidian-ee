@@ -697,6 +697,7 @@ impl DocumentRegistry {
     /// # Errors
     ///
     /// Returns `RegistryError::NotFound` if the document doesn't exist.
+    /// Returns `RegistryError::InvalidState` if the key package is empty.
     /// Returns `RegistryError::NotEncrypted` if the document is not encrypted.
     /// Returns `RegistryError::MlsError` if invite creation fails.
     pub fn create_invite(
@@ -708,9 +709,9 @@ impl DocumentRegistry {
 
         if key_package.is_empty() {
             error!(document_id = %id, "Empty key package provided");
-            return Err(RegistryError::MlsError(Arc::new(crate::Error::InvalidState(
+            return Err(RegistryError::InvalidState(
                 "Key package cannot be empty".to_string(),
-            ))));
+            ));
         }
 
         let entry = self.documents.get_mut(id).ok_or_else(|| {
