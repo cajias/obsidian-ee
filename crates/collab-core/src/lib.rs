@@ -5,17 +5,23 @@
 //! - `MlsDocumentGroup`: MLS group operations for end-to-end encryption
 //! - `EncryptedDocument`: Combined encrypted collaborative document
 
-pub mod connection;
+mod connection;
 mod document;
 mod encryption;
 mod mls;
 
+pub use connection::{
+    ConnectionAction, ConnectionConfig, ConnectionState, ConnectionStateMachine, RetryPolicy,
+};
 pub use document::CollabDocument;
 pub use encryption::{EncryptedDocument, EncryptedOp, Invite};
 pub use mls::{MlsDocumentGroup, PendingMember};
 
 /// Document identifier type.
 pub type DocumentId = String;
+
+/// User identifier type.
+pub type UserId = String;
 
 /// Error types for the collab-core crate.
 #[derive(Debug, thiserror::Error)]

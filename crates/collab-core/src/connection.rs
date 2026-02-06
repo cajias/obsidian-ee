@@ -8,11 +8,24 @@
 //! The state machine emits [`ConnectionAction`] values telling the caller what
 //! to do next, without performing any I/O itself. This keeps the module
 //! testable and free of async runtime dependencies.
+//!
+//! # State transitions
+//!
+//! ```text
+//! Disconnected --(connect/auto_connect)--> Connecting
+//! Connecting --(on_connected)--> Connected
+//! Connecting --(on_error)--> Reconnecting | Failed
+//! Connected --(on_disconnected)--> Reconnecting | Failed
+//! Reconnecting --(on_retry_tick)--> Connecting
+//! ```
 
 use std::time::Duration;
 
+use crate::{DocumentId, UserId};
+
 /// Possible states of the connection state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionState {
     /// Not connected and not attempting to connect.
     Disconnected,
@@ -43,10 +56,16 @@ pub struct RetryPolicy {
     max_delay: Duration,
     /// Multiplier applied to the delay after each attempt.
     backoff_multiplier: f64,
+    /// Maximum jitter factor (0.0 = no jitter, 1.0 = full jitter).
+    ///
+    /// When non-zero, the actual delay should be chosen uniformly at random
+    /// from the range returned by [`delay_range_for_attempt`](Self::delay_range_for_attempt).
+    jitter_factor: f64,
 }
 
 /// Actions the caller should perform based on the current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionAction {
     /// Initiate a connection to the relay server.
     Connect {
@@ -63,9 +82,9 @@ pub enum ConnectionAction {
     /// Send identification and subscribe to a document.
     IdentifyAndSubscribe {
         /// The user identifier.
-        user_id: String,
+        user_id: UserId,
         /// The document identifier.
-        doc_id: String,
+        doc_id: DocumentId,
     },
     /// Stop retrying; the connection has permanently failed.
     GiveUp {
@@ -80,15 +99,15 @@ pub enum ConnectionAction {
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     /// WebSocket URL of the relay server.
-    pub relay_url: String,
+    relay_url: String,
     /// Identifier of the local user.
-    pub user_id: String,
+    user_id: UserId,
     /// Identifier of the document to collaborate on.
-    pub doc_id: String,
+    doc_id: DocumentId,
     /// Whether to automatically connect on creation.
-    pub auto_connect: bool,
+    auto_connect: bool,
     /// Retry policy for reconnection attempts.
-    pub retry_policy: RetryPolicy,
+    retry_policy: RetryPolicy,
 }
 
 /// A synchronous connection state machine.
@@ -101,23 +120,36 @@ pub struct ConnectionStateMachine {
     retry_count: u32,
 }
 
-// ── RetryPolicy implementation ──────────────────────────────────────────────
+// -- RetryPolicy implementation ----------------------------------------------
 
 impl RetryPolicy {
     /// Create a new retry policy.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         max_retries: u32,
         initial_delay: Duration,
         max_delay: Duration,
         backoff_multiplier: f64,
+        jitter_factor: f64,
     ) -> Self {
-        Self { max_retries, initial_delay, max_delay, backoff_multiplier }
+        debug_assert!(backoff_multiplier > 0.0, "backoff_multiplier must be positive");
+        debug_assert!(initial_delay <= max_delay, "initial_delay must not exceed max_delay");
+        debug_assert!(
+            (0.0..=1.0).contains(&jitter_factor),
+            "jitter_factor must be between 0.0 and 1.0"
+        );
+        Self { max_retries, initial_delay, max_delay, backoff_multiplier, jitter_factor }
     }
 
-    /// Compute the delay for a given attempt (0-based).
+    /// Compute the deterministic base delay for a given attempt (0-based).
     ///
     /// Returns `None` if `attempt >= max_retries`.
+    ///
+    /// This returns the base delay without jitter applied. For the jittered
+    /// range, use [`delay_range_for_attempt`](Self::delay_range_for_attempt).
+    /// The [`ConnectionStateMachine::next_action`] method uses this base delay
+    /// in [`ConnectionAction::WaitAndRetry`]; callers that want jitter should
+    /// use `delay_range_for_attempt` and pick a random value in the range.
     #[must_use]
     pub fn delay_for_attempt(&self, attempt: u32) -> Option<Duration> {
         if attempt >= self.max_retries {
@@ -129,6 +161,19 @@ impl RetryPolicy {
 
         Some(delay.min(self.max_delay))
     }
+
+    /// Compute the jittered delay range for a given attempt (0-based).
+    ///
+    /// Returns `None` if `attempt >= max_retries`.
+    /// The returned range is `(min_delay, max_delay)` where the caller
+    /// should pick a random value uniformly in this range.
+    #[must_use]
+    pub fn delay_range_for_attempt(&self, attempt: u32) -> Option<(Duration, Duration)> {
+        let base = self.delay_for_attempt(attempt)?;
+        let jitter_amount = base.mul_f64(self.jitter_factor);
+        let min = base.saturating_sub(jitter_amount);
+        Some((min, base))
+    }
 }
 
 impl Default for RetryPolicy {
@@ -138,11 +183,67 @@ impl Default for RetryPolicy {
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(30),
             backoff_multiplier: 2.0,
+            jitter_factor: 0.25,
         }
     }
 }
 
-// ── ConnectionStateMachine implementation ───────────────────────────────────
+// -- ConnectionConfig implementation -----------------------------------------
+
+impl ConnectionConfig {
+    /// Create a new connection configuration.
+    ///
+    /// Auto-connect is enabled by default. Use [`with_auto_connect`](Self::with_auto_connect)
+    /// and [`with_retry_policy`](Self::with_retry_policy) to customize.
+    #[must_use]
+    pub fn new(
+        relay_url: impl Into<String>,
+        user_id: impl Into<String>,
+        doc_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            relay_url: relay_url.into(),
+            user_id: user_id.into(),
+            doc_id: doc_id.into(),
+            auto_connect: true,
+            retry_policy: RetryPolicy::default(),
+        }
+    }
+
+    /// Set whether to automatically connect on creation.
+    #[must_use]
+    pub const fn with_auto_connect(mut self, auto_connect: bool) -> Self {
+        self.auto_connect = auto_connect;
+        self
+    }
+
+    /// Set the retry policy for reconnection attempts.
+    #[must_use]
+    pub const fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    /// Returns the relay URL.
+    #[must_use]
+    pub fn relay_url(&self) -> &str {
+        &self.relay_url
+    }
+
+    /// Returns the user ID.
+    #[must_use]
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    /// Returns the document ID.
+    #[must_use]
+    pub fn doc_id(&self) -> &str {
+        &self.doc_id
+    }
+}
+
+// -- ConnectionStateMachine implementation -----------------------------------
 
 impl ConnectionStateMachine {
     /// Create a new connection state machine.
@@ -172,11 +273,11 @@ impl ConnectionStateMachine {
         match &self.state {
             ConnectionState::Disconnected => ConnectionAction::DoNothing,
             ConnectionState::Connecting => {
-                ConnectionAction::Connect { relay_url: self.config.relay_url.clone() }
+                ConnectionAction::Connect { relay_url: self.config.relay_url().to_owned() }
             }
             ConnectionState::Connected => ConnectionAction::IdentifyAndSubscribe {
-                user_id: self.config.user_id.clone(),
-                doc_id: self.config.doc_id.clone(),
+                user_id: self.config.user_id().to_owned(),
+                doc_id: self.config.doc_id().to_owned(),
             },
             ConnectionState::Reconnecting { attempt } => {
                 // attempt is 1-based, delay_for_attempt uses 0-based index
@@ -191,34 +292,41 @@ impl ConnectionStateMachine {
         }
     }
 
-    /// Request a connection (transitions `Disconnected` -> `Connecting`).
+    /// Request a connection. No-op if not in Disconnected state.
     pub fn connect(&mut self) {
         if self.state == ConnectionState::Disconnected {
             self.state = ConnectionState::Connecting;
         }
     }
 
-    /// Signal that the connection has been established.
+    /// Unconditionally transitions to Connected and resets retry counter.
     pub fn on_connected(&mut self) {
+        debug_assert!(
+            !matches!(self.state, ConnectionState::Failed { .. }),
+            "on_connected called on Failed state machine"
+        );
         self.state = ConnectionState::Connected;
         self.retry_count = 0;
     }
 
-    /// Signal that the connection has been lost.
+    /// Signals connection ended. Increments retry counter; transitions to
+    /// Reconnecting or Failed.
     pub fn on_disconnected(&mut self) {
-        self.retry_count += 1;
-        self.state = ConnectionState::Reconnecting { attempt: self.retry_count };
+        debug_assert!(
+            !matches!(self.state, ConnectionState::Failed { .. }),
+            "on_disconnected called on Failed state machine"
+        );
+        self.advance_retry("connection lost");
     }
 
-    /// Signal that a connection error occurred.
+    /// If retries remain, transitions to Reconnecting. If exhausted,
+    /// transitions to Failed.
     pub fn on_error(&mut self, reason: &str) {
-        self.retry_count += 1;
-
-        if self.config.retry_policy.delay_for_attempt(self.retry_count - 1).is_none() {
-            self.state = ConnectionState::Failed { reason: reason.to_string() };
-        } else {
-            self.state = ConnectionState::Reconnecting { attempt: self.retry_count };
-        }
+        debug_assert!(
+            !matches!(self.state, ConnectionState::Failed { .. }),
+            "on_error called on Failed state machine"
+        );
+        self.advance_retry(reason);
     }
 
     /// Advance from `Reconnecting` to `Connecting` for the next attempt.
@@ -239,28 +347,38 @@ impl ConnectionStateMachine {
     pub const fn is_auto_connect(&self) -> bool {
         self.config.auto_connect
     }
+
+    // -- private helpers -----------------------------------------------------
+
+    /// Shared retry logic for `on_disconnected` and `on_error`.
+    ///
+    /// Increments the retry counter. If the retry budget is exhausted,
+    /// transitions to `Failed`; otherwise transitions to `Reconnecting`.
+    fn advance_retry(&mut self, reason: &str) {
+        self.retry_count += 1;
+        if self.config.retry_policy.delay_for_attempt(self.retry_count - 1).is_none() {
+            self.state = ConnectionState::Failed { reason: reason.to_string() };
+        } else {
+            self.state = ConnectionState::Reconnecting { attempt: self.retry_count };
+        }
+    }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
+// -- Tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    // ── helpers ─────────────────────────────────────────────────────────
+    // -- helpers -------------------------------------------------------------
 
     fn default_config(auto_connect: bool) -> ConnectionConfig {
-        ConnectionConfig {
-            relay_url: "ws://localhost:8080".into(),
-            user_id: "user-1".into(),
-            doc_id: "doc-1".into(),
-            auto_connect,
-            retry_policy: RetryPolicy::default(),
-        }
+        ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1")
+            .with_auto_connect(auto_connect)
     }
 
-    // ── RetryPolicy tests ──────────────────────────────────────────────
+    // -- RetryPolicy tests ---------------------------------------------------
 
     #[test]
     fn retry_policy_default_values() {
@@ -269,6 +387,7 @@ mod tests {
         assert_eq!(policy.initial_delay, Duration::from_secs(1));
         assert_eq!(policy.max_delay, Duration::from_secs(30));
         assert!((policy.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+        assert!((policy.jitter_factor - 0.25).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -288,25 +407,24 @@ mod tests {
 
     #[test]
     fn retry_policy_caps_at_max_delay() {
-        let policy = RetryPolicy::new(10, Duration::from_secs(1), Duration::from_secs(5), 2.0);
+        let policy = RetryPolicy::new(10, Duration::from_secs(1), Duration::from_secs(5), 2.0, 0.0);
         // attempt 3 would be 8s without cap, but max_delay is 5s
         assert_eq!(policy.delay_for_attempt(3), Some(Duration::from_secs(5)));
     }
 
     #[test]
     fn retry_policy_returns_none_when_max_retries_exceeded() {
-        let policy = RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0);
+        let policy = RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0);
         assert!(policy.delay_for_attempt(3).is_none());
         assert!(policy.delay_for_attempt(4).is_none());
     }
 
-    // ── ConnectionConfig tests ─────────────────────────────────────────
+    // -- ConnectionConfig tests ----------------------------------------------
 
     #[test]
     fn config_with_auto_connect_enabled() {
         let config = default_config(true);
-        assert!(config.auto_connect);
-        assert_eq!(config.relay_url, "ws://localhost:8080");
+        assert_eq!(config.relay_url(), "ws://localhost:8080");
     }
 
     #[test]
@@ -315,7 +433,7 @@ mod tests {
         assert!(!config.auto_connect);
     }
 
-    // ── ConnectionStateMachine tests ───────────────────────────────────
+    // -- ConnectionStateMachine tests ----------------------------------------
 
     #[test]
     fn new_with_auto_connect_starts_connecting() {
@@ -398,10 +516,10 @@ mod tests {
 
     #[test]
     fn on_error_transitions_to_failed_when_max_retries_exceeded() {
-        let config = ConnectionConfig {
-            retry_policy: RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(30), 2.0),
-            ..default_config(true)
-        };
+        let config =
+            ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
+                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+            );
         let mut sm = ConnectionStateMachine::new(config);
 
         // attempt 1
@@ -491,5 +609,134 @@ mod tests {
         // Reconnection succeeds
         sm.on_connected();
         assert!(sm.is_connected());
+    }
+
+    // -- Invalid state transition tests --------------------------------------
+
+    #[test]
+    fn connect_from_connected_is_no_op() {
+        let mut sm = ConnectionStateMachine::new(default_config(true));
+        sm.on_connected();
+        sm.connect(); // should be no-op
+        assert_eq!(*sm.state(), ConnectionState::Connected);
+    }
+
+    #[test]
+    fn connect_from_connecting_is_no_op() {
+        let sm_auto = ConnectionStateMachine::new(default_config(true));
+        // already in Connecting, can't call connect() again since it only works from Disconnected
+        assert_eq!(*sm_auto.state(), ConnectionState::Connecting);
+    }
+
+    #[test]
+    fn connect_from_reconnecting_is_no_op() {
+        let mut sm = ConnectionStateMachine::new(default_config(true));
+        sm.on_error("fail");
+        sm.connect(); // should be no-op
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+    }
+
+    #[test]
+    fn on_retry_tick_from_connected_is_no_op() {
+        let mut sm = ConnectionStateMachine::new(default_config(true));
+        sm.on_connected();
+        sm.on_retry_tick(); // should be no-op
+        assert_eq!(*sm.state(), ConnectionState::Connected);
+    }
+
+    #[test]
+    fn on_retry_tick_from_disconnected_is_no_op() {
+        let mut sm = ConnectionStateMachine::new(default_config(false));
+        sm.on_retry_tick(); // should be no-op
+        assert_eq!(*sm.state(), ConnectionState::Disconnected);
+    }
+
+    // -- Retry budget / boundary tests ---------------------------------------
+
+    #[test]
+    fn next_action_when_failed_returns_give_up_with_reason() {
+        let config =
+            ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
+                RetryPolicy::new(1, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+            );
+        let mut sm = ConnectionStateMachine::new(config);
+        sm.on_error("first");
+        sm.on_retry_tick();
+        sm.on_error("fatal");
+        assert_eq!(sm.next_action(), ConnectionAction::GiveUp { reason: "fatal".into() });
+    }
+
+    #[test]
+    fn retry_policy_zero_max_retries_fails_immediately() {
+        let policy = RetryPolicy::new(0, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0);
+        assert!(policy.delay_for_attempt(0).is_none());
+    }
+
+    #[test]
+    fn on_disconnected_transitions_to_failed_when_retries_exhausted() {
+        let config =
+            ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
+                RetryPolicy::new(1, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+            );
+        let mut sm = ConnectionStateMachine::new(config);
+        // First disconnect
+        sm.on_connected();
+        sm.on_disconnected();
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+        // Second disconnect after reconnect
+        sm.on_retry_tick();
+        sm.on_connected();
+        sm.on_disconnected();
+        // retry_count was reset by on_connected, so this is attempt 1 again
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+    }
+
+    #[test]
+    fn multi_cycle_retry_count_resets() {
+        let mut sm = ConnectionStateMachine::new(default_config(true));
+
+        // Cycle 1: connect -> disconnect -> reconnect -> connect
+        sm.on_connected();
+        sm.on_disconnected();
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+        sm.on_retry_tick();
+        sm.on_connected();
+
+        // Cycle 2: should start from attempt 1 again
+        sm.on_disconnected();
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+        sm.on_retry_tick();
+        sm.on_connected();
+
+        // Cycle 3: still resets
+        sm.on_disconnected();
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+    }
+
+    // -- Jitter tests --------------------------------------------------------
+
+    #[test]
+    fn retry_policy_jitter_range() {
+        let policy =
+            RetryPolicy::new(5, Duration::from_secs(10), Duration::from_secs(60), 2.0, 0.5);
+        let range = policy.delay_range_for_attempt(0).unwrap();
+        // base = 10s, jitter = 50%, so range is 5s to 10s
+        assert_eq!(range, (Duration::from_secs(5), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn retry_policy_no_jitter() {
+        let policy =
+            RetryPolicy::new(5, Duration::from_secs(10), Duration::from_secs(60), 2.0, 0.0);
+        let range = policy.delay_range_for_attempt(0).unwrap();
+        assert_eq!(range, (Duration::from_secs(10), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn retry_policy_full_jitter() {
+        let policy =
+            RetryPolicy::new(5, Duration::from_secs(10), Duration::from_secs(60), 2.0, 1.0);
+        let range = policy.delay_range_for_attempt(0).unwrap();
+        assert_eq!(range, (Duration::ZERO, Duration::from_secs(10)));
     }
 }
