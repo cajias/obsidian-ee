@@ -255,6 +255,7 @@ async fn process_single_event(
             VaultEventKind::Created
         }
     } else {
+        known_files.lock().unwrap().remove(path);
         VaultEventKind::Deleted
     };
 
@@ -436,6 +437,38 @@ mod tests {
                 .any(|e| e.kind == VaultEventKind::Deleted
                     && e.path == PathBuf::from("to-delete.md")),
             "should detect .md file deletion, got: {events:?}"
+        );
+
+        watcher.stop();
+    }
+
+    #[tokio::test]
+    async fn test_delete_then_recreate_emits_created() {
+        let dir = TempDir::new().unwrap();
+        let note = dir.path().join("cycle.md");
+        fs::write(&note, "v1").unwrap();
+
+        let (watcher, mut rx) = VaultWatcher::new(dir.path(), test_config()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Delete and wait for the event to be processed
+        fs::remove_file(&note).unwrap();
+        let events = collect_events(&mut rx, Duration::from_secs(2)).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == VaultEventKind::Deleted && e.path == PathBuf::from("cycle.md")),
+            "should detect deletion, got: {events:?}"
+        );
+
+        // Recreate the same file - should be Created, not Modified
+        fs::write(&note, "v2").unwrap();
+        let events = collect_events(&mut rx, Duration::from_secs(2)).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == VaultEventKind::Created && e.path == PathBuf::from("cycle.md")),
+            "should detect recreation as Created (not Modified), got: {events:?}"
         );
 
         watcher.stop();
