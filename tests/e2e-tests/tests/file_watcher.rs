@@ -14,8 +14,8 @@
 //! - Extension filtering (default `.md` and custom)
 //! - Recursive subdirectory watching
 //!
-//! ## Integration with Document Registry
-//! - VaultEvent-driven document lifecycle management
+//! ## Integration with [`DocumentRegistry`]
+//! - [`VaultEvent`]-driven document lifecycle management
 //! - File content to CRDT document mapping
 
 use std::collections::HashSet;
@@ -344,7 +344,7 @@ async fn test_watches_dynamically_created_subdirectory() {
 // Integration: VaultEvents → DocumentRegistry
 // ---------------------------------------------------------------------------
 
-/// RED: Vault events should drive document lifecycle in the registry.
+/// Vault events should drive document lifecycle in the registry.
 ///
 /// When a file is created in the vault, we should be able to read its
 /// content, load it into a CRDT document via the registry, and retrieve
@@ -383,7 +383,7 @@ async fn test_vault_events_drive_document_registry_lifecycle() {
     watcher.stop();
 }
 
-/// RED: File modification events should update the corresponding document.
+/// File modification events should update the corresponding document.
 #[tokio::test]
 async fn test_file_modification_updates_document_content() {
     let vault = TempDir::new().unwrap();
@@ -415,7 +415,7 @@ async fn test_file_modification_updates_document_content() {
     // This tests the expectation: after a Modified event, the registry
     // document should reflect the file's current content.
     let doc = registry.get_mut("draft").unwrap();
-    let current_len: u32 = doc.get_content().len().try_into().unwrap();
+    let current_len: u32 = doc.get_content().chars().count().try_into().unwrap();
     doc.delete(0, current_len);
     doc.insert(0, &new_content);
 
@@ -428,7 +428,7 @@ async fn test_file_modification_updates_document_content() {
     watcher.stop();
 }
 
-/// RED: File deletion events should close documents in the registry.
+/// File deletion events should close documents in the registry.
 #[tokio::test]
 async fn test_file_deletion_closes_document_in_registry() {
     let vault = TempDir::new().unwrap();
