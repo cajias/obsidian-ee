@@ -6,28 +6,25 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 /// Error types for registry operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RegistryError {
     /// Document already exists.
     #[error("Document already exists: {0}")]
     AlreadyExists(DocumentId),
     /// Failed to restore document state.
-    #[error("Failed to restore document state")]
-    InvalidState,
+    #[error("Failed to restore document state: {0}")]
+    InvalidState(String),
     /// Document not found.
     #[error("Document not found: {0}")]
-    NotFound(String),
+    NotFound(DocumentId),
 }
 
 /// Metadata associated with a document.
 #[derive(Debug, Clone)]
 pub struct DocumentMetadata {
-    /// When the document was created.
-    pub created_at: SystemTime,
-    /// When the document was last modified.
-    pub last_modified: SystemTime,
-    /// Custom key-value metadata.
-    pub custom: HashMap<String, String>,
+    created_at: SystemTime,
+    last_modified: SystemTime,
+    custom: HashMap<String, String>,
 }
 
 impl DocumentMetadata {
@@ -35,6 +32,24 @@ impl DocumentMetadata {
     fn new() -> Self {
         let now = SystemTime::now();
         Self { created_at: now, last_modified: now, custom: HashMap::new() }
+    }
+
+    /// When the document was created.
+    #[must_use]
+    pub const fn created_at(&self) -> SystemTime {
+        self.created_at
+    }
+
+    /// When the document was last modified.
+    #[must_use]
+    pub const fn last_modified(&self) -> SystemTime {
+        self.last_modified
+    }
+
+    /// Custom key-value metadata.
+    #[must_use]
+    pub const fn custom(&self) -> &HashMap<String, String> {
+        &self.custom
     }
 
     /// Update `last_modified` to current time.
@@ -45,10 +60,22 @@ impl DocumentMetadata {
 
 /// An entry in the document registry containing both the document and its metadata.
 pub struct DocumentEntry {
-    /// The collaborative document.
-    pub document: CollabDocument,
-    /// Metadata about the document.
-    pub metadata: DocumentMetadata,
+    document: CollabDocument,
+    metadata: DocumentMetadata,
+}
+
+impl DocumentEntry {
+    /// Get a reference to the collaborative document.
+    #[must_use]
+    pub const fn document(&self) -> &CollabDocument {
+        &self.document
+    }
+
+    /// Get a reference to the document metadata.
+    #[must_use]
+    pub const fn metadata(&self) -> &DocumentMetadata {
+        &self.metadata
+    }
 }
 
 /// A registry for managing multiple collaborative documents.
@@ -131,7 +158,8 @@ impl DocumentRegistry {
             return Err(RegistryError::AlreadyExists(id));
         }
         let mut doc = CollabDocument::new(id.clone());
-        doc.apply_update(state).map_err(|_| RegistryError::InvalidState)?;
+        doc.apply_update(state)
+            .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
         let entry = DocumentEntry { document: doc, metadata: DocumentMetadata::new() };
         self.documents.insert(id.clone(), entry);
         Ok(&mut self.documents.get_mut(&id).expect("just inserted").document)
@@ -154,17 +182,26 @@ impl DocumentRegistry {
         key: &str,
         value: &str,
     ) -> Result<(), RegistryError> {
-        let entry =
-            self.documents.get_mut(id).ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
+        let entry = self
+            .documents
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
         entry.metadata.custom.insert(key.to_string(), value.to_string());
         Ok(())
     }
 
     /// Update the `last_modified` timestamp for a document.
-    pub fn touch(&mut self, id: &str) {
-        if let Some(entry) = self.documents.get_mut(id) {
-            entry.metadata.touch();
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns `RegistryError::NotFound` if the document does not exist.
+    pub fn touch(&mut self, id: &str) -> Result<(), RegistryError> {
+        let entry = self
+            .documents
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
+        entry.metadata.touch();
+        Ok(())
     }
 }
 
@@ -295,8 +332,8 @@ mod tests {
         let after = SystemTime::now();
         let metadata = registry.get_metadata("doc-1").expect("should have metadata");
 
-        assert!(metadata.created_at >= before);
-        assert!(metadata.created_at <= after);
+        assert!(metadata.created_at() >= before);
+        assert!(metadata.created_at() <= after);
     }
 
     #[test]
@@ -311,8 +348,8 @@ mod tests {
         let after = SystemTime::now();
         let metadata = registry.get_metadata("doc-1").expect("should have metadata");
 
-        assert!(metadata.last_modified >= before);
-        assert!(metadata.last_modified <= after);
+        assert!(metadata.last_modified() >= before);
+        assert!(metadata.last_modified() <= after);
     }
 
     #[test]
@@ -322,15 +359,15 @@ mod tests {
         let mut registry = DocumentRegistry::new();
 
         registry.create("doc-1").unwrap();
-        let initial_modified = registry.get_metadata("doc-1").unwrap().last_modified;
+        let initial_modified = registry.get_metadata("doc-1").unwrap().last_modified();
 
         // Small delay to ensure time difference
         std::thread::sleep(Duration::from_millis(10));
 
         // Touch the document to update last_modified
-        registry.touch("doc-1");
+        registry.touch("doc-1").unwrap();
 
-        let updated_modified = registry.get_metadata("doc-1").unwrap().last_modified;
+        let updated_modified = registry.get_metadata("doc-1").unwrap().last_modified();
         assert!(updated_modified > initial_modified);
     }
 
@@ -349,8 +386,8 @@ mod tests {
             .expect("should set custom metadata");
 
         let metadata = registry.get_metadata("doc-1").unwrap();
-        assert_eq!(metadata.custom.get("author"), Some(&"Alice".to_string()));
-        assert_eq!(metadata.custom.get("version"), Some(&"1.0".to_string()));
+        assert_eq!(metadata.custom().get("author"), Some(&"Alice".to_string()));
+        assert_eq!(metadata.custom().get("version"), Some(&"1.0".to_string()));
     }
 
     #[test]
@@ -366,5 +403,85 @@ mod tests {
         let registry = DocumentRegistry::new();
 
         assert!(registry.get_metadata("nonexistent").is_none());
+    }
+
+    // Additional tests for edge cases and error paths
+
+    #[test]
+    fn test_open_with_invalid_state_returns_error() {
+        let mut registry = DocumentRegistry::new();
+        let invalid_state = b"this is not valid yrs state";
+
+        let result = registry.open("doc-1", invalid_state);
+        assert!(matches!(result, Err(RegistryError::InvalidState(_))));
+
+        // Document should not be partially created
+        assert!(registry.get("doc-1").is_none());
+    }
+
+    #[test]
+    fn test_open_duplicate_returns_error() {
+        let mut registry = DocumentRegistry::new();
+
+        registry.create("doc-1").unwrap().insert(0, "Original");
+        let state = registry.get("doc-1").unwrap().encode_state();
+
+        // Try to open the same ID while document exists
+        let result = registry.open("doc-1", &state);
+        assert!(matches!(result, Err(RegistryError::AlreadyExists(_))));
+
+        // Original document should be unchanged
+        assert_eq!(registry.get("doc-1").unwrap().get_content(), "Original");
+    }
+
+    #[test]
+    fn test_close_nonexistent_returns_none() {
+        let mut registry = DocumentRegistry::new();
+
+        let result = registry.close("nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_touch_nonexistent_returns_error() {
+        let mut registry = DocumentRegistry::new();
+
+        let result = registry.touch("nonexistent");
+        assert!(matches!(result, Err(RegistryError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_get_mut_allows_modification() {
+        let mut registry = DocumentRegistry::new();
+
+        registry.create("doc-1").unwrap();
+
+        // Get mutable reference and modify
+        let doc = registry.get_mut("doc-1").expect("should exist");
+        doc.insert(0, "Modified via get_mut");
+
+        // Verify change persisted
+        assert_eq!(
+            registry.get("doc-1").unwrap().get_content(),
+            "Modified via get_mut"
+        );
+    }
+
+    #[test]
+    fn test_default_creates_empty_registry() {
+        let registry = DocumentRegistry::default();
+        assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn test_custom_metadata_overwrites_existing() {
+        let mut registry = DocumentRegistry::new();
+        registry.create("doc-1").unwrap();
+
+        registry.set_custom_metadata("doc-1", "key", "value1").unwrap();
+        registry.set_custom_metadata("doc-1", "key", "value2").unwrap();
+
+        let metadata = registry.get_metadata("doc-1").unwrap();
+        assert_eq!(metadata.custom().get("key"), Some(&"value2".to_string()));
     }
 }
