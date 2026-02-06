@@ -102,17 +102,16 @@ impl CollabCore {
             .as_ref()
             .ok_or_else(|| CollabError::key_error("No encryption key set"))?;
 
-        let cipher = Aes256Gcm::new_from_slice(key)
-            .map_err(|e| CollabError::encryption(e.to_string()))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|e| CollabError::encryption(e.to_string()))?;
 
         let mut nonce_bytes = [0u8; 12];
         getrandom(&mut nonce_bytes)
             .map_err(|e| CollabError::encryption(format!("Failed to generate nonce: {}", e)))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| CollabError::encryption(e.to_string()))?;
+        let ciphertext =
+            cipher.encrypt(nonce, plaintext).map_err(|e| CollabError::encryption(e.to_string()))?;
 
         // Prepend nonce to ciphertext
         let mut result = nonce_bytes.to_vec();
@@ -132,24 +131,21 @@ impl CollabCore {
             .as_ref()
             .ok_or_else(|| CollabError::key_error("No encryption key set"))?;
 
-        let cipher = Aes256Gcm::new_from_slice(key)
-            .map_err(|e| CollabError::decryption(e.to_string()))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|e| CollabError::decryption(e.to_string()))?;
 
         let (nonce_bytes, encrypted) = ciphertext.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        cipher
-            .decrypt(nonce, encrypted)
-            .map_err(|e| CollabError::decryption(e.to_string()))
+        cipher.decrypt(nonce, encrypted).map_err(|e| CollabError::decryption(e.to_string()))
     }
 
     /// Apply an update from another document (internal).
     pub fn apply_update_internal(&mut self, update: &[u8]) -> Result<(), CollabError> {
-        let update = yrs::Update::decode_v1(update)
-            .map_err(|e| CollabError::sync_error(e.to_string()))?;
+        let update =
+            yrs::Update::decode_v1(update).map_err(|e| CollabError::sync_error(e.to_string()))?;
         let mut txn = self.doc.transact_mut();
-        txn.apply_update(update)
-            .map_err(|e| CollabError::sync_error(e.to_string()))?;
+        txn.apply_update(update).map_err(|e| CollabError::sync_error(e.to_string()))?;
         Ok(())
     }
 

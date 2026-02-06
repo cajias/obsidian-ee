@@ -3,7 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-use collab_core::{EncryptedDocument, MlsDocumentGroup, PendingMember};
+use collab_core::{
+    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument,
+    MlsDocumentGroup, PendingMember,
+};
 use collab_proto::Invite;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -327,47 +330,132 @@ fn handle_server_message(server_msg: collab_proto::ServerMessage) {
     }
 }
 
-/// Connect to a relay server and listen for updates.
+/// Run the WebSocket session: identify, subscribe, and process messages.
+///
+/// Returns `Ok(())` when the server closes the connection or the message
+/// stream ends.
 ///
 /// # Errors
 ///
-/// Returns an error if connection fails.
-pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Result<()> {
+/// Returns an error on WebSocket send failures during the handshake phase.
+async fn run_ws_session(
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    user_id: &str,
+    doc_id: &str,
+) -> anyhow::Result<()> {
     use collab_proto::{ClientMessage, ServerMessage};
 
-    println!("Connecting to {relay_url} as {user_id} for document {doc_id}...");
-
-    // Connect to relay
-    let (ws, _) = connect_async(relay_url).await?;
     let (mut write, mut read) = ws.split();
 
-    // Identify
     let identify = ClientMessage::Identify { user_id: user_id.to_string() };
     write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 
-    // Subscribe to document
     let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string() };
     write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 
-    println!("Connected! Listening for updates...");
-    println!("(Press Ctrl+C to exit)");
+    println!("Connected as {user_id}, subscribed to {doc_id}");
+    println!("Listening for updates... (Press Ctrl+C to exit)");
 
-    // Simple message loop
     while let Some(msg) = read.next().await {
         match msg {
-            Ok(Message::Text(text)) => {
-                let server_msg: ServerMessage = serde_json::from_str(&text)?;
-                handle_server_message(server_msg);
+            Ok(Message::Text(text)) => match serde_json::from_str::<ServerMessage>(&text) {
+                Ok(server_msg) => handle_server_message(server_msg),
+                Err(e) => eprintln!("Failed to parse server message: {e}"),
+            },
+            Ok(Message::Binary(data)) => {
+                eprintln!("Warning: unexpected binary message ({} bytes)", data.len());
             }
             Ok(Message::Close(_)) => {
-                println!("Connection closed");
+                println!("Connection closed by server");
                 break;
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                eprintln!("WebSocket error: {e}");
                 break;
             }
-            _ => {}
+            _ => {
+                // Ping/Pong handled by tungstenite at protocol level
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Connect to a relay server and listen for updates.
+///
+/// Uses [`ConnectionStateMachine`] for automatic connection and retry logic
+/// with exponential backoff. On disconnection or session error, the state
+/// machine drives reconnection attempts until the retry policy is exhausted.
+///
+/// # Errors
+///
+/// Returns an error if the connection permanently fails after exhausting
+/// all retry attempts.
+pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Result<()> {
+    let config = ConnectionConfig::new(relay_url, user_id, doc_id);
+    let mut sm = ConnectionStateMachine::new(config);
+
+    loop {
+        match sm.next_action() {
+            ConnectionAction::Connect { relay_url: url } => {
+                println!("Connecting to {url}...");
+                handle_connect_action(&mut sm, &url).await?;
+            }
+            ConnectionAction::WaitAndRetry { delay, attempt } => {
+                println!("Retry attempt {attempt} in {delay:?}...");
+                tokio::time::sleep(delay).await;
+                sm.on_retry_tick();
+            }
+            ConnectionAction::GiveUp { reason } => {
+                return Err(anyhow::anyhow!("Connection failed permanently: {reason}"));
+            }
+            ConnectionAction::DoNothing => {
+                // Only occurs when auto_connect is false (not current usage)
+                break;
+            }
+            ConnectionAction::IdentifyAndSubscribe { .. } => {
+                // Should only appear inside handle_connect_action
+                debug_assert!(false, "IdentifyAndSubscribe at top of connect loop");
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a single [`ConnectionAction::Connect`] attempt.
+///
+/// On success, runs the WebSocket session and signals disconnection when it ends.
+/// On failure, signals the error to the state machine for retry handling.
+async fn handle_connect_action(sm: &mut ConnectionStateMachine, url: &str) -> anyhow::Result<()> {
+    let (ws, _) = match connect_async(url).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("Connection failed: {e}");
+            sm.on_error(&e.to_string());
+            return Ok(());
+        }
+    };
+
+    sm.on_connected();
+
+    let action = sm.next_action();
+    let ConnectionAction::IdentifyAndSubscribe { user_id: uid, doc_id: did } = action else {
+        eprintln!("Unexpected action after connect: {action:?}");
+        sm.on_error("unexpected state after connect");
+        return Ok(());
+    };
+
+    match run_ws_session(ws, &uid, &did).await {
+        Ok(()) => sm.on_disconnected(),
+        Err(e) => {
+            eprintln!("Session error: {e}");
+            sm.on_error(&e.to_string());
         }
     }
 
