@@ -18,7 +18,10 @@ pub use connection::{
 pub use document::CollabDocument;
 pub use encryption::{EncryptedDocument, EncryptedOp, Invite};
 pub use mls::{MlsDocumentGroup, PendingMember};
-pub use registry::{DocumentEntry, DocumentMetadata, DocumentRegistry, RegistryError};
+pub use registry::{
+    DocumentEntry, DocumentMetadata, DocumentRegistry, DocumentVariant, EncryptionMetadata,
+    RegistryError,
+};
 
 /// Document identifier type.
 pub type DocumentId = String;
