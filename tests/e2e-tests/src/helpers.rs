@@ -295,7 +295,7 @@ pub async fn setup_two_user_group(
     // Bob joins using the welcome
     // Note: commit is empty here since we received welcome via network.
     // For 2-user groups, no commit processing is needed.
-    let bob_invite = Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![] };
+    let bob_invite = Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
     let bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
 
     Ok((alice_doc, bob_doc))
@@ -346,7 +346,7 @@ pub async fn setup_three_user_group(
     let _ = charlie.try_recv(SHORT_TIMEOUT).await;
 
     let bob_doc = EncryptedDocument::join(
-        &Invite { doc_id: doc_id.clone(), welcome: bob_welcome, commit: vec![] },
+        &Invite { doc_id: doc_id.clone(), welcome: bob_welcome, commit: vec![], epoch: 1 },
         bob_pending,
     )?;
 
@@ -372,7 +372,7 @@ pub async fn setup_three_user_group(
     let _ = bob.try_recv(SHORT_TIMEOUT).await;
 
     let charlie_doc = EncryptedDocument::join(
-        &Invite { doc_id: doc_id.clone(), welcome: charlie_welcome, commit: vec![] },
+        &Invite { doc_id: doc_id.clone(), welcome: charlie_welcome, commit: vec![], epoch: 2 },
         charlie_pending,
     )?;
 

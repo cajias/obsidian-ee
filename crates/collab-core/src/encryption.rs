@@ -96,7 +96,7 @@ impl EncryptedDocument {
     pub fn create_invite(&mut self, key_package: &[u8]) -> Result<Invite> {
         let (commit, welcome) = self.mls.add_member(key_package)?;
 
-        Ok(Invite { doc_id: self.doc.id().to_string(), welcome, commit })
+        Ok(Invite { doc_id: self.doc.id().to_string(), welcome, commit, epoch: self.mls.epoch() })
     }
 
     /// Process a commit message from another member (e.g., when a new member is added).
@@ -119,6 +119,11 @@ impl EncryptedDocument {
 }
 
 /// Invite for joining an encrypted document.
+///
+/// The `epoch` field records the group epoch at which this invite was created
+/// (after `add_member`). The transport/relay layer should compare this against
+/// the current group epoch before delivering the invite. If the group has
+/// advanced past `epoch`, the invite is stale and should be rejected.
 #[derive(Debug, Clone)]
 pub struct Invite {
     /// Document identifier.
@@ -128,6 +133,9 @@ pub struct Invite {
     /// MLS commit message for existing members.
     /// Existing group members must process this to stay in sync.
     pub commit: Vec<u8>,
+    /// MLS epoch at which this invite was created (after `add_member`).
+    /// Used to detect stale invites when the group has advanced past this epoch.
+    pub epoch: u64,
 }
 
 #[cfg(test)]

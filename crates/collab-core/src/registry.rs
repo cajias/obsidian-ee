@@ -29,6 +29,16 @@ pub enum RegistryError {
     /// MLS operation failed.
     #[error("MLS error: {0}")]
     MlsError(#[from] Arc<crate::Error>),
+    /// Invite is stale — the group epoch has advanced past the invite's epoch.
+    #[error("Stale invite for document {doc_id}: invite epoch {invite_epoch}, current epoch {current_epoch}")]
+    StaleInvite {
+        /// The document the invite was for.
+        doc_id: DocumentId,
+        /// The epoch recorded in the invite.
+        invite_epoch: u64,
+        /// The current group epoch.
+        current_epoch: u64,
+    },
     /// Internal inconsistency detected.
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -94,6 +104,20 @@ impl DocumentVariant {
 }
 
 /// Metadata about document encryption state.
+///
+/// # Clone Semantics
+///
+/// `EncryptionMetadata` derives [`Clone`] and produces a fully independent copy.
+/// All fields are simple owned types ([`String`], [`bool`], [`u64`]) — there are
+/// no `Arc` references, interior mutability, or shared state. Cloning is cheap
+/// (one heap allocation for the `user_id` string).
+///
+/// This struct holds **no cryptographic key material**. Keys live exclusively in
+/// [`MlsDocumentGroup`]. Cloning `EncryptionMetadata` therefore has no security
+/// implications — the clone is plain metadata.
+///
+/// Cloned instances track epoch independently; advancing the epoch on one copy
+/// does not affect the other.
 #[derive(Debug, Clone)]
 pub struct EncryptionMetadata {
     /// The user ID of the local participant.
@@ -553,8 +577,14 @@ impl DocumentRegistry {
 
     /// Join an existing encrypted document using an invite.
     ///
+    /// `current_group_epoch` is the latest known group epoch, typically provided
+    /// by the relay/transport layer. If it differs from the invite's epoch, the
+    /// invite is considered stale and the join is rejected.
+    ///
     /// # Errors
     ///
+    /// Returns `RegistryError::StaleInvite` if the invite's epoch does not match
+    /// `current_group_epoch`.
     /// Returns `RegistryError::AlreadyExists` if a document with the given ID already exists.
     /// Returns `RegistryError::MlsError` if joining fails.
     ///
@@ -566,11 +596,26 @@ impl DocumentRegistry {
         &mut self,
         invite: &Invite,
         pending: PendingMember,
+        current_group_epoch: u64,
     ) -> Result<&mut EncryptedDocument, RegistryError> {
         let doc_id = invite.doc_id.clone();
         let user_id = pending.user_id().to_string();
 
-        info!(document_id = %doc_id, user_id = %user_id, "Joining encrypted document via invite");
+        info!(document_id = %doc_id, user_id = %user_id,
+              invite_epoch = invite.epoch, current_epoch = current_group_epoch,
+              "Joining encrypted document via invite");
+
+        // Reject stale invites: the group has advanced past the invite's epoch
+        if invite.epoch != current_group_epoch {
+            warn!(document_id = %doc_id, invite_epoch = invite.epoch,
+                  current_epoch = current_group_epoch,
+                  "Rejecting stale invite: group epoch has advanced");
+            return Err(RegistryError::StaleInvite {
+                doc_id,
+                invite_epoch: invite.epoch,
+                current_epoch: current_group_epoch,
+            });
+        }
 
         if self.documents.contains_key(&doc_id) {
             warn!(document_id = %doc_id, "Attempted to join duplicate encrypted document");
@@ -1202,7 +1247,7 @@ mod tests {
 
         // Bob joins in a separate registry
         let mut bob_registry = DocumentRegistry::new();
-        let result = bob_registry.join_encrypted(&invite, bob_pending);
+        let result = bob_registry.join_encrypted(&invite, bob_pending, invite.epoch);
         assert!(result.is_ok());
     }
 
@@ -1223,7 +1268,7 @@ mod tests {
 
         // Bob joins
         let mut bob_registry = DocumentRegistry::new();
-        bob_registry.join_encrypted(&invite, bob_pending).unwrap();
+        bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
 
         // Bob's metadata should show is_owner=false
         let meta = bob_registry.get_encryption_metadata("doc-1").unwrap();
@@ -1253,7 +1298,7 @@ mod tests {
 
         // Bob joins
         let mut bob_registry = DocumentRegistry::new();
-        bob_registry.join_encrypted(&invite, bob_pending).unwrap();
+        bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
 
         // Bob can decrypt Alice's message
         let bob_doc = bob_registry.get_encrypted_mut("doc-1").unwrap();
@@ -1311,7 +1356,7 @@ mod tests {
 
         // Bob joins
         let mut bob_registry = DocumentRegistry::new();
-        bob_registry.join_encrypted(&bob_invite, bob_pending).unwrap();
+        bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
         // Alice adds Carol (this creates a commit)
         let carol_invite = alice_registry.create_invite("doc-1", carol_pending.key_package()).unwrap();
