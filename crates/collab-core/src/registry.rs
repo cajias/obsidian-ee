@@ -29,7 +29,7 @@ pub enum RegistryError {
     /// MLS operation failed.
     #[error("MLS error: {0}")]
     MlsError(#[from] Arc<crate::Error>),
-    /// Invite is stale — the group epoch has advanced past the invite's epoch.
+    /// Invite is stale — the invite's epoch does not match the current group epoch.
     #[error("Stale invite for document {doc_id}: invite epoch {invite_epoch}, current epoch {current_epoch}")]
     StaleInvite {
         /// The document the invite was for.
@@ -516,6 +516,7 @@ impl DocumentRegistry {
     /// # Errors
     ///
     /// Returns `RegistryError::AlreadyExists` if a document with the given ID already exists.
+    /// Returns `RegistryError::InvalidState` if `user_id` is empty.
     /// Returns `RegistryError::MlsError` if MLS group creation fails.
     ///
     /// # Panics
@@ -591,6 +592,7 @@ impl DocumentRegistry {
     /// Returns `RegistryError::StaleInvite` if the invite's epoch does not match
     /// `current_group_epoch`.
     /// Returns `RegistryError::AlreadyExists` if a document with the given ID already exists.
+    /// Returns `RegistryError::InvalidState` if the pending member's user ID is empty.
     /// Returns `RegistryError::MlsError` if joining fails.
     ///
     /// # Panics
@@ -610,11 +612,11 @@ impl DocumentRegistry {
               invite_epoch = invite.epoch, current_epoch = current_group_epoch,
               "Joining encrypted document via invite");
 
-        // Reject stale invites: the group has advanced past the invite's epoch
+        // Reject stale invites: the invite's epoch must match the current group epoch
         if invite.epoch != current_group_epoch {
             warn!(document_id = %doc_id, invite_epoch = invite.epoch,
                   current_epoch = current_group_epoch,
-                  "Rejecting stale invite: group epoch has advanced");
+                  "Rejecting stale invite: epoch mismatch");
             return Err(RegistryError::StaleInvite {
                 doc_id,
                 invite_epoch: invite.epoch,
@@ -723,7 +725,7 @@ impl DocumentRegistry {
         info!(document_id = %id, key_package_len = key_package.len(), "Creating invite for new member");
 
         if key_package.is_empty() {
-            error!(document_id = %id, "Empty key package provided");
+            warn!(document_id = %id, "Empty key package provided");
             return Err(RegistryError::InvalidState(
                 "Key package cannot be empty".to_string(),
             ));
@@ -748,7 +750,8 @@ impl DocumentRegistry {
             RegistryError::MlsError(Arc::new(e))
         })?;
 
-        let new_epoch = doc.epoch();
+        // Use the invite's epoch directly (authoritative post-add_member epoch)
+        let new_epoch = invite.epoch;
 
         // Update epoch in metadata after adding member
         let meta = entry
@@ -778,10 +781,10 @@ impl DocumentRegistry {
     pub fn process_commit(&mut self, id: &str, commit: &[u8]) -> Result<(), RegistryError> {
         info!(document_id = %id, commit_len = commit.len(), "Processing commit for encrypted document");
 
-        let entry = self
-            .documents
-            .get_mut(id)
-            .ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
+        let entry = self.documents.get_mut(id).ok_or_else(|| {
+            warn!(document_id = %id, "Cannot process commit: document not found");
+            RegistryError::NotFound(id.to_string())
+        })?;
 
         let doc = match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => doc.as_mut(),

@@ -122,8 +122,8 @@ impl EncryptedDocument {
 ///
 /// The `epoch` field records the group epoch at which this invite was created
 /// (after `add_member`). The transport/relay layer should compare this against
-/// the current group epoch before delivering the invite. If the group has
-/// advanced past `epoch`, the invite is stale and should be rejected.
+/// the current group epoch before delivering the invite. If `epoch` does not
+/// match the current group epoch, the invite is stale and should be rejected.
 #[derive(Debug, Clone)]
 pub struct Invite {
     /// Document identifier.
@@ -134,7 +134,7 @@ pub struct Invite {
     /// Existing group members must process this to stay in sync.
     pub commit: Vec<u8>,
     /// MLS epoch at which this invite was created (after `add_member`).
-    /// Used to detect stale invites when the group has advanced past this epoch.
+    /// Used to detect stale invites when this epoch does not match the current group epoch.
     pub epoch: u64,
 }
 
