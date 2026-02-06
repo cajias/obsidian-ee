@@ -1,0 +1,23 @@
+[package]
+name = "collab-watcher"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "File system watcher for Obsidian vault events"
+
+[dependencies]
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio-test = { workspace = true }
+tempfile = "3.14"
+
+[lints]
+workspace = true
