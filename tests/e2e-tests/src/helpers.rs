@@ -183,7 +183,15 @@ impl TestClient {
             doc_id: doc_id.clone(),
             encrypted: op.ciphertext.clone(),
             epoch: op.epoch,
-            signature: vec![], // TODO: Add proper signatures
+            // TODO(security): Implement message signatures for replay attack prevention
+            // Priority: Medium - MLS provides forward secrecy and authenticity, but not
+            // protection against replay attacks or message reordering by a compromised relay.
+            // Suggested approach:
+            // - Use Ed25519 for signing (fast, 64-byte signatures)
+            // - Sign: BLAKE3(doc_id || encrypted || epoch || sequence_number)
+            // - Track sequence numbers per sender to detect replays/reordering
+            // - Key distribution via MLS KeyPackage credential field
+            signature: vec![],
         })
         .await
     }
@@ -300,8 +308,11 @@ pub async fn setup_two_user_group(
     };
 
     // Bob joins using the welcome
-    // Note: commit is empty here since we received welcome via network.
-    // For 2-user groups, no commit processing is needed.
+    // MLS Protocol Detail: The Welcome message contains all state Bob needs to join.
+    // The Commit message (empty here) is only needed to update *existing* members about
+    // the new joiner. In a 2-user group, there are no existing members to update (only
+    // Alice who created the group, and Bob who is joining). For 3+ user groups, the
+    // commit would contain updates that existing members must process to learn about Bob.
     let bob_invite = Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
     let bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
 
