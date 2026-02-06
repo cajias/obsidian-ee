@@ -319,13 +319,18 @@ async fn test_full_identify_subscribe_handshake() {
     assert!(sm.is_connected());
 }
 
-/// Test that the state machine handles server rejection of Identify gracefully.
+/// Test that the state machine transitions to Reconnecting when the
+/// application layer signals an error after a successful TCP connection.
 ///
-/// This verifies the critical path where `on_connected()` has been called
-/// (TCP handshake succeeded) but the application-level handshake fails.
-/// The state machine should transition to Reconnecting and retry.
+/// This verifies the path where `on_connected()` has been called (TCP
+/// handshake succeeded), the Identify exchange completes over the wire, but
+/// the application layer calls `on_error()` — for example because the
+/// server returned an `Error` response or business logic rejected the
+/// session. The current relay always accepts `Identify`, so this test
+/// simulates the rejection via `on_error()` rather than relying on a real
+/// server rejection path.
 #[tokio::test]
-async fn test_identify_rejected_triggers_retry() {
+async fn test_app_layer_error_after_identify_triggers_retry() {
     let server = TestServer::start().await;
     let url = server.url().to_owned();
 
@@ -368,31 +373,32 @@ async fn test_identify_rejected_triggers_retry() {
     let server_msg: ServerMessage = serde_json::from_str(text)
         .unwrap_or_else(|e| panic!("Failed to parse response: {e}. Got: {text}"));
 
-    // In a real scenario, the server might reject with an Error response
-    // For this test, we'll simulate the rejection by calling on_error
-    // (In production, the application layer would detect Error response and call on_error)
+    // The current relay always responds with Identified (no rejection path).
+    // We verify the server response, then simulate an application-layer error
+    // to test the state machine's retry behavior after on_error().
     match server_msg {
         ServerMessage::Error { code, message } => {
-            // Server rejected - this is the scenario we're testing
+            // Server rejected (future path) — feed the real error into the SM
             sm.on_error(&format!("Identification failed: {code:?} - {message}"));
-            assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
-
-            // Verify retry action
-            let retry_action = sm.next_action();
-            assert!(
-                matches!(retry_action, ConnectionAction::WaitAndRetry { attempt: 1, .. }),
-                "Expected WaitAndRetry action after rejection, got {retry_action:?}"
-            );
         }
         ServerMessage::Identified { .. } => {
-            // Server accepted (normal path) - simulate a reject for test purposes
-            sm.on_error("simulated identification rejection");
-            assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+            // Normal path — simulate an app-layer error (e.g., version mismatch,
+            // auth failure detected client-side, etc.)
+            sm.on_error("simulated app-layer rejection after Identify");
         }
         other => {
             panic!("Expected Identified or Error response, got {other:?}");
         }
     }
+
+    // Regardless of which branch, the state machine should retry
+    assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+
+    let retry_action = sm.next_action();
+    assert!(
+        matches!(retry_action, ConnectionAction::WaitAndRetry { attempt: 1, .. }),
+        "Expected WaitAndRetry action after app-layer error, got {retry_action:?}"
+    );
 }
 
 /// Extract `user_id` and `doc_id` from an `IdentifyAndSubscribe` action.
@@ -544,7 +550,7 @@ async fn test_disconnect_before_handshake_retries() {
 /// Test that the state machine handles race conditions gracefully.
 ///
 /// This verifies:
-/// 1. Calling `on_error()` while already in `Reconnecting` is idempotent
+/// 1. Calling `on_error()` while already in `Reconnecting` increments the attempt counter
 /// 2. Calling `on_retry_tick()` multiple times is handled safely
 ///
 /// These scenarios can occur in production when:
@@ -592,11 +598,7 @@ async fn test_concurrent_error_handling() {
 
     // Advance through retry tick
     sm.on_retry_tick();
-    assert_eq!(
-        *sm.state(),
-        ConnectionState::Connecting,
-        "Retry tick should advance to Connecting"
-    );
+    assert_eq!(*sm.state(), ConnectionState::Connecting, "Retry tick should advance to Connecting");
 
     // Second connection attempt fails
     let result2 = timeout(TEST_TIMEOUT, connect_async(dead_url)).await;
@@ -671,15 +673,10 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
     let url = server.url().to_owned();
 
     // Policy: 50ms initial, 2x backoff, 500ms cap, 25% jitter, 4 retries
-    let policy = RetryPolicy::new(
-        4,
-        Duration::from_millis(50),
-        Duration::from_millis(500),
-        2.0,
-        0.25,
-    );
-    let config = ConnectionConfig::new(&url, "jitter-user", DOC_ID)
-        .with_retry_policy(policy.clone());
+    let policy =
+        RetryPolicy::new(4, Duration::from_millis(50), Duration::from_millis(500), 2.0, 0.25);
+    let config =
+        ConnectionConfig::new(&url, "jitter-user", DOC_ID).with_retry_policy(policy.clone());
 
     let mut sm = ConnectionStateMachine::new(config);
 
@@ -763,19 +760,24 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
     );
 }
 
-/// Test that server-initiated WebSocket close frames trigger reconnection.
+/// Test that the state machine reconnects after WebSocket close frames.
 ///
-/// This verifies the state machine handles different close codes properly:
-/// - 1000 (Normal Closure): Clean shutdown, still should reconnect for resilience
-/// - 1001 (Going Away): Server shutting down or restarting
-/// - 1006 (Abnormal): Connection lost without close handshake (network issue)
+/// This verifies that when the application layer detects a WebSocket close
+/// (of any kind) and calls `on_disconnected()`, the state machine transitions
+/// to `Reconnecting` rather than `Failed`. Three scenarios are exercised:
 ///
-/// Unlike `test_reconnect_after_server_restart` which calls `sm.on_disconnected()`
-/// directly, this test sends actual WebSocket close frames and verifies the
-/// application layer detects them and notifies the state machine.
+/// - **Normal close (1000)**: Clean shutdown — still reconnects for resilience.
+/// - **Going Away (1001)**: Server restarting — reconnects to pick up new instance.
+/// - **Abnormal close**: Connection dropped without a close frame (network issue).
+///
+/// Note: In a real deployment the *server* initiates the close, but in this
+/// test the close frames are sent from the client-side WebSocket handle
+/// (we don't have a hook into the relay to force server-side closes). The
+/// important thing being tested is the state machine's reaction to
+/// `on_disconnected()` after each scenario, not who initiates the close.
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::excessive_nesting)]
-async fn test_server_close_frame_triggers_reconnect() {
+async fn test_close_frame_handling_triggers_reconnect() {
     let server = TestServer::start().await;
     let url = server.url().to_owned();
     let config = auto_config(&url);
@@ -788,12 +790,13 @@ async fn test_server_close_frame_triggers_reconnect() {
         // Actually connect
         let result = timeout(TEST_TIMEOUT, connect_async(&url)).await;
         let ws_result = result.expect("WebSocket connect timed out");
-        let (mut ws, _response) = ws_result.unwrap_or_else(|e| panic!("WebSocket connect failed: {e}"));
+        let (mut ws, _response) =
+            ws_result.unwrap_or_else(|e| panic!("WebSocket connect failed: {e}"));
 
         sm.on_connected();
         assert_eq!(*sm.state(), ConnectionState::Connected);
 
-        // Server sends normal close frame
+        // Send normal close frame (simulates server-initiated close)
         ws.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
             code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
             reason: std::borrow::Cow::Borrowed("server shutdown"),
@@ -835,12 +838,13 @@ async fn test_server_close_frame_triggers_reconnect() {
 
         let result = timeout(TEST_TIMEOUT, connect_async(&url)).await;
         let ws_result = result.expect("WebSocket connect timed out");
-        let (mut ws, _response) = ws_result.unwrap_or_else(|e| panic!("WebSocket connect failed: {e}"));
+        let (mut ws, _response) =
+            ws_result.unwrap_or_else(|e| panic!("WebSocket connect failed: {e}"));
 
         sm.on_connected();
         assert_eq!(*sm.state(), ConnectionState::Connected);
 
-        // Server sends "going away" close frame (e.g., server restart, maintenance)
+        // Send "going away" close frame (simulates server restart/maintenance)
         ws.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
             code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
             reason: std::borrow::Cow::Borrowed("server restarting"),

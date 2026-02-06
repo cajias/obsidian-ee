@@ -141,17 +141,24 @@ impl TestClient {
         }
     }
 
-    /// Try to receive a message, returning None only on timeout.
+    /// Try to receive a message, returning `Ok(None)` only on timeout.
+    ///
+    /// Unlike [`recv_timeout`](Self::recv_timeout), this method distinguishes
+    /// timeouts from real errors structurally (via `tokio::time::timeout`)
+    /// rather than by string matching.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection fails or message is invalid.
-    /// Only returns `Ok(None)` on legitimate timeout.
+    /// Only returns `Ok(None)` on a legitimate `tokio::time::Elapsed` timeout.
     pub async fn try_recv(&mut self, duration: Duration) -> anyhow::Result<Option<ServerMessage>> {
-        match self.recv_timeout(duration).await {
-            Ok(msg) => Ok(Some(msg)),
-            Err(e) if e.to_string().contains("Timeout") => Ok(None),
-            Err(e) => Err(e),
+        match timeout(duration, self.ws.next()).await {
+            Err(_elapsed) => Ok(None),
+            Ok(Some(Ok(Message::Text(text)))) => Ok(Some(serde_json::from_str(&text)?)),
+            Ok(Some(Ok(Message::Close(_)))) => anyhow::bail!("Connection closed unexpectedly"),
+            Ok(Some(Err(e))) => Err(e.into()),
+            Ok(None) => anyhow::bail!("WebSocket stream ended unexpectedly"),
+            Ok(Some(Ok(_))) => anyhow::bail!("Unexpected WebSocket message type"),
         }
     }
 
@@ -309,10 +316,11 @@ pub async fn setup_two_user_group(
 
     // Bob joins using the welcome
     // MLS Protocol Detail: The Welcome message contains all state Bob needs to join.
-    // The Commit message (empty here) is only needed to update *existing* members about
-    // the new joiner. In a 2-user group, there are no existing members to update (only
-    // Alice who created the group, and Bob who is joining). For 3+ user groups, the
-    // commit would contain updates that existing members must process to learn about Bob.
+    // The Commit message (empty here) is only needed to update *other* existing members
+    // about the new joiner. In this 2-user case, Alice (the inviter) already processed
+    // the commit when creating the invite, and there are no other existing members to
+    // notify. For 3+ user groups, the commit would contain updates that existing members
+    // must process to learn about Bob.
     let bob_invite = Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
     let bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
 
