@@ -4,26 +4,12 @@ Obsidian E2E is an end-to-end encrypted collaborative document editing system. I
 
 ## System Context
 
-```
-+-------------------+          +-------------------+
-|   Obsidian App    |          |   Obsidian App    |
-|  (Plugin + WASM)  |          |  (Plugin + WASM)  |
-|                   |          |                   |
-|  CollabCore(WASM) |          |  CollabCore(WASM) |
-|  CollabClient(TS) |          |  CollabClient(TS) |
-+--------+----------+          +--------+----------+
-         |                              |
-         |  Encrypted WebSocket (wss://)
-         |                              |
-    +----v------------------------------v----+
-    |         WebSocket Relay Server         |
-    |  (Zero-Knowledge: cannot read content) |
-    +---------+-------------------+----------+
-              |                   |
-     +--------v--------+  +------v--------+
-     |    DynamoDB      |  |    Redis      |
-     | (Offline Queue)  |  |  (Presence)   |
-     +-----------------+  +---------------+
+```mermaid
+graph TD
+    A1[Obsidian App<br/>Plugin + WASM<br/>CollabCore / CollabClient] -->|Encrypted WebSocket wss://| R
+    A2[Obsidian App<br/>Plugin + WASM<br/>CollabCore / CollabClient] -->|Encrypted WebSocket wss://| R
+    R[WebSocket Relay Server<br/>Zero-Knowledge: cannot read content] --> D[(DynamoDB<br/>Offline Queue)]
+    R --> Redis[(Redis<br/>Presence)]
 ```
 
 ## Core Principles
@@ -53,114 +39,67 @@ Additionally:
 
 ### Collaborative Edit (Happy Path)
 
-```
-Alice types "Hello"
-    |
-    v
-1. CollabDocument (Yrs CRDT)
-   - Text inserted at position via Yrs transaction
-   - State vector updated
-   - Incremental update encoded (Yrs V1 format)
-    |
-    v
-2. EncryptedDocument (MLS Layer)
-   - Yrs update bytes encrypted with MLS group key
-   - Produces EncryptedOp { ciphertext, epoch }
-    |
-    v
-3. WebSocket Transport
-   - Serialized as ClientMessage::YrsUpdate (JSON)
-   - Contains: doc_id, encrypted (opaque bytes), epoch, signature
-    |
-    v
-4. Relay Server
-   - Deserializes message header (doc_id, from)
-   - Looks up subscribers for doc_id
-   - Forwards to all subscribers EXCEPT sender
-   - Never inspects encrypted payload
-    |
-    v
-5. Bob's Client Receives ServerMessage::YrsUpdate
-   - MLS decryption with group key
-   - Yrs update applied to local document
-   - CRDT conflict resolution (automatic)
-   - Editor updated with new content
-    |
-    v
-Both Alice and Bob have identical document state
+```mermaid
+flowchart TD
+    A["Alice types 'Hello'"] --> B["1. CollabDocument (Yrs CRDT)<br/>Text inserted via Yrs transaction<br/>State vector updated<br/>Incremental update encoded (V1)"]
+    B --> C["2. EncryptedDocument (MLS Layer)<br/>Yrs update encrypted with MLS group key<br/>Produces EncryptedOp { ciphertext, epoch }"]
+    C --> D["3. WebSocket Transport<br/>Serialized as ClientMessage::YrsUpdate (JSON)<br/>Contains: doc_id, encrypted, epoch, signature"]
+    D --> E["4. Relay Server<br/>Deserializes header (doc_id, from)<br/>Forwards to subscribers EXCEPT sender<br/>Never inspects encrypted payload"]
+    E --> F["5. Bob's Client Receives ServerMessage::YrsUpdate<br/>MLS decryption with group key<br/>Yrs update applied to local document<br/>CRDT conflict resolution (automatic)"]
+    F --> G["Both Alice and Bob have identical document state"]
 ```
 
 ### MLS Group Formation
 
-```
-1. Alice creates document
-   MlsDocumentGroup::create("alice")
-   -> MLS group with single member
-   -> Ciphersuite: X25519 + AES-128-GCM + SHA-256 + Ed25519
+```mermaid
+sequenceDiagram
+    participant Alice
+    participant Bob
 
-2. Bob generates key package
-   PendingMember::new("bob")
-   -> Key package containing Bob's public keys
+    Note over Alice: 1. MlsDocumentGroup::create("alice")<br/>MLS group with single member<br/>Ciphersuite: X25519 + AES-128-GCM + SHA-256 + Ed25519
 
-3. Alice invites Bob
-   alice_group.add_member(bob_key_package)
-   -> commit (for existing members to process)
-   -> welcome (for Bob to join)
-   -> Epoch incremented
+    Note over Bob: 2. PendingMember::new("bob")<br/>Key package containing Bob's public keys
+    Bob->>Alice: key_package_bytes
 
-4. Bob joins
-   bob_pending.join(welcome_bytes)
-   -> Bob now has MLS group state
-   -> Can encrypt/decrypt messages
+    Note over Alice: 3. alice_group.add_member(bob_key_package)<br/>→ commit + welcome<br/>→ Epoch incremented
+    Alice->>Bob: welcome_bytes
+    Alice->>Alice: commit_bytes (for self)
 
-5. Alice processes commit
-   alice_group.process_commit(commit_bytes)
-   -> Both at same epoch
-   -> Bidirectional encryption now works
+    Note over Bob: 4. bob_pending.join(welcome_bytes)<br/>Bob now has MLS group state
+
+    Note over Alice: 5. alice_group.process_commit(commit_bytes)<br/>Both at same epoch<br/>Bidirectional encryption works
 ```
 
 ## Layer Architecture
 
-```
-+--------------------------------------------------+
-|              Obsidian Plugin (TypeScript)          |
-|  main.ts -> CollabClient -> EditorSync            |
-+--------------------------------------------------+
-|              WASM Bridge (collab-wasm)             |
-|  CollabCore: Yrs CRDT + AES-256-GCM              |
-+--------------------------------------------------+
-|              Protocol (collab-proto)               |
-|  ClientMessage | ServerMessage | MlsMessageType   |
-+--------------------------------------------------+
-|              Core Library (collab-core)            |
-|  CollabDocument | MlsDocumentGroup | Registry     |
-|  EncryptedDocument | ConnectionStateMachine       |
-+--------------------------------------------------+
-|              Relay Server (collab-relay)           |
-|  RelayServer | MessageRouter | OfflineQueue       |
-+--------------------------------------------------+
-|              Infrastructure                        |
-|  DynamoDB | Redis | Docker | AWS CDK              |
-+--------------------------------------------------+
+```mermaid
+block-beta
+    columns 1
+    A["Obsidian Plugin (TypeScript)\nmain.ts → CollabClient → EditorSync"]
+    B["WASM Bridge (collab-wasm)\nCollabCore: Yrs CRDT + AES-256-GCM"]
+    C["Protocol (collab-proto)\nClientMessage | ServerMessage | MlsMessageType"]
+    D["Core Library (collab-core)\nCollabDocument | MlsDocumentGroup | Registry\nEncryptedDocument | ConnectionStateMachine"]
+    E["Relay Server (collab-relay)\nRelayServer | MessageRouter | OfflineQueue"]
+    F["Infrastructure\nDynamoDB | Redis | Docker | AWS CDK"]
+
+    A --> B --> C --> D
+    D --> E --> F
 ```
 
 ## Module Dependency Graph
 
-```
-collab-proto (shared types)
-    ^           ^
-    |           |
-collab-core    collab-relay
-    ^               ^
-    |               |
-collab-cli     (standalone server)
+```mermaid
+graph BT
+    proto[collab-proto<br/>shared types]
+    core[collab-core] --> proto
+    relay[collab-relay] --> proto
+    cli[collab-cli] --> core
+    relay ~~~ cli
 
-collab-wasm (independent, uses yrs + aes-gcm directly)
-    ^
-    |
-plugins/obsidian-ee (TypeScript)
+    wasm[collab-wasm<br/>independent, yrs + aes-gcm]
+    plugin[plugins/obsidian-ee<br/>TypeScript] --> wasm
 
-collab-watcher (independent, file system events)
+    watcher[collab-watcher<br/>independent, file system events]
 ```
 
 Key design decisions:
@@ -173,13 +112,18 @@ Key design decisions:
 
 The `ConnectionStateMachine` in `collab-core` manages WebSocket lifecycle:
 
-```
-Disconnected ──(connect/auto_connect)──> Connecting
-Connecting ──(on_connected)──> Connected
-Connecting ──(on_error)──> Reconnecting | Failed
-Connected ──(on_disconnected)──> Reconnecting | Failed
-Reconnecting ──(on_retry_tick)──> Connecting
-Reconnecting ──(max_retries)──> Failed
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected
+    Disconnected --> Connecting : connect / auto_connect
+    Connecting --> Connected : on_connected
+    Connecting --> Reconnecting : on_error
+    Connecting --> Failed : on_error (max retries)
+    Connected --> Reconnecting : on_disconnected
+    Connected --> Failed : on_disconnected (max retries)
+    Reconnecting --> Connecting : on_retry_tick
+    Reconnecting --> Failed : max_retries exceeded
+    Failed --> [*]
 ```
 
 Retry policy: exponential backoff (1s, 2s, 4s, 8s, 16s) with 25% jitter, capped at 30s, max 5 retries.

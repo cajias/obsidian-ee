@@ -127,51 +127,25 @@ Each membership change (add/remove) creates a new epoch. Forward secrecy is main
 
 ### Native (collab-core)
 
-```
-Plaintext (Yrs update bytes)
-    |
-    v
-MlsDocumentGroup::encrypt(plaintext)
-    |  Uses current epoch's group key
-    |  AES-128-GCM AEAD encryption
-    v
-EncryptedOp { ciphertext: Vec<u8>, epoch: u64 }
-    |
-    v
-Network transmission (opaque bytes)
-    |
-    v
-MlsDocumentGroup::decrypt(ciphertext)
-    |  Verifies AEAD tag
-    |  Decrypts with group key
-    v
-Plaintext (Yrs update bytes)
-    |
-    v
-CollabDocument::apply_update(bytes)
+```mermaid
+flowchart TD
+    A[Plaintext<br/>Yrs update bytes] --> B["MlsDocumentGroup::encrypt(plaintext)<br/>Uses current epoch's group key<br/>AES-128-GCM AEAD encryption"]
+    B --> C["EncryptedOp { ciphertext, epoch }"]
+    C --> D[Network transmission<br/>opaque bytes]
+    D --> E["MlsDocumentGroup::decrypt(ciphertext)<br/>Verifies AEAD tag<br/>Decrypts with group key"]
+    E --> F[Plaintext<br/>Yrs update bytes]
+    F --> G["CollabDocument::apply_update(bytes)"]
 ```
 
 ### WASM (collab-wasm, MVP)
 
-```
-Plaintext (Yrs state bytes)
-    |
-    v
-AES-256-GCM encrypt
-    |  12-byte random nonce (CSPRNG)
-    |  32-byte shared key
-    v
-Wire format: nonce (12B) || ciphertext
-    |
-    v
-Network transmission
-    |
-    v
-AES-256-GCM decrypt
-    |  Extract nonce from first 12 bytes
-    |  Verify AEAD authentication tag
-    v
-Plaintext (Yrs state bytes)
+```mermaid
+flowchart TD
+    A[Plaintext<br/>Yrs state bytes] --> B["AES-256-GCM encrypt<br/>12-byte random nonce (CSPRNG)<br/>32-byte shared key"]
+    B --> C["Wire format: nonce (12B) ‖ ciphertext"]
+    C --> D[Network transmission]
+    D --> E["AES-256-GCM decrypt<br/>Extract nonce from first 12 bytes<br/>Verify AEAD authentication tag"]
+    E --> F[Plaintext<br/>Yrs state bytes]
 ```
 
 ## Security Properties by Layer

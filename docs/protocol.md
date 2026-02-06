@@ -162,69 +162,59 @@ Error response from the server.
 
 ## Session Lifecycle
 
-```
-Client                              Relay Server
-  |                                      |
-  |-- identify { user_id } ------------>|
-  |<------------ identified { user_id } -|
-  |                                      |
-  |-- subscribe { doc_id } ------------>|
-  |<------------ subscribed { doc_id }  -|
-  |                                      |
-  |-- yrs_update { encrypted } -------->|
-  |         (broadcast to other subscribers)
-  |<------------ yrs_update { from, encrypted }
-  |                                      |
-  |-- mls_handshake { payload } ------->|
-  |         (broadcast to document members)
-  |<------------ mls_handshake { from, payload }
-  |                                      |
-  |-- unsubscribe { doc_id } ---------->|
-  |<------------ unsubscribed { doc_id } |
-  |                                      |
-  |-- (WebSocket close) --------------->|
-  |         (client removed from all subscriptions)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Relay as Relay Server
+
+    Client->>Relay: identify { user_id }
+    Relay-->>Client: identified { user_id }
+
+    Client->>Relay: subscribe { doc_id }
+    Relay-->>Client: subscribed { doc_id }
+
+    Client->>Relay: yrs_update { encrypted }
+    Note right of Relay: Broadcast to other subscribers
+    Relay-->>Client: yrs_update { from, encrypted }
+
+    Client->>Relay: mls_handshake { payload }
+    Note right of Relay: Broadcast to document members
+    Relay-->>Client: mls_handshake { from, payload }
+
+    Client->>Relay: unsubscribe { doc_id }
+    Relay-->>Client: unsubscribed { doc_id }
+
+    Client-xRelay: WebSocket close
+    Note right of Relay: Client removed from all subscriptions
 ```
 
 ## MLS Handshake Flow (Group Formation)
 
-```
-Alice (Owner)                    Relay                    Bob (Joiner)
-     |                            |                           |
-     |                            |     identify + subscribe  |
-     |                            |<--------------------------|
-     |                            |                           |
-     |                            |   mls_handshake           |
-     |                            |   (key_package)           |
-     |                            |<--------------------------|
-     |  mls_handshake             |                           |
-     |  (key_package, from: bob)  |                           |
-     |<---------------------------|                           |
-     |                            |                           |
-     |  [Alice processes key      |                           |
-     |   package, creates         |                           |
-     |   welcome + commit]        |                           |
-     |                            |                           |
-     |  mls_handshake (welcome) ->|                           |
-     |                            |  mls_handshake            |
-     |                            |  (welcome, from: alice)   |
-     |                            |-------------------------->|
-     |                            |                           |
-     |  mls_handshake (commit) -->|                           |
-     |                            |  mls_handshake            |
-     |                            |  (commit, from: alice)    |
-     |                            |-------------------------->|
-     |                            |                           |
-     |  [Both now share MLS       |     [Bob joins group      |
-     |   group at same epoch]     |      using welcome]       |
-     |                            |                           |
-     |  yrs_update (encrypted) -->|                           |
-     |                            |  yrs_update               |
-     |                            |  (from: alice, encrypted) |
-     |                            |-------------------------->|
-     |                            |                           |
-     |                            |   [Bob decrypts with      |
-     |                            |    MLS group key]         |
+```mermaid
+sequenceDiagram
+    participant Alice as Alice (Owner)
+    participant Relay
+    participant Bob as Bob (Joiner)
+
+    Bob->>Relay: identify + subscribe
+    Bob->>Relay: mls_handshake (key_package)
+    Relay->>Alice: mls_handshake (key_package, from: bob)
+
+    Note over Alice: Processes key package,<br/>creates welcome + commit
+
+    Alice->>Relay: mls_handshake (welcome)
+    Relay->>Bob: mls_handshake (welcome, from: alice)
+
+    Alice->>Relay: mls_handshake (commit)
+    Relay->>Bob: mls_handshake (commit, from: alice)
+
+    Note over Alice: Both share MLS group<br/>at same epoch
+    Note over Bob: Joins group using welcome
+
+    Alice->>Relay: yrs_update (encrypted)
+    Relay->>Bob: yrs_update (from: alice, encrypted)
+
+    Note over Bob: Decrypts with MLS group key
 ```
 
 ## Routing Rules

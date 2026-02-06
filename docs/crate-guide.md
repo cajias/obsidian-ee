@@ -375,8 +375,9 @@ pub struct VaultEvent {
 
 Uses a bridge pattern to connect the synchronous `notify` crate to tokio:
 
-```
-notify (sync) -> std::sync::mpsc -> poll loop -> tokio::sync::mpsc -> consumer
+```mermaid
+flowchart LR
+    A["notify (sync)"] --> B["std::sync::mpsc"] --> C["poll loop"] --> D["tokio::sync::mpsc"] --> E["consumer"]
 ```
 
 The watcher:

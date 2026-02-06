@@ -4,46 +4,18 @@ The `plugins/obsidian-ee/` directory contains the TypeScript Obsidian plugin tha
 
 ## Architecture
 
-```
-+------------------------------------------+
-|            Obsidian Desktop App           |
-|                                          |
-|  +------------------------------------+  |
-|  |         CollabPlugin (main.ts)     |  |
-|  |  - WASM initialization             |  |
-|  |  - Session lifecycle management     |  |
-|  |  - Settings UI                      |  |
-|  +--------+---------------------------+  |
-|           |                              |
-|  +--------v---------------------------+  |
-|  |     EditorSync (editor-sync.ts)    |  |
-|  |  - Binds to Obsidian MarkdownView  |  |
-|  |  - Debounces local changes (100ms) |  |
-|  |  - Applies remote updates          |  |
-|  |  - Preserves cursor position       |  |
-|  +--------+---------------------------+  |
-|           |                              |
-|  +--------v---------------------------+  |
-|  |    CollabClient (collab-client.ts) |  |
-|  |  - WebSocket connection            |  |
-|  |  - Reconnection with backoff       |  |
-|  |  - Message queue (1000 max)        |  |
-|  |  - Text diff algorithm             |  |
-|  +--------+---------------------------+  |
-|           |                              |
-|  +--------v---------------------------+  |
-|  |     CollabCore (WASM module)       |  |
-|  |  - Yrs CRDT operations            |  |
-|  |  - AES-256-GCM encryption         |  |
-|  +------------------------------------+  |
-+------------------------------------------+
-          |
-          | wss:// WebSocket
-          |
-    +-----v-----+
-    |   Relay    |
-    |   Server   |
-    +-----------+
+```mermaid
+graph TD
+    subgraph Obsidian["Obsidian Desktop App"]
+        Plugin["CollabPlugin (main.ts)<br/>WASM initialization<br/>Session lifecycle management<br/>Settings UI"]
+        Plugin --> Sync
+        Sync["EditorSync (editor-sync.ts)<br/>Binds to Obsidian MarkdownView<br/>Debounces local changes (100ms)<br/>Applies remote updates<br/>Preserves cursor position"]
+        Sync --> Client
+        Client["CollabClient (collab-client.ts)<br/>WebSocket connection<br/>Reconnection with backoff<br/>Message queue (1000 max)<br/>Text diff algorithm"]
+        Client --> Core
+        Core["CollabCore (WASM module)<br/>Yrs CRDT operations<br/>AES-256-GCM encryption"]
+    end
+    Client -->|"wss:// WebSocket"| Relay[Relay Server]
 ```
 
 ## Components
