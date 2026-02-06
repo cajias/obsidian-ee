@@ -10,6 +10,11 @@
 //! - Full Identify + Subscribe handshake driven by state machine actions
 //! - Two independent clients auto-connecting in parallel
 //! - Disabled auto-connect staying idle until explicitly connected
+//! - Application-layer errors after Identify triggering retry
+//! - Disconnect before handshake completion triggering retry
+//! - Race conditions: concurrent errors and duplicate retry ticks
+//! - Jitter ranges during exponential backoff with delay cap
+//! - WebSocket close frame handling (Normal / Going Away / Abnormal)
 //!
 //! All tests spin up an in-process relay via [`TestServer::start`] (no Docker
 //! required) and use `tokio_tungstenite::connect_async` for real WebSocket I/O.
@@ -651,6 +656,24 @@ async fn test_concurrent_error_handling() {
         ConnectionState::Reconnecting { attempt: 4 },
         "State machine should continue functioning correctly after race conditions"
     );
+
+    // Drive to exhaustion: verify the state machine correctly transitions to Failed
+    // even after a messy sequence of race conditions
+    sm.on_retry_tick();
+    sm.on_error("fourth connection failure");
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Reconnecting { attempt: 5 },
+        "Fifth error should still be Reconnecting (max_retries=5)"
+    );
+
+    sm.on_retry_tick();
+    sm.on_error("fifth connection failure — exhausted");
+    assert!(
+        matches!(sm.state(), ConnectionState::Failed { .. }),
+        "Should transition to Failed after exhausting all retries post-race-conditions, got {:?}",
+        sm.state()
+    );
 }
 
 /// Test that jitter ranges are correctly computed alongside the state machine's
@@ -672,9 +695,10 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
     let server = TestServer::start().await;
     let url = server.url().to_owned();
 
-    // Policy: 50ms initial, 2x backoff, 500ms cap, 25% jitter, 4 retries
+    // Policy: 50ms initial, 2x backoff, 500ms cap, 25% jitter, 5 retries
+    // 5 retries ensures attempt 4 (50ms * 2^4 = 800ms) gets capped to 500ms
     let policy =
-        RetryPolicy::new(4, Duration::from_millis(50), Duration::from_millis(500), 2.0, 0.25);
+        RetryPolicy::new(5, Duration::from_millis(50), Duration::from_millis(500), 2.0, 0.25);
     let config =
         ConnectionConfig::new(&url, "jitter-user", DOC_ID).with_retry_policy(policy.clone());
 
@@ -694,6 +718,7 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
         Duration::from_millis(100), // attempt 1: 50ms * 2^1
         Duration::from_millis(200), // attempt 2: 50ms * 2^2
         Duration::from_millis(400), // attempt 3: 50ms * 2^3
+        Duration::from_millis(500), // attempt 4: 50ms * 2^4 = 800ms → capped to 500ms
     ];
 
     for (i, expected_base) in expected_base_delays.iter().enumerate() {
@@ -744,7 +769,7 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
         }
     }
 
-    // After exhausting all 4 retries, the next error should transition to Failed
+    // After exhausting all 5 retries, the next error should transition to Failed
     sm.on_retry_tick();
     sm.on_error("final failure");
     assert!(
@@ -755,7 +780,7 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
 
     // Verify policy returns None for out-of-range attempts
     assert!(
-        policy.delay_range_for_attempt(4).is_none(),
+        policy.delay_range_for_attempt(5).is_none(),
         "Should return None for attempt beyond max_retries"
     );
 }
@@ -863,6 +888,13 @@ async fn test_close_frame_handling_triggers_reconnect() {
             *sm.state(),
             ConnectionState::Reconnecting { attempt: 1 },
             "Going Away (1001) should trigger reconnection"
+        );
+
+        // Verify retry is possible
+        let action = sm.next_action();
+        assert!(
+            matches!(action, ConnectionAction::WaitAndRetry { attempt: 1, .. }),
+            "Expected WaitAndRetry action after Going Away close, got {action:?}"
         );
     }
 
