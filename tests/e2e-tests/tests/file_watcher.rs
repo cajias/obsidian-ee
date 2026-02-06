@@ -1,6 +1,6 @@
-//! E2E tests for the VaultWatcher filesystem event detection system.
+//! E2E tests for the [`VaultWatcher`] filesystem event detection system.
 //!
-//! These tests verify that the VaultWatcher correctly detects and reports
+//! These tests verify that the [`VaultWatcher`] correctly detects and reports
 //! file system events (creation, modification, deletion) through its async
 //! event channel. Unlike unit tests in the collab-watcher crate, these
 //! tests exercise the public API from an external consumer's perspective
@@ -49,10 +49,7 @@ async fn recv_event(rx: &mut mpsc::Receiver<VaultEvent>) -> VaultEvent {
 }
 
 /// Drain all available events within a time window.
-async fn drain_events(
-    rx: &mut mpsc::Receiver<VaultEvent>,
-    window: Duration,
-) -> Vec<VaultEvent> {
+async fn drain_events(rx: &mut mpsc::Receiver<VaultEvent>, window: Duration) -> Vec<VaultEvent> {
     let mut events = Vec::new();
     let deadline = tokio::time::Instant::now() + window;
     loop {
@@ -71,11 +68,7 @@ async fn drain_events(
 /// Assert that no events arrive within a time window.
 async fn assert_no_events(rx: &mut mpsc::Receiver<VaultEvent>, window: Duration) {
     let events = drain_events(rx, window).await;
-    assert!(
-        events.is_empty(),
-        "expected no events but received {}: {events:?}",
-        events.len()
-    );
+    assert!(events.is_empty(), "expected no events but received {}: {events:?}", events.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -85,8 +78,7 @@ async fn assert_no_events(rx: &mut mpsc::Receiver<VaultEvent>, window: Duration)
 #[tokio::test]
 async fn test_detects_markdown_file_creation() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     tokio::fs::write(vault.path().join("hello.md"), "# Hello World").await.unwrap();
@@ -101,23 +93,15 @@ async fn test_detects_markdown_file_creation() {
 #[tokio::test]
 async fn test_creation_reports_relative_path_not_absolute() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     tokio::fs::write(vault.path().join("test.md"), "content").await.unwrap();
 
     let event = recv_event(&mut rx).await;
+    assert!(event.path.is_relative(), "expected relative path, got absolute: {:?}", event.path);
     assert!(
-        event.path.is_relative(),
-        "expected relative path, got absolute: {:?}",
-        event.path
-    );
-    assert!(
-        !event
-            .path
-            .to_string_lossy()
-            .contains(vault.path().to_string_lossy().as_ref()),
+        !event.path.to_string_lossy().contains(vault.path().to_string_lossy().as_ref()),
         "event path should not contain the vault root"
     );
 
@@ -127,20 +111,12 @@ async fn test_creation_reports_relative_path_not_absolute() {
 #[tokio::test]
 async fn test_detects_creation_in_nested_subdirectory() {
     let vault = TempDir::new().unwrap();
-    tokio::fs::create_dir_all(vault.path().join("daily/2024/01"))
-        .await
-        .unwrap();
+    tokio::fs::create_dir_all(vault.path().join("daily/2024/01")).await.unwrap();
 
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
-    tokio::fs::write(
-        vault.path().join("daily/2024/01/journal.md"),
-        "Daily note",
-    )
-    .await
-    .unwrap();
+    tokio::fs::write(vault.path().join("daily/2024/01/journal.md"), "Daily note").await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Created);
@@ -160,14 +136,11 @@ async fn test_detects_file_modification() {
     // Pre-create a file so the watcher's known-files set includes it.
     std::fs::write(vault.path().join("existing.md"), "original").unwrap();
 
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     // Modify the existing file.
-    tokio::fs::write(vault.path().join("existing.md"), "modified content")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("existing.md"), "modified content").await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Modified);
@@ -179,28 +152,19 @@ async fn test_detects_file_modification() {
 #[tokio::test]
 async fn test_distinguishes_creation_from_modification() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     // First write to a new file = Created.
-    tokio::fs::write(vault.path().join("evolving.md"), "v1")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("evolving.md"), "v1").await.unwrap();
     let event = recv_event(&mut rx).await;
-    assert_eq!(
-        event.kind,
-        VaultEventKind::Created,
-        "first write to a new file should be Created"
-    );
+    assert_eq!(event.kind, VaultEventKind::Created, "first write to a new file should be Created");
 
     // Let the debounce window close.
     sleep(SETTLE_TIME).await;
 
     // Second write to the same file = Modified.
-    tokio::fs::write(vault.path().join("evolving.md"), "v2")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("evolving.md"), "v2").await.unwrap();
     let event = recv_event(&mut rx).await;
     assert_eq!(
         event.kind,
@@ -222,13 +186,10 @@ async fn test_detects_file_deletion() {
     // Pre-create a file.
     std::fs::write(vault.path().join("doomed.md"), "goodbye").unwrap();
 
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
-    tokio::fs::remove_file(vault.path().join("doomed.md"))
-        .await
-        .unwrap();
+    tokio::fs::remove_file(vault.path().join("doomed.md")).await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Deleted);
@@ -240,8 +201,7 @@ async fn test_detects_file_deletion() {
 #[tokio::test]
 async fn test_full_lifecycle_create_modify_delete() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     let file = vault.path().join("lifecycle.md");
@@ -278,28 +238,19 @@ async fn test_full_lifecycle_create_modify_delete() {
 #[tokio::test]
 async fn test_ignores_non_watched_extensions() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     // Create files with non-markdown extensions.
-    tokio::fs::write(vault.path().join("image.png"), b"fake png")
-        .await
-        .unwrap();
-    tokio::fs::write(vault.path().join("data.json"), "{}")
-        .await
-        .unwrap();
-    tokio::fs::write(vault.path().join("readme.txt"), "hello")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("image.png"), b"fake png").await.unwrap();
+    tokio::fs::write(vault.path().join("data.json"), "{}").await.unwrap();
+    tokio::fs::write(vault.path().join("readme.txt"), "hello").await.unwrap();
 
     // None of these should produce events.
     assert_no_events(&mut rx, Duration::from_secs(1)).await;
 
     // But a .md file should.
-    tokio::fs::write(vault.path().join("real.md"), "# Real Note")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("real.md"), "# Real Note").await.unwrap();
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Created);
     assert_eq!(event.path, PathBuf::from("real.md"));
@@ -318,15 +269,11 @@ async fn test_custom_extension_filter() {
     sleep(SETTLE_TIME).await;
 
     // .md should be ignored with custom config.
-    tokio::fs::write(vault.path().join("note.md"), "# Ignored")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("note.md"), "# Ignored").await.unwrap();
     assert_no_events(&mut rx, Duration::from_millis(500)).await;
 
     // .txt should be detected.
-    tokio::fs::write(vault.path().join("note.txt"), "detected")
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("note.txt"), "detected").await.unwrap();
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Created);
     assert_eq!(event.path, PathBuf::from("note.txt"));
@@ -341,16 +288,13 @@ async fn test_custom_extension_filter() {
 #[tokio::test]
 async fn test_multiple_file_creations_all_reported() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     let file_names: Vec<String> = (0..5).map(|i| format!("note_{i}.md")).collect();
 
     for name in &file_names {
-        tokio::fs::write(vault.path().join(name), format!("content of {name}"))
-            .await
-            .unwrap();
+        tokio::fs::write(vault.path().join(name), format!("content of {name}")).await.unwrap();
         // Space out writes to avoid debounce coalescing.
         sleep(Duration::from_millis(50)).await;
     }
@@ -379,23 +323,15 @@ async fn test_watches_dynamically_created_subdirectory() {
     let vault = TempDir::new().unwrap();
 
     // Start watcher BEFORE creating the subdirectory.
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     // Create a new subdirectory after the watcher is running.
-    tokio::fs::create_dir(vault.path().join("new_folder"))
-        .await
-        .unwrap();
+    tokio::fs::create_dir(vault.path().join("new_folder")).await.unwrap();
     sleep(SETTLE_TIME).await;
 
     // Create a file inside the dynamically created subdirectory.
-    tokio::fs::write(
-        vault.path().join("new_folder/dynamic.md"),
-        "# Dynamic",
-    )
-    .await
-    .unwrap();
+    tokio::fs::write(vault.path().join("new_folder/dynamic.md"), "# Dynamic").await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Created);
@@ -416,17 +352,14 @@ async fn test_watches_dynamically_created_subdirectory() {
 #[tokio::test]
 async fn test_vault_events_drive_document_registry_lifecycle() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     let mut registry = DocumentRegistry::new();
 
     // ── Step 1: Create a file and receive the event ──────────────
     let file_content = "# Meeting Notes\n\nAction items go here.";
-    tokio::fs::write(vault.path().join("meeting.md"), file_content)
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("meeting.md"), file_content).await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Created);
@@ -438,20 +371,14 @@ async fn test_vault_events_drive_document_registry_lifecycle() {
     // Read file content as text, create a CRDT document, then insert via
     // the Yrs transaction API. registry.open() is for restoring serialised
     // Yrs state — not raw file text.
-    let content = tokio::fs::read_to_string(vault.path().join(&event.path))
-        .await
-        .unwrap();
+    let content = tokio::fs::read_to_string(vault.path().join(&event.path)).await.unwrap();
 
     let doc = registry.create(&doc_id).unwrap();
     doc.insert(0, &content);
 
     // ── Step 3: Verify round-trip content fidelity ───────────────
     let doc = registry.get(&doc_id).expect("document should be in registry");
-    assert_eq!(
-        doc.get_content(),
-        file_content,
-        "document content should match the original file"
-    );
+    assert_eq!(doc.get_content(), file_content, "document content should match the original file");
 
     watcher.stop();
 }
@@ -463,8 +390,7 @@ async fn test_file_modification_updates_document_content() {
     let original = "# Draft\n\nFirst version.";
     std::fs::write(vault.path().join("draft.md"), original).unwrap();
 
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     let mut registry = DocumentRegistry::new();
@@ -476,17 +402,13 @@ async fn test_file_modification_updates_document_content() {
 
     // Modify the file on disk.
     let updated = "# Draft\n\nSecond version with edits.";
-    tokio::fs::write(vault.path().join("draft.md"), updated)
-        .await
-        .unwrap();
+    tokio::fs::write(vault.path().join("draft.md"), updated).await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Modified);
 
     // Read updated content from disk.
-    let new_content = tokio::fs::read_to_string(vault.path().join(&event.path))
-        .await
-        .unwrap();
+    let new_content = tokio::fs::read_to_string(vault.path().join(&event.path)).await.unwrap();
 
     // In the GREEN phase, a VaultEventProcessor would compute a diff and
     // apply it as a CRDT operation. For now, we naively replace content.
@@ -512,8 +434,7 @@ async fn test_file_deletion_closes_document_in_registry() {
     let vault = TempDir::new().unwrap();
     std::fs::write(vault.path().join("temp.md"), "temporary").unwrap();
 
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE_TIME).await;
 
     let mut registry = DocumentRegistry::new();
@@ -521,9 +442,7 @@ async fn test_file_deletion_closes_document_in_registry() {
     assert!(registry.get("temp").is_some(), "document should exist before deletion");
 
     // Delete the file.
-    tokio::fs::remove_file(vault.path().join("temp.md"))
-        .await
-        .unwrap();
+    tokio::fs::remove_file(vault.path().join("temp.md")).await.unwrap();
 
     let event = recv_event(&mut rx).await;
     assert_eq!(event.kind, VaultEventKind::Deleted);
