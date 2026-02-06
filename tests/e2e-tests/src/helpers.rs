@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use collab_core::{EncryptedDocument, EncryptedOp, Invite, MlsDocumentGroup, PendingMember};
 use collab_proto::{ClientMessage, DocumentId, MlsMessageType, ServerMessage};
+use collab_relay::{RelayServer, ServerHandle};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -27,20 +28,43 @@ pub const RELAY_URL: &str = "ws://localhost:8080/ws";
 /// Test server wrapper for E2E tests.
 pub struct TestServer {
     pub url: String,
+    handle: ServerHandle,
 }
 
 impl TestServer {
-    /// Start a test server.
-    #[allow(clippy::unused_async)] // Will have async implementation in T16
+    /// Start a test server on a random port.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the server fails to bind to a free port.
     pub async fn start() -> Self {
-        // TODO: Implement in T16
-        Self { url: "ws://localhost:8080".to_string() }
+        let server = RelayServer::new();
+        let bound = server.bind("127.0.0.1:0").await.expect("Failed to bind test server");
+        let url = format!("ws://{}", bound.addr);
+        Self { url, handle: bound.handle }
     }
 
     /// Get the server URL.
     #[must_use]
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Get the WebSocket URL (convenience clone).
+    #[must_use]
+    pub fn ws_url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Shut down the server.
+    pub fn shutdown(&self) {
+        self.handle.shutdown();
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.handle.shutdown();
     }
 }
 
