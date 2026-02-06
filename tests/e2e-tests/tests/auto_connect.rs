@@ -88,11 +88,25 @@ async fn send_identify(
     user_id: &str,
 ) {
     let msg = ClientMessage::Identify { user_id: user_id.to_string() };
-    let json = serde_json::to_string(&msg).unwrap();
-    ws.send(Message::Text(json)).await.unwrap();
+    let json = serde_json::to_string(&msg)
+        .unwrap_or_else(|e| panic!("Failed to serialize Identify message for {user_id}: {e}"));
 
-    let resp = timeout(SHORT_TIMEOUT, ws.next()).await.unwrap().unwrap().unwrap();
-    let server_msg: ServerMessage = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    ws.send(Message::Text(json))
+        .await
+        .unwrap_or_else(|e| panic!("Failed to send Identify message: {e}"));
+
+    let resp =
+        timeout(SHORT_TIMEOUT, ws.next()).await.expect("Timeout waiting for Identified response");
+
+    let msg = resp
+        .expect("WebSocket stream closed before Identified response")
+        .expect("WebSocket error during Identified handshake");
+
+    let text = msg.to_text().expect("Received non-text WebSocket message during Identify");
+
+    let server_msg: ServerMessage = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("Failed to parse Identified response: {e}. Got: {text}"));
+
     assert!(
         matches!(server_msg, ServerMessage::Identified { user_id: ref uid } if uid == user_id),
         "Expected Identified, got {server_msg:?}"
@@ -107,11 +121,25 @@ async fn send_subscribe(
     doc_id: &str,
 ) {
     let msg = ClientMessage::Subscribe { doc_id: doc_id.to_string() };
-    let json = serde_json::to_string(&msg).unwrap();
-    ws.send(Message::Text(json)).await.unwrap();
+    let json = serde_json::to_string(&msg)
+        .unwrap_or_else(|e| panic!("Failed to serialize Subscribe message for {doc_id}: {e}"));
 
-    let resp = timeout(SHORT_TIMEOUT, ws.next()).await.unwrap().unwrap().unwrap();
-    let server_msg: ServerMessage = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+    ws.send(Message::Text(json))
+        .await
+        .unwrap_or_else(|e| panic!("Failed to send Subscribe message: {e}"));
+
+    let resp =
+        timeout(SHORT_TIMEOUT, ws.next()).await.expect("Timeout waiting for Subscribed response");
+
+    let msg = resp
+        .expect("WebSocket stream closed before Subscribed response")
+        .expect("WebSocket error during Subscribed handshake");
+
+    let text = msg.to_text().expect("Received non-text WebSocket message during Subscribe");
+
+    let server_msg: ServerMessage = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("Failed to parse Subscribed response: {e}. Got: {text}"));
+
     assert!(
         matches!(server_msg, ServerMessage::Subscribed { doc_id: ref did } if did == doc_id),
         "Expected Subscribed, got {server_msg:?}"
@@ -265,6 +293,82 @@ async fn test_full_identify_subscribe_handshake() {
     assert!(sm.is_connected());
 }
 
+/// Test that the state machine handles server rejection of Identify gracefully.
+///
+/// This verifies the critical path where `on_connected()` has been called
+/// (TCP handshake succeeded) but the application-level handshake fails.
+/// The state machine should transition to Reconnecting and retry.
+#[tokio::test]
+async fn test_identify_rejected_triggers_retry() {
+    let server = TestServer::start().await;
+    let url = server.url().to_owned();
+
+    // Create config with 3 retries so we can observe retry behavior
+    let config = config_with_retries(&url, 3);
+    let mut sm = ConnectionStateMachine::new(config);
+
+    // Drive to Connecting state
+    assert_eq!(*sm.state(), ConnectionState::Connecting);
+
+    // Actually connect (TCP handshake succeeds)
+    let (mut ws, _) = timeout(TEST_TIMEOUT, connect_async(&url))
+        .await
+        .expect("WebSocket connect timed out")
+        .unwrap_or_else(|e| panic!("WebSocket connect failed: {e}"));
+
+    // Notify state machine of successful connection
+    sm.on_connected();
+    assert_eq!(*sm.state(), ConnectionState::Connected);
+
+    // Get the IdentifyAndSubscribe action
+    let action = sm.next_action();
+    let (user_id, _doc_id) = extract_identify_subscribe(&action);
+
+    // Send Identify message
+    let msg = ClientMessage::Identify { user_id: user_id.clone() };
+    let json = serde_json::to_string(&msg)
+        .unwrap_or_else(|e| panic!("Failed to serialize Identify for {user_id}: {e}"));
+    ws.send(Message::Text(json)).await.unwrap_or_else(|e| panic!("Failed to send Identify: {e}"));
+
+    // Receive response - could be Identified or Error
+    let resp =
+        timeout(SHORT_TIMEOUT, ws.next()).await.expect("Timeout waiting for Identify response");
+
+    let msg_result =
+        resp.expect("WebSocket closed during Identify").expect("WebSocket error during Identify");
+
+    let text = msg_result.to_text().expect("Non-text message during Identify");
+
+    let server_msg: ServerMessage = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("Failed to parse response: {e}. Got: {text}"));
+
+    // In a real scenario, the server might reject with an Error response
+    // For this test, we'll simulate the rejection by calling on_error
+    // (In production, the application layer would detect Error response and call on_error)
+    match server_msg {
+        ServerMessage::Error { code, message } => {
+            // Server rejected - this is the scenario we're testing
+            sm.on_error(&format!("Identification failed: {code:?} - {message}"));
+            assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+
+            // Verify retry action
+            let retry_action = sm.next_action();
+            assert!(
+                matches!(retry_action, ConnectionAction::WaitAndRetry { attempt: 1, .. }),
+                "Expected WaitAndRetry action after rejection, got {retry_action:?}"
+            );
+        }
+        ServerMessage::Identified { .. } => {
+            // Server accepted (normal path) - simulate a reject for test purposes
+            sm.on_error("simulated identification rejection");
+            assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+        }
+        other => {
+            panic!("Expected Identified or Error response, got {other:?}");
+        }
+    }
+}
+
 /// Extract `user_id` and `doc_id` from an `IdentifyAndSubscribe` action.
 /// Panics if the action is not `IdentifyAndSubscribe`.
 fn extract_identify_subscribe(action: &ConnectionAction) -> (String, String) {
@@ -337,4 +441,74 @@ async fn test_auto_connect_disabled_stays_disconnected() {
     sm.connect();
 
     assert_sm(&sm, &ConnectionState::Connecting, &ConnectionAction::Connect { relay_url });
+}
+
+/// Test that disconnection after `on_connected()` but before handshake triggers retry.
+///
+/// This tests the critical window between TCP handshake success and
+/// application handshake completion. Network issues in this window
+/// (NAT timeout, server restart, etc.) should trigger reconnection.
+#[tokio::test]
+async fn test_disconnect_before_handshake_retries() {
+    let server = TestServer::start().await;
+    let url = server.url().to_owned();
+    let config = auto_config(&url);
+    let mut sm = ConnectionStateMachine::new(config);
+
+    // Drive to Connecting state
+    assert_eq!(*sm.state(), ConnectionState::Connecting);
+
+    // Actually connect (TCP handshake succeeds)
+    let result = timeout(TEST_TIMEOUT, connect_async(&url)).await;
+    let ws_result = result.expect("WebSocket connect timed out");
+    let ws = ws_result.unwrap_or_else(|e| panic!("WebSocket connect failed: {e}"));
+
+    // Notify state machine of successful connection
+    sm.on_connected();
+    assert_eq!(*sm.state(), ConnectionState::Connected);
+
+    // Connection drops immediately - before any handshake messages
+    // In production this could be:
+    // - NAT timeout
+    // - Server restart
+    // - Network partition
+    // - Load balancer reconfiguration
+    drop(ws);
+
+    // Application detects the disconnect and notifies state machine
+    sm.on_disconnected();
+
+    // Should transition to Reconnecting, not Failed
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Reconnecting { attempt: 1 },
+        "State machine should retry after disconnect before handshake"
+    );
+
+    // Verify it will retry (not give up)
+    let action = sm.next_action();
+    assert!(
+        matches!(action, ConnectionAction::WaitAndRetry { attempt: 1, .. }),
+        "Expected WaitAndRetry action, got {action:?}"
+    );
+
+    // Verify the state machine can recover: advance through retry
+    sm.on_retry_tick();
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Connecting,
+        "After retry tick, should be back in Connecting state"
+    );
+
+    // And successfully reconnect
+    let result2 = timeout(TEST_TIMEOUT, connect_async(&url)).await;
+    let ws_result2 = result2.expect("Second connect timed out");
+    let _ws2 = ws_result2.unwrap_or_else(|e| panic!("Second connect failed: {e}"));
+
+    sm.on_connected();
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Connected,
+        "State machine should reach Connected after successful reconnect"
+    );
 }

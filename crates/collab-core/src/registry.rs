@@ -1087,10 +1087,7 @@ mod tests {
         doc.insert(0, "Modified via get_mut");
 
         // Verify change persisted
-        assert_eq!(
-            registry.get("doc-1").unwrap().get_content(),
-            "Modified via get_mut"
-        );
+        assert_eq!(registry.get("doc-1").unwrap().get_content(), "Modified via get_mut");
     }
 
     #[test]

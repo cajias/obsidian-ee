@@ -141,11 +141,18 @@ impl TestClient {
         }
     }
 
-    /// Try to receive a message, returning None if no message is available within timeout.
+    /// Try to receive a message, returning None only on timeout.
     ///
-    /// Useful for checking that no unexpected messages are received.
-    pub async fn try_recv(&mut self, duration: Duration) -> Option<ServerMessage> {
-        self.recv_timeout(duration).await.ok()
+    /// # Errors
+    ///
+    /// Returns an error if the connection fails or message is invalid.
+    /// Only returns `Ok(None)` on legitimate timeout.
+    pub async fn try_recv(&mut self, duration: Duration) -> anyhow::Result<Option<ServerMessage>> {
+        match self.recv_timeout(duration).await {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) if e.to_string().contains("Timeout") => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Subscribe to a document and wait for confirmation.
@@ -310,6 +317,10 @@ pub async fn setup_two_user_group(
 /// # Errors
 ///
 /// Returns an error if any step of the setup fails.
+///
+/// # Panics
+///
+/// Panics if draining broadcast messages fails due to connection errors.
 pub async fn setup_three_user_group(
     alice: &mut TestClient,
     bob: &mut TestClient,
@@ -343,7 +354,11 @@ pub async fn setup_three_user_group(
     };
 
     // Charlie receives the handshake too (but can't use it - it's for Bob)
-    let _ = charlie.try_recv(SHORT_TIMEOUT).await;
+    // Drain broadcast message not meant for this client
+    let _ = charlie
+        .try_recv(SHORT_TIMEOUT)
+        .await
+        .expect("Connection error while draining broadcast message");
 
     let bob_doc = EncryptedDocument::join(
         &Invite { doc_id: doc_id.clone(), welcome: bob_welcome, commit: vec![], epoch: 1 },
@@ -369,7 +384,11 @@ pub async fn setup_three_user_group(
     };
 
     // Bob also receives the handshake (but can't use it)
-    let _ = bob.try_recv(SHORT_TIMEOUT).await;
+    // Drain broadcast message not meant for this client
+    let _ = bob
+        .try_recv(SHORT_TIMEOUT)
+        .await
+        .expect("Connection error while draining broadcast message");
 
     let charlie_doc = EncryptedDocument::join(
         &Invite { doc_id: doc_id.clone(), welcome: charlie_welcome, commit: vec![], epoch: 2 },
