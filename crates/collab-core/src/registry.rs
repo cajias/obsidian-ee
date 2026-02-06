@@ -163,19 +163,19 @@ impl EncryptionMetadata {
 
     /// Update the epoch.
     ///
-    /// # Panics (Debug Only)
+    /// # Errors
     ///
-    /// In debug builds, panics if the new epoch is less than the current epoch.
-    /// Epochs should only increase (monotonicity). In release builds, the check
-    /// is skipped for performance.
-    fn set_epoch(&mut self, epoch: u64) {
-        debug_assert!(
-            epoch >= self.epoch,
-            "Epoch regression detected: attempted to set epoch {} but current epoch is {}",
-            epoch,
-            self.epoch
-        );
+    /// Returns `RegistryError::InvalidState` if the new epoch is less than
+    /// the current epoch. Epochs must only increase (monotonicity).
+    fn set_epoch(&mut self, epoch: u64) -> Result<(), RegistryError> {
+        if epoch < self.epoch {
+            return Err(RegistryError::InvalidState(format!(
+                "Epoch regression: attempted to set epoch {} but current epoch is {}",
+                epoch, self.epoch
+            )));
+        }
         self.epoch = epoch;
+        Ok(())
     }
 }
 
@@ -542,11 +542,16 @@ impl DocumentRegistry {
 
         let mut entry = DocumentEntry::new_encrypted(doc, user_id.to_string(), true)?;
 
-        // Set the epoch from the document - this should never fail since we just created the entry
+        // Set the epoch from the document
         let meta = entry
             .encryption_metadata
             .as_mut()
-            .expect("encrypted document must have encryption metadata");
+            .ok_or_else(|| {
+                error!(document_id = %id, "Internal error: encrypted document missing encryption metadata");
+                RegistryError::InternalError(
+                    "Encrypted document missing encryption metadata".to_string(),
+                )
+            })?;
         let doc = match &entry.variant {
             DocumentVariant::Encrypted(d) => d,
             DocumentVariant::Plain(_) => {
@@ -556,7 +561,7 @@ impl DocumentRegistry {
                 ));
             }
         };
-        meta.set_epoch(doc.epoch());
+        meta.set_epoch(doc.epoch())?;
 
         self.documents.insert(id.clone(), entry);
 
@@ -630,12 +635,17 @@ impl DocumentRegistry {
         let epoch = doc.epoch();
         let mut entry = DocumentEntry::new_encrypted(doc, user_id.clone(), false)?;
 
-        // Set the epoch from the document - this should never fail since we just created the entry
+        // Set the epoch from the document
         let meta = entry
             .encryption_metadata
             .as_mut()
-            .expect("encrypted document must have encryption metadata");
-        let doc = match &entry.variant {
+            .ok_or_else(|| {
+                error!(document_id = %doc_id, "Internal error: encrypted document missing encryption metadata");
+                RegistryError::InternalError(
+                    "Encrypted document missing encryption metadata".to_string(),
+                )
+            })?;
+        let doc_ref = match &entry.variant {
             DocumentVariant::Encrypted(d) => d,
             DocumentVariant::Plain(_) => {
                 error!("Internal error: plain variant after encrypted document operation");
@@ -644,7 +654,7 @@ impl DocumentRegistry {
                 ));
             }
         };
-        meta.set_epoch(doc.epoch());
+        meta.set_epoch(doc_ref.epoch())?;
 
         self.documents.insert(doc_id.clone(), entry);
 
@@ -654,7 +664,12 @@ impl DocumentRegistry {
         let entry = self.documents.get_mut(&doc_id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => Ok(doc.as_mut()),
-            DocumentVariant::Plain(_) => unreachable!("just created encrypted"),
+            DocumentVariant::Plain(_) => {
+                error!("Internal error: variant mismatch after encrypted document operation");
+                Err(RegistryError::InternalError(
+                    "Document has wrong variant after encrypted operation".to_string(),
+                ))
+            }
         }
     }
 
@@ -739,8 +754,13 @@ impl DocumentRegistry {
         let meta = entry
             .encryption_metadata
             .as_mut()
-            .expect("encrypted document must have encryption metadata");
-        meta.set_epoch(new_epoch);
+            .ok_or_else(|| {
+                error!(document_id = %id, "Internal error: encrypted document missing encryption metadata");
+                RegistryError::InternalError(
+                    "Encrypted document missing encryption metadata".to_string(),
+                )
+            })?;
+        meta.set_epoch(new_epoch)?;
 
         info!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
               "Invite created successfully, epoch advanced");
@@ -785,8 +805,13 @@ impl DocumentRegistry {
         let meta = entry
             .encryption_metadata
             .as_mut()
-            .expect("encrypted document must have encryption metadata");
-        meta.set_epoch(new_epoch);
+            .ok_or_else(|| {
+                error!(document_id = %id, "Internal error: encrypted document missing encryption metadata");
+                RegistryError::InternalError(
+                    "Encrypted document missing encryption metadata".to_string(),
+                )
+            })?;
+        meta.set_epoch(new_epoch)?;
 
         debug!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
                "Commit processed successfully, epoch updated");
@@ -1126,7 +1151,7 @@ mod tests {
     fn test_encryption_metadata_epoch_update() {
         let mut meta = EncryptionMetadata::new("bob".to_string(), false).unwrap();
         assert_eq!(meta.epoch(), 0);
-        meta.set_epoch(5);
+        meta.set_epoch(5).unwrap();
         assert_eq!(meta.epoch(), 5);
     }
 
@@ -1136,19 +1161,24 @@ mod tests {
         assert_eq!(meta.epoch(), 0);
 
         // Epoch can increase
-        meta.set_epoch(1);
+        meta.set_epoch(1).unwrap();
         assert_eq!(meta.epoch(), 1);
 
-        meta.set_epoch(5);
+        meta.set_epoch(5).unwrap();
         assert_eq!(meta.epoch(), 5);
 
         // Epoch can stay the same
-        meta.set_epoch(5);
+        meta.set_epoch(5).unwrap();
         assert_eq!(meta.epoch(), 5);
 
-        // In debug builds, epoch regression should panic
-        // This is tested via debug_assert! in set_epoch()
-        // Note: This test doesn't actually trigger the panic to avoid failing the test suite
+        // Epoch regression is rejected
+        let result = meta.set_epoch(3);
+        assert!(
+            matches!(result, Err(RegistryError::InvalidState(_))),
+            "Epoch regression should be rejected"
+        );
+        // Epoch should remain unchanged after rejected regression
+        assert_eq!(meta.epoch(), 5);
     }
 
     // ==================== Phase 2: Create Encrypted ====================
