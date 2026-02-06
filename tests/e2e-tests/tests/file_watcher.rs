@@ -365,7 +365,7 @@ async fn test_vault_events_drive_document_registry_lifecycle() {
     assert_eq!(event.kind, VaultEventKind::Created);
 
     // Derive a document ID from the vault-relative path.
-    let doc_id = event.path.to_string_lossy().replace(".md", "");
+    let doc_id = event.path.with_extension("").display().to_string();
 
     // ── Step 2: Load file content into the document registry ─────
     // Read file content as text, create a CRDT document, then insert via
@@ -448,7 +448,7 @@ async fn test_file_deletion_closes_document_in_registry() {
     assert_eq!(event.kind, VaultEventKind::Deleted);
 
     // Process the deletion: close the document in the registry.
-    let doc_id = event.path.to_string_lossy().replace(".md", "");
+    let doc_id = event.path.with_extension("").display().to_string();
     let closed = registry.close(&doc_id);
     assert!(
         closed.is_some(),
