@@ -691,6 +691,7 @@ async fn test_concurrent_error_handling() {
 ///
 /// This is exercised against a real relay server to confirm end-to-end behavior.
 #[tokio::test]
+#[allow(clippy::too_many_lines, clippy::excessive_nesting)]
 async fn test_jitter_ranges_during_retry_lifecycle() {
     let server = TestServer::start().await;
     let url = server.url().to_owned();
@@ -722,7 +723,8 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
     ];
 
     for (i, expected_base) in expected_base_delays.iter().enumerate() {
-        let attempt = (i + 1) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let attempt = (i + 1) as u32; // max 5 retries, no truncation possible
 
         // State machine should be in Reconnecting
         assert_eq!(
@@ -733,13 +735,11 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
 
         // Verify the WaitAndRetry action has the deterministic base delay
         let action = sm.next_action();
-        match &action {
-            ConnectionAction::WaitAndRetry { delay, attempt: a } => {
-                assert_eq!(delay, expected_base, "Base delay mismatch at attempt {a}");
-                assert_eq!(*a, attempt);
-            }
-            other => panic!("Expected WaitAndRetry at attempt {attempt}, got {other:?}"),
-        }
+        let ConnectionAction::WaitAndRetry { delay, attempt: a } = &action else {
+            panic!("Expected WaitAndRetry at attempt {attempt}, got {action:?}");
+        };
+        assert_eq!(delay, expected_base, "Base delay mismatch at attempt {a}");
+        assert_eq!(*a, attempt);
 
         // Verify jitter range from the policy (attempt is 1-based, index is 0-based)
         let (jitter_min, jitter_max) = policy
@@ -763,7 +763,8 @@ async fn test_jitter_ranges_during_retry_lifecycle() {
         assert!(jitter_min <= jitter_max, "Jitter range must be non-empty");
 
         // Advance to next attempt (unless this is the last one)
-        if i < expected_base_delays.len() - 1 {
+        let is_last = i == expected_base_delays.len() - 1;
+        if !is_last {
             sm.on_retry_tick();
             sm.on_error("simulated failure for jitter test");
         }

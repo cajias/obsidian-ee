@@ -133,12 +133,10 @@ impl EncryptionMetadata {
     ///
     /// # Errors
     ///
-    /// Returns `RegistryError::InvalidState` if user_id is empty.
+    /// Returns `RegistryError::InvalidState` if `user_id` is empty.
     fn new(user_id: String, is_owner: bool) -> Result<Self, RegistryError> {
         if user_id.is_empty() {
-            return Err(RegistryError::InvalidState(
-                "User ID cannot be empty".to_string(),
-            ));
+            return Err(RegistryError::InvalidState("User ID cannot be empty".to_string()));
         }
         Ok(Self { user_id, is_owner, epoch: 0 })
     }
@@ -228,14 +226,18 @@ pub struct DocumentEntry {
 impl DocumentEntry {
     /// Create a new entry with a plain document.
     fn new_plain(doc: CollabDocument) -> Self {
-        Self { variant: DocumentVariant::Plain(doc), metadata: DocumentMetadata::new(), encryption_metadata: None }
+        Self {
+            variant: DocumentVariant::Plain(doc),
+            metadata: DocumentMetadata::new(),
+            encryption_metadata: None,
+        }
     }
 
     /// Create a new entry with an encrypted document.
     ///
     /// # Errors
     ///
-    /// Returns `RegistryError::InvalidState` if user_id is empty.
+    /// Returns `RegistryError::InvalidState` if `user_id` is empty.
     fn new_encrypted(
         doc: EncryptedDocument,
         user_id: String,
@@ -323,8 +325,7 @@ impl DocumentRegistry {
             DocumentVariant::Encrypted(_) => {
                 error!(document_id = %id, "Internal error: variant mismatch after plain document operation");
                 Err(RegistryError::InternalError(format!(
-                    "Document '{}' has wrong variant after creation",
-                    id
+                    "Document '{id}' has wrong variant after creation"
                 )))
             }
         }
@@ -378,9 +379,10 @@ impl DocumentRegistry {
         debug!(document_id = %id, "Attempting to close plain document");
 
         // Check if it's a plain document first
-        let is_plain = self.documents.get(id).is_some_and(|entry| {
-            matches!(entry.variant, DocumentVariant::Plain(_))
-        });
+        let is_plain = self
+            .documents
+            .get(id)
+            .is_some_and(|entry| matches!(entry.variant, DocumentVariant::Plain(_)));
 
         if is_plain {
             info!(document_id = %id, "Closing plain document");
@@ -439,8 +441,7 @@ impl DocumentRegistry {
         doc.apply_update(state).map_err(|e| {
             error!(document_id = %id, error = %e, "Failed to apply document state");
             RegistryError::InvalidState(format!(
-                "Failed to restore document '{}': {}. State may be corrupted or incompatible.",
-                id, e
+                "Failed to restore document '{id}': {e}. State may be corrupted or incompatible."
             ))
         })?;
 
@@ -455,8 +456,7 @@ impl DocumentRegistry {
             DocumentVariant::Encrypted(_) => {
                 error!(document_id = %id, "Internal error: variant mismatch after plain document operation");
                 Err(RegistryError::InternalError(format!(
-                    "Document '{}' has wrong variant after creation",
-                    id
+                    "Document '{id}' has wrong variant after creation"
                 )))
             }
         }
@@ -558,7 +558,7 @@ impl DocumentRegistry {
             DocumentVariant::Plain(_) => {
                 error!("Internal error: plain variant after encrypted document operation");
                 return Err(RegistryError::InternalError(
-                    "Document has plain variant after encrypted operation".to_string()
+                    "Document has plain variant after encrypted operation".to_string(),
                 ));
             }
         };
@@ -599,6 +599,7 @@ impl DocumentRegistry {
     ///
     /// This function will not panic under normal circumstances. The internal
     /// `expect` is guarded by the insertion that occurs immediately before.
+    #[allow(clippy::too_many_lines)]
     pub fn join_encrypted(
         &mut self,
         invite: &Invite,
@@ -652,7 +653,7 @@ impl DocumentRegistry {
             DocumentVariant::Plain(_) => {
                 error!("Internal error: plain variant after encrypted document operation");
                 return Err(RegistryError::InternalError(
-                    "Document has plain variant after encrypted operation".to_string()
+                    "Document has plain variant after encrypted operation".to_string(),
                 ));
             }
         };
@@ -717,18 +718,12 @@ impl DocumentRegistry {
     /// Returns `RegistryError::InvalidState` if the key package is empty.
     /// Returns `RegistryError::NotEncrypted` if the document is not encrypted.
     /// Returns `RegistryError::MlsError` if invite creation fails.
-    pub fn create_invite(
-        &mut self,
-        id: &str,
-        key_package: &[u8],
-    ) -> Result<Invite, RegistryError> {
+    pub fn create_invite(&mut self, id: &str, key_package: &[u8]) -> Result<Invite, RegistryError> {
         info!(document_id = %id, key_package_len = key_package.len(), "Creating invite for new member");
 
         if key_package.is_empty() {
             warn!(document_id = %id, "Empty key package provided");
-            return Err(RegistryError::InvalidState(
-                "Key package cannot be empty".to_string(),
-            ));
+            return Err(RegistryError::InvalidState("Key package cannot be empty".to_string()));
         }
 
         let entry = self.documents.get_mut(id).ok_or_else(|| {
@@ -1126,9 +1121,8 @@ mod tests {
 
     #[test]
     fn test_mls_error() {
-        let err = RegistryError::MlsError(Arc::new(crate::Error::Mls(
-            "failed to encrypt".to_string(),
-        )));
+        let err =
+            RegistryError::MlsError(Arc::new(crate::Error::Mls("failed to encrypt".to_string())));
         assert!(err.to_string().contains("MLS"));
         assert!(err.to_string().contains("failed to encrypt"));
     }
@@ -1143,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_encryption_metadata_rejects_empty_user_id() {
-        let result = EncryptionMetadata::new("".to_string(), true);
+        let result = EncryptionMetadata::new(String::new(), true);
         assert!(matches!(result, Err(RegistryError::InvalidState(_))));
     }
 
@@ -1252,7 +1246,8 @@ mod tests {
         let mut registry = DocumentRegistry::new();
 
         registry.create_encrypted("doc-1", "alice").unwrap();
-        let meta = registry.get_encryption_metadata("doc-1").expect("should have encryption metadata");
+        let meta =
+            registry.get_encryption_metadata("doc-1").expect("should have encryption metadata");
 
         assert_eq!(meta.user_id(), "alice");
         assert!(meta.is_owner());
@@ -1390,7 +1385,8 @@ mod tests {
         bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
         // Alice adds Carol (this creates a commit)
-        let carol_invite = alice_registry.create_invite("doc-1", carol_pending.key_package()).unwrap();
+        let carol_invite =
+            alice_registry.create_invite("doc-1", carol_pending.key_package()).unwrap();
 
         // Bob processes the commit to stay in sync
         bob_registry.process_commit("doc-1", &carol_invite.commit).unwrap();

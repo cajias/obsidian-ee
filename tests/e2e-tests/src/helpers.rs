@@ -321,7 +321,8 @@ pub async fn setup_two_user_group(
     // the commit when creating the invite, and there are no other existing members to
     // notify. For 3+ user groups, the commit would contain updates that existing members
     // must process to learn about Bob.
-    let bob_invite = Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
+    let bob_invite =
+        Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
     let bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
 
     Ok((alice_doc, bob_doc))
