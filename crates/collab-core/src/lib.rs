@@ -1,9 +1,10 @@
 //! Core collaboration engine with Yrs CRDT and MLS encryption.
 //!
 //! This crate provides:
-//! - `CollabDocument`: A wrapper around Yrs for CRDT-based text editing
-//! - `MlsDocumentGroup`: MLS group operations for end-to-end encryption
-//! - `EncryptedDocument`: Combined encrypted collaborative document
+//! - [`CollabDocument`]: A wrapper around Yrs for CRDT-based text editing
+//! - [`MlsDocumentGroup`]: MLS group operations for end-to-end encryption
+//! - [`EncryptedDocument`]: Combined encrypted collaborative document
+//! - [`DocumentRegistry`]: Multi-document session management with metadata tracking
 
 mod document;
 mod encryption;

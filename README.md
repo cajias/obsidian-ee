@@ -134,10 +134,35 @@ obsidian-ee/
 
 | Crate | Description |
 |-------|-------------|
-| `collab-core` | Core encryption (MLS) and CRDT (Yrs) integration |
+| `collab-core` | Core encryption (MLS), CRDT (Yrs), and document management |
 | `collab-relay` | WebSocket server for message routing |
 | `collab-cli` | Command-line client for testing |
 | `collab-proto` | Shared protocol message definitions |
+
+### Core API
+
+The `collab-core` crate provides the main building blocks:
+
+```rust
+use collab_core::{DocumentRegistry, CollabDocument, EncryptedDocument};
+
+// Manage multiple documents per session
+let mut registry = DocumentRegistry::new();
+
+// Create and edit documents
+let doc = registry.create("my-doc")?;
+doc.insert(0, "Hello, world!");
+
+// Track metadata
+registry.touch("my-doc")?;
+let metadata = registry.get_metadata("my-doc").unwrap();
+println!("Last modified: {:?}", metadata.last_modified());
+
+// Save and restore state
+let state = registry.get("my-doc").unwrap().encode_state();
+registry.close("my-doc");
+registry.open("my-doc", &state)?;
+```
 
 ## Development
 
