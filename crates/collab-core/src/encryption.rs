@@ -110,6 +110,12 @@ impl EncryptedDocument {
     pub fn process_commit(&mut self, commit: &[u8]) -> Result<()> {
         self.mls.process_commit(commit)
     }
+
+    /// Get the current MLS epoch.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.mls.epoch()
+    }
 }
 
 /// Invite for joining an encrypted document.

@@ -81,6 +81,12 @@ impl PendingMember {
         })
     }
 
+    /// Get the user ID for this pending member.
+    #[must_use]
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
     /// Get the serialized key package to send to the group owner.
     #[must_use]
     pub fn key_package(&self) -> &[u8] {
