@@ -13,6 +13,7 @@ collab-core = { path = "../../crates/collab-core" }
 collab-relay = { path = "../../crates/collab-relay" }
 collab-cli = { path = "../../crates/collab-cli" }
 collab-proto = { path = "../../crates/collab-proto" }
+collab-watcher = { path = "../../crates/collab-watcher" }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true
@@ -25,6 +26,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio-test.workspace = true
+tempfile = "3.14"
 
 [lints]
 workspace = true
