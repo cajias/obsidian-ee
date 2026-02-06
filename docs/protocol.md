@@ -251,14 +251,26 @@ pub type DocumentId = String;
 pub type UserId = String;
 ```
 
-## Invite Structure
+## Invite Structures
 
-For out-of-band MLS group invitations (used by CLI):
+There are two `Invite` types in different crates:
+
+**`collab-proto::Invite`** - For out-of-band invitation exchange (used by CLI for file-based workflows):
 
 ```rust
 pub struct Invite {
     pub doc_id: DocumentId,
     pub key_package: Vec<u8>,
     pub relay_url: String,
+}
+```
+
+**`collab_core::Invite`** - For MLS group membership (contains the cryptographic welcome/commit messages):
+
+```rust
+pub struct Invite {
+    pub doc_id: DocumentId,
+    pub welcome: Vec<u8>,
+    pub commit: Vec<u8>,
 }
 ```

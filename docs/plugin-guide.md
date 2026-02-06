@@ -178,4 +178,4 @@ The plugin build uses esbuild (`esbuild.config.mjs`) to bundle TypeScript into a
 From `manifest.json`:
 - **ID**: `obsidian-ee`
 - **Name**: Obsidian E2E Collaboration
-- **Min Obsidian Version**: 1.5.0
+- **Min Obsidian Version**: 1.0.0

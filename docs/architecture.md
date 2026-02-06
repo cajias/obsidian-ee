@@ -192,10 +192,9 @@ The `DocumentRegistry` manages multiple concurrent documents:
 
 ```rust
 DocumentRegistry
-├── Plain documents: HashMap<DocumentId, DocumentEntry>
-│   └── DocumentEntry { CollabDocument, metadata }
-└── Encrypted documents: HashMap<DocumentId, DocumentEntry>
-    └── DocumentEntry { EncryptedDocument, metadata, encryption_metadata }
+└── documents: HashMap<DocumentId, DocumentEntry>
+    └── DocumentEntry { CollabDocument, DocumentMetadata }
+        └── DocumentMetadata { created_at, last_modified, custom: HashMap }
 ```
 
-Type-safe variant dispatch prevents accidentally performing plain operations on encrypted documents (and vice versa). The registry tracks creation time, last-modified time, custom metadata, and MLS epoch for encrypted documents.
+The registry manages `CollabDocument` instances with metadata tracking (creation time, last-modified time, custom key-value pairs). It supports create, get, close, and open (restore from serialized state) operations. Encrypted document support via `EncryptedDocument` integration is planned.

@@ -228,15 +228,16 @@ git worktree add ../obsidian-ee-infra -b feature/infra-work
 GitHub Actions workflow (`.github/workflows/ci.yml`):
 
 ```
-Push/PR → Check & Lint → Test → E2E Tests → Security Audit
+Push/PR → Check & Lint → Test → E2E Tests
+Push only → Security Audit (non-blocking)
 ```
 
-| Stage | What It Does |
-|-------|-------------|
-| Check & Lint | `cargo fmt --check`, `cargo lint`, `cargo build --release` |
-| Test | `cargo test --workspace` |
-| E2E Tests | Docker Compose up, build release, run E2E tests |
-| Security Audit | `cargo deny check advisories` (vulnerability scanning) |
+| Stage | Trigger | What It Does |
+|-------|---------|-------------|
+| Check & Lint | Push, PR | `cargo fmt --check`, `cargo lint`, `cargo build --release` |
+| Test | Push, PR | `cargo test --workspace` |
+| E2E Tests | Push, PR | Docker Compose up, build release, run E2E tests |
+| Security Audit | Push, Schedule | `cargo deny check advisories` (non-blocking, `continue-on-error`) |
 
 ## Security Scanning
 

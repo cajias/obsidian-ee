@@ -94,11 +94,13 @@ This is the primary type for encrypted collaborative editing. It exposes the sam
 Manages multiple documents (both plain and encrypted) with metadata tracking.
 
 ```rust
-pub struct DocumentRegistry { ... }
+pub struct DocumentRegistry {
+    documents: HashMap<DocumentId, DocumentEntry>,
+}
 
-pub enum DocumentVariant {
-    Plain(CollabDocument),
-    Encrypted(Box<EncryptedDocument>),
+pub struct DocumentEntry {
+    document: CollabDocument,
+    metadata: DocumentMetadata,
 }
 
 pub struct DocumentMetadata {
@@ -106,15 +108,9 @@ pub struct DocumentMetadata {
     last_modified: SystemTime,
     custom: HashMap<String, String>,
 }
-
-pub struct EncryptionMetadata {
-    user_id: String,
-    is_owner: bool,
-    epoch: u64,
-}
 ```
 
-The registry provides type-safe access: attempting plain operations on encrypted documents (or vice versa) returns a typed error rather than silently failing.
+The registry manages `CollabDocument` instances with associated metadata. It supports create, get, close, and open (restore from state) operations, along with custom metadata and timestamp tracking.
 
 #### `connection.rs` - Connection State Machine
 
@@ -141,7 +137,7 @@ The state machine emits actions; the caller decides how to execute them. This de
 
 ```toml
 yrs = "0.21"
-openmls = "0.7"
+openmls = { version = "0.7", default-features = false }
 openmls_rust_crypto = "0.4"
 openmls_basic_credential = "0.4"
 serde = "1.0"
@@ -229,7 +225,7 @@ tracing = "0.1"
 
 ## collab-proto
 
-Minimal protocol definition crate (121 lines). Contains only data types and serialization - zero business logic.
+Minimal protocol definition crate (120 lines). Contains only data types and serialization - zero business logic.
 
 ### Types
 
@@ -363,8 +359,8 @@ File system watcher for Obsidian vault directories.
 pub struct VaultWatcher { ... }
 
 pub struct WatcherConfig {
-    pub extensions: Vec<String>,   // Default: ["md"]
-    pub debounce_ms: u64,          // Default: 200
+    pub extensions: HashSet<String>,  // Default: ["md"]
+    pub debounce: Duration,           // Default: 200ms
 }
 
 pub enum VaultEventKind { Created, Modified, Deleted }
