@@ -4,7 +4,9 @@ use crate::document::CollabDocument;
 use crate::encryption::EncryptedDocument;
 use crate::{DocumentId, Invite, PendingMember};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::SystemTime;
+use tracing::{debug, error, info, warn};
 
 /// Error types for registry operations.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -26,7 +28,10 @@ pub enum RegistryError {
     IsEncrypted(DocumentId),
     /// MLS operation failed.
     #[error("MLS error: {0}")]
-    MlsError(String),
+    MlsError(#[from] Arc<crate::Error>),
+    /// Internal inconsistency detected.
+    #[error("Internal error: {0}")]
+    InternalError(String),
 }
 
 /// Variant for documents in the registry - either plain or encrypted.
@@ -51,9 +56,17 @@ pub struct EncryptionMetadata {
 
 impl EncryptionMetadata {
     /// Create new encryption metadata.
-    #[allow(clippy::missing_const_for_fn)] // String parameter prevents const
-    fn new(user_id: String, is_owner: bool) -> Self {
-        Self { user_id, is_owner, epoch: 0 }
+    ///
+    /// # Errors
+    ///
+    /// Returns `RegistryError::InvalidState` if user_id is empty.
+    fn new(user_id: String, is_owner: bool) -> Result<Self, RegistryError> {
+        if user_id.is_empty() {
+            return Err(RegistryError::InvalidState(
+                "User ID cannot be empty".to_string(),
+            ));
+        }
+        Ok(Self { user_id, is_owner, epoch: 0 })
     }
 
     /// The user ID of the local participant.
@@ -133,12 +146,20 @@ impl DocumentEntry {
     }
 
     /// Create a new entry with an encrypted document.
-    fn new_encrypted(doc: EncryptedDocument, user_id: String, is_owner: bool) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `RegistryError::InvalidState` if user_id is empty.
+    fn new_encrypted(
+        doc: EncryptedDocument,
+        user_id: String,
+        is_owner: bool,
+    ) -> Result<Self, RegistryError> {
+        Ok(Self {
             variant: DocumentVariant::Encrypted(Box::new(doc)),
             metadata: DocumentMetadata::new(),
-            encryption_metadata: Some(EncryptionMetadata::new(user_id, is_owner)),
-        }
+            encryption_metadata: Some(EncryptionMetadata::new(user_id, is_owner)?),
+        })
     }
 
     /// Get a reference to the document variant.
@@ -197,16 +218,29 @@ impl DocumentRegistry {
         id: impl Into<DocumentId>,
     ) -> Result<&mut CollabDocument, RegistryError> {
         let id = id.into();
+        info!(document_id = %id, "Creating plain document");
+
         if self.documents.contains_key(&id) {
+            warn!(document_id = %id, "Attempted to create duplicate document");
             return Err(RegistryError::AlreadyExists(id));
         }
+
         let doc = CollabDocument::new(id.clone());
         let entry = DocumentEntry::new_plain(doc);
         self.documents.insert(id.clone(), entry);
+
+        debug!(document_id = %id, "Plain document created successfully");
+
         let entry = self.documents.get_mut(&id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Plain(doc) => Ok(doc),
-            DocumentVariant::Encrypted(_) => unreachable!("just created plain"),
+            DocumentVariant::Encrypted(_) => {
+                error!(document_id = %id, "Internal error: variant mismatch after plain document operation");
+                Err(RegistryError::InternalError(format!(
+                    "Document '{}' has wrong variant after creation",
+                    id
+                )))
+            }
         }
     }
 
@@ -216,8 +250,14 @@ impl DocumentRegistry {
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&CollabDocument> {
         self.documents.get(id).and_then(|entry| match &entry.variant {
-            DocumentVariant::Plain(doc) => Some(doc),
-            DocumentVariant::Encrypted(_) => None,
+            DocumentVariant::Plain(doc) => {
+                debug!(document_id = %id, "Retrieved plain document");
+                Some(doc)
+            }
+            DocumentVariant::Encrypted(_) => {
+                warn!(document_id = %id, "Attempted to access encrypted document with plain accessor");
+                None
+            }
         })
     }
 
@@ -227,8 +267,14 @@ impl DocumentRegistry {
     #[must_use]
     pub fn get_mut(&mut self, id: &str) -> Option<&mut CollabDocument> {
         self.documents.get_mut(id).and_then(|entry| match &mut entry.variant {
-            DocumentVariant::Plain(doc) => Some(doc),
-            DocumentVariant::Encrypted(_) => None,
+            DocumentVariant::Plain(doc) => {
+                debug!(document_id = %id, "Retrieved mutable plain document");
+                Some(doc)
+            }
+            DocumentVariant::Encrypted(_) => {
+                warn!(document_id = %id, "Attempted to access encrypted document with plain mutable accessor");
+                None
+            }
         })
     }
 
@@ -243,16 +289,21 @@ impl DocumentRegistry {
     /// Returns `None` if the document doesn't exist or is encrypted.
     /// Use `close_any` to close any document type.
     pub fn close(&mut self, id: &str) -> Option<CollabDocument> {
+        debug!(document_id = %id, "Attempting to close plain document");
+
         // Check if it's a plain document first
         let is_plain = self.documents.get(id).is_some_and(|entry| {
             matches!(entry.variant, DocumentVariant::Plain(_))
         });
+
         if is_plain {
+            info!(document_id = %id, "Closing plain document");
             self.documents.remove(id).and_then(|entry| match entry.variant {
                 DocumentVariant::Plain(doc) => Some(doc),
                 DocumentVariant::Encrypted(_) => None,
             })
         } else {
+            warn!(document_id = %id, "Cannot close: document not found or is encrypted");
             None
         }
     }
@@ -261,7 +312,17 @@ impl DocumentRegistry {
     ///
     /// Returns the document variant, or `None` if the document doesn't exist.
     pub fn close_any(&mut self, id: &str) -> Option<DocumentVariant> {
-        self.documents.remove(id).map(|entry| entry.variant)
+        info!(document_id = %id, "Closing document (any type)");
+
+        let result = self.documents.remove(id).map(|entry| entry.variant);
+
+        if result.is_some() {
+            debug!(document_id = %id, "Document closed successfully");
+        } else {
+            warn!(document_id = %id, "Document not found");
+        }
+
+        result
     }
 
     /// Open a plain document with existing state.
@@ -281,18 +342,37 @@ impl DocumentRegistry {
         state: &[u8],
     ) -> Result<&mut CollabDocument, RegistryError> {
         let id = id.into();
+        info!(document_id = %id, state_size = state.len(), "Opening plain document with existing state");
+
         if self.documents.contains_key(&id) {
+            warn!(document_id = %id, "Attempted to open duplicate document");
             return Err(RegistryError::AlreadyExists(id));
         }
+
         let mut doc = CollabDocument::new(id.clone());
-        doc.apply_update(state)
-            .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
+        doc.apply_update(state).map_err(|e| {
+            error!(document_id = %id, error = %e, "Failed to apply document state");
+            RegistryError::InvalidState(format!(
+                "Failed to restore document '{}': {}. State may be corrupted or incompatible.",
+                id, e
+            ))
+        })?;
+
         let entry = DocumentEntry::new_plain(doc);
         self.documents.insert(id.clone(), entry);
+
+        debug!(document_id = %id, "Plain document opened successfully");
+
         let entry = self.documents.get_mut(&id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Plain(doc) => Ok(doc),
-            DocumentVariant::Encrypted(_) => unreachable!("just created plain"),
+            DocumentVariant::Encrypted(_) => {
+                error!(document_id = %id, "Internal error: variant mismatch after plain document operation");
+                Err(RegistryError::InternalError(format!(
+                    "Document '{}' has wrong variant after creation",
+                    id
+                )))
+            }
         }
     }
 
@@ -313,11 +393,15 @@ impl DocumentRegistry {
         key: &str,
         value: &str,
     ) -> Result<(), RegistryError> {
-        let entry = self
-            .documents
-            .get_mut(id)
-            .ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
+        debug!(document_id = %id, key = %key, "Setting custom metadata");
+
+        let entry = self.documents.get_mut(id).ok_or_else(|| {
+            warn!(document_id = %id, "Cannot set metadata: document not found");
+            RegistryError::NotFound(id.to_string())
+        })?;
+
         entry.metadata.custom.insert(key.to_string(), value.to_string());
+        debug!(document_id = %id, key = %key, "Custom metadata set successfully");
         Ok(())
     }
 
@@ -327,11 +411,15 @@ impl DocumentRegistry {
     ///
     /// Returns `RegistryError::NotFound` if the document does not exist.
     pub fn touch(&mut self, id: &str) -> Result<(), RegistryError> {
-        let entry = self
-            .documents
-            .get_mut(id)
-            .ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
+        debug!(document_id = %id, "Updating last_modified timestamp");
+
+        let entry = self.documents.get_mut(id).ok_or_else(|| {
+            warn!(document_id = %id, "Cannot touch: document not found");
+            RegistryError::NotFound(id.to_string())
+        })?;
+
         entry.metadata.touch();
+        debug!(document_id = %id, "Timestamp updated successfully");
         Ok(())
     }
 
@@ -354,28 +442,50 @@ impl DocumentRegistry {
         user_id: &str,
     ) -> Result<&mut EncryptedDocument, RegistryError> {
         let id = id.into();
+        info!(document_id = %id, user_id = %user_id, "Creating encrypted document");
+
         if self.documents.contains_key(&id) {
+            warn!(document_id = %id, "Attempted to create duplicate encrypted document");
             return Err(RegistryError::AlreadyExists(id));
         }
 
-        let doc = EncryptedDocument::create(&id, user_id)
-            .map_err(|e| RegistryError::MlsError(e.to_string()))?;
+        let doc = EncryptedDocument::create(&id, user_id).map_err(|e| {
+            error!(document_id = %id, user_id = %user_id, error = ?e, "MLS group creation failed");
+            RegistryError::MlsError(Arc::new(e))
+        })?;
 
-        let mut entry = DocumentEntry::new_encrypted(doc, user_id.to_string(), true);
+        let mut entry = DocumentEntry::new_encrypted(doc, user_id.to_string(), true)?;
 
-        // Set the epoch from the document
-        if let (DocumentVariant::Encrypted(doc), Some(meta)) =
-            (&entry.variant, &mut entry.encryption_metadata)
-        {
-            meta.set_epoch(doc.epoch());
-        }
+        // Set the epoch from the document - this should never fail since we just created the entry
+        let meta = entry
+            .encryption_metadata
+            .as_mut()
+            .expect("encrypted document must have encryption metadata");
+        let doc = match &entry.variant {
+            DocumentVariant::Encrypted(d) => d,
+            DocumentVariant::Plain(_) => {
+                error!("Internal error: plain variant after encrypted document operation");
+                return Err(RegistryError::InternalError(
+                    "Document has plain variant after encrypted operation".to_string()
+                ));
+            }
+        };
+        meta.set_epoch(doc.epoch());
 
         self.documents.insert(id.clone(), entry);
+
+        debug!(document_id = %id, user_id = %user_id, epoch = 0, is_owner = true,
+               "Encrypted document created successfully");
 
         let entry = self.documents.get_mut(&id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => Ok(doc.as_mut()),
-            DocumentVariant::Plain(_) => unreachable!("just created encrypted"),
+            DocumentVariant::Plain(_) => {
+                error!("Internal error: variant mismatch after encrypted document operation");
+                Err(RegistryError::InternalError(
+                    "Document has wrong variant after encrypted operation".to_string(),
+                ))
+            }
         }
     }
 
@@ -396,24 +506,43 @@ impl DocumentRegistry {
         pending: PendingMember,
     ) -> Result<&mut EncryptedDocument, RegistryError> {
         let doc_id = invite.doc_id.clone();
+        let user_id = pending.user_id().to_string();
+
+        info!(document_id = %doc_id, user_id = %user_id, "Joining encrypted document via invite");
+
         if self.documents.contains_key(&doc_id) {
+            warn!(document_id = %doc_id, "Attempted to join duplicate encrypted document");
             return Err(RegistryError::AlreadyExists(doc_id));
         }
 
-        let user_id = pending.user_id().to_string();
-        let doc = EncryptedDocument::join(invite, pending)
-            .map_err(|e| RegistryError::MlsError(e.to_string()))?;
+        let doc = EncryptedDocument::join(invite, pending).map_err(|e| {
+            error!(document_id = %doc_id, user_id = %user_id, error = ?e, "MLS group join failed");
+            RegistryError::MlsError(Arc::new(e))
+        })?;
 
-        let mut entry = DocumentEntry::new_encrypted(doc, user_id, false);
+        let epoch = doc.epoch();
+        let mut entry = DocumentEntry::new_encrypted(doc, user_id.clone(), false)?;
 
-        // Set the epoch from the document
-        if let (DocumentVariant::Encrypted(doc), Some(meta)) =
-            (&entry.variant, &mut entry.encryption_metadata)
-        {
-            meta.set_epoch(doc.epoch());
-        }
+        // Set the epoch from the document - this should never fail since we just created the entry
+        let meta = entry
+            .encryption_metadata
+            .as_mut()
+            .expect("encrypted document must have encryption metadata");
+        let doc = match &entry.variant {
+            DocumentVariant::Encrypted(d) => d,
+            DocumentVariant::Plain(_) => {
+                error!("Internal error: plain variant after encrypted document operation");
+                return Err(RegistryError::InternalError(
+                    "Document has plain variant after encrypted operation".to_string()
+                ));
+            }
+        };
+        meta.set_epoch(doc.epoch());
 
         self.documents.insert(doc_id.clone(), entry);
+
+        debug!(document_id = %doc_id, user_id = %user_id, epoch = %epoch, is_owner = false,
+               "Successfully joined encrypted document");
 
         let entry = self.documents.get_mut(&doc_id).expect("just inserted");
         match &mut entry.variant {
@@ -428,8 +557,14 @@ impl DocumentRegistry {
     #[must_use]
     pub fn get_encrypted(&self, id: &str) -> Option<&EncryptedDocument> {
         self.documents.get(id).and_then(|entry| match &entry.variant {
-            DocumentVariant::Encrypted(doc) => Some(doc.as_ref()),
-            DocumentVariant::Plain(_) => None,
+            DocumentVariant::Encrypted(doc) => {
+                debug!(document_id = %id, "Retrieved encrypted document");
+                Some(doc.as_ref())
+            }
+            DocumentVariant::Plain(_) => {
+                warn!(document_id = %id, "Attempted to access plain document with encrypted accessor");
+                None
+            }
         })
     }
 
@@ -439,8 +574,14 @@ impl DocumentRegistry {
     #[must_use]
     pub fn get_encrypted_mut(&mut self, id: &str) -> Option<&mut EncryptedDocument> {
         self.documents.get_mut(id).and_then(|entry| match &mut entry.variant {
-            DocumentVariant::Encrypted(doc) => Some(doc.as_mut()),
-            DocumentVariant::Plain(_) => None,
+            DocumentVariant::Encrypted(doc) => {
+                debug!(document_id = %id, "Retrieved mutable encrypted document");
+                Some(doc.as_mut())
+            }
+            DocumentVariant::Plain(_) => {
+                warn!(document_id = %id, "Attempted to access plain document with encrypted mutable accessor");
+                None
+            }
         })
     }
 
@@ -456,24 +597,45 @@ impl DocumentRegistry {
         id: &str,
         key_package: &[u8],
     ) -> Result<Invite, RegistryError> {
-        let entry = self
-            .documents
-            .get_mut(id)
-            .ok_or_else(|| RegistryError::NotFound(id.to_string()))?;
+        info!(document_id = %id, key_package_len = key_package.len(), "Creating invite for new member");
+
+        if key_package.is_empty() {
+            error!(document_id = %id, "Empty key package provided");
+            return Err(RegistryError::MlsError(Arc::new(crate::Error::InvalidState(
+                "Key package cannot be empty".to_string(),
+            ))));
+        }
+
+        let entry = self.documents.get_mut(id).ok_or_else(|| {
+            warn!(document_id = %id, "Cannot create invite: document not found");
+            RegistryError::NotFound(id.to_string())
+        })?;
 
         let doc = match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => doc.as_mut(),
-            DocumentVariant::Plain(_) => return Err(RegistryError::NotEncrypted(id.to_string())),
+            DocumentVariant::Plain(_) => {
+                error!(document_id = %id, "Cannot create invite: document is not encrypted");
+                return Err(RegistryError::NotEncrypted(id.to_string()));
+            }
         };
 
-        let invite = doc
-            .create_invite(key_package)
-            .map_err(|e| RegistryError::MlsError(e.to_string()))?;
+        let old_epoch = doc.epoch();
+        let invite = doc.create_invite(key_package).map_err(|e| {
+            error!(document_id = %id, error = ?e, "Failed to create MLS invite");
+            RegistryError::MlsError(Arc::new(e))
+        })?;
+
+        let new_epoch = doc.epoch();
 
         // Update epoch in metadata after adding member
-        if let Some(meta) = &mut entry.encryption_metadata {
-            meta.set_epoch(doc.epoch());
-        }
+        let meta = entry
+            .encryption_metadata
+            .as_mut()
+            .expect("encrypted document must have encryption metadata");
+        meta.set_epoch(new_epoch);
+
+        info!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
+              "Invite created successfully, epoch advanced");
 
         Ok(invite)
     }
@@ -486,6 +648,8 @@ impl DocumentRegistry {
     /// Returns `RegistryError::NotEncrypted` if the document is not encrypted.
     /// Returns `RegistryError::MlsError` if processing the commit fails.
     pub fn process_commit(&mut self, id: &str, commit: &[u8]) -> Result<(), RegistryError> {
+        info!(document_id = %id, commit_len = commit.len(), "Processing commit for encrypted document");
+
         let entry = self
             .documents
             .get_mut(id)
@@ -493,16 +657,31 @@ impl DocumentRegistry {
 
         let doc = match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => doc.as_mut(),
-            DocumentVariant::Plain(_) => return Err(RegistryError::NotEncrypted(id.to_string())),
+            DocumentVariant::Plain(_) => {
+                warn!(document_id = %id, "Attempted to process commit on plain document");
+                return Err(RegistryError::NotEncrypted(id.to_string()));
+            }
         };
 
-        doc.process_commit(commit)
-            .map_err(|e| RegistryError::MlsError(e.to_string()))?;
+        let old_epoch = doc.epoch();
+
+        doc.process_commit(commit).map_err(|e| {
+            error!(document_id = %id, error = ?e, old_epoch = %old_epoch,
+                   "Failed to process commit");
+            RegistryError::MlsError(Arc::new(e))
+        })?;
+
+        let new_epoch = doc.epoch();
 
         // Update epoch in metadata after processing commit
-        if let Some(meta) = &mut entry.encryption_metadata {
-            meta.set_epoch(doc.epoch());
-        }
+        let meta = entry
+            .encryption_metadata
+            .as_mut()
+            .expect("encrypted document must have encryption metadata");
+        meta.set_epoch(new_epoch);
+
+        debug!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
+               "Commit processed successfully, epoch updated");
 
         Ok(())
     }
@@ -814,22 +993,30 @@ mod tests {
 
     #[test]
     fn test_mls_error() {
-        let err = RegistryError::MlsError("failed to encrypt".to_string());
+        let err = RegistryError::MlsError(Arc::new(crate::Error::Mls(
+            "failed to encrypt".to_string(),
+        )));
         assert!(err.to_string().contains("MLS"));
         assert!(err.to_string().contains("failed to encrypt"));
     }
 
     #[test]
     fn test_encryption_metadata_creation() {
-        let meta = EncryptionMetadata::new("alice".to_string(), true);
+        let meta = EncryptionMetadata::new("alice".to_string(), true).unwrap();
         assert_eq!(meta.user_id(), "alice");
         assert!(meta.is_owner());
         assert_eq!(meta.epoch(), 0);
     }
 
     #[test]
+    fn test_encryption_metadata_rejects_empty_user_id() {
+        let result = EncryptionMetadata::new("".to_string(), true);
+        assert!(matches!(result, Err(RegistryError::InvalidState(_))));
+    }
+
+    #[test]
     fn test_encryption_metadata_epoch_update() {
-        let mut meta = EncryptionMetadata::new("bob".to_string(), false);
+        let mut meta = EncryptionMetadata::new("bob".to_string(), false).unwrap();
         assert_eq!(meta.epoch(), 0);
         meta.set_epoch(5);
         assert_eq!(meta.epoch(), 5);
