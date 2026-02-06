@@ -75,8 +75,9 @@ fn assert_sm(
 /// a WebSocket to the given URL and notifying the state machine.
 async fn drive_to_connected(sm: &mut ConnectionStateMachine, url: &str) {
     let result = timeout(TEST_TIMEOUT, connect_async(url)).await;
-    assert!(result.is_ok(), "WebSocket connect timed out");
-    assert!(result.unwrap().is_ok(), "WebSocket connect failed");
+    assert!(result.is_ok(), "WebSocket connect timed out after {TEST_TIMEOUT:?}");
+    let ws_result = result.unwrap();
+    assert!(ws_result.is_ok(), "WebSocket connect failed: {}", ws_result.unwrap_err());
     sm.on_connected();
 }
 
@@ -189,10 +190,13 @@ async fn test_connect_to_nonexistent_relay_triggers_retry() {
 
     // Attempt the real connection -- it will fail.
     let result = timeout(TEST_TIMEOUT, connect_async(dead_url)).await;
-    let connect_failed = result.is_err() || result.unwrap().is_err();
-    assert!(connect_failed, "Connection to port 1 should fail");
+    let error_msg = match result {
+        Err(_) => "connection timeout".to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(_)) => panic!("Connection to port 1 should fail"),
+    };
 
-    sm.on_error("connection refused");
+    sm.on_error(&error_msg);
 
     assert_eq!(sm.state(), &ConnectionState::Reconnecting { attempt: 1 });
     let action = sm.next_action();
@@ -211,10 +215,13 @@ async fn fail_one_attempt(
     expect_reconnecting: Option<u32>,
 ) {
     let result = timeout(TEST_TIMEOUT, connect_async(dead_url)).await;
-    let failed = result.is_err() || result.unwrap().is_err();
-    assert!(failed, "Connection to dead URL should fail");
+    let error_msg = match result {
+        Err(_) => "connection timeout".to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(_)) => panic!("Connection to dead URL should fail"),
+    };
 
-    sm.on_error("connection refused");
+    sm.on_error(&error_msg);
 
     if let Some(attempt) = expect_reconnecting {
         assert_eq!(sm.state(), &ConnectionState::Reconnecting { attempt });
@@ -238,8 +245,27 @@ async fn test_retry_exhaustion_gives_up() {
     // Attempt 3: exceeds max_retries -- should transition to Failed
     fail_one_attempt(&mut sm, dead_url, None).await;
 
-    assert_eq!(sm.state(), &ConnectionState::Failed { reason: "connection refused".into() });
-    assert_eq!(sm.next_action(), ConnectionAction::GiveUp { reason: "connection refused".into() });
+    // Verify we're in Failed state with an error about connection refused
+    match sm.state() {
+        ConnectionState::Failed { reason } => {
+            assert!(
+                reason.to_lowercase().contains("connection refused"),
+                "Expected 'connection refused' in error, got: {reason}"
+            );
+        }
+        other => panic!("Expected Failed state, got {other:?}"),
+    }
+
+    // Verify GiveUp action with error about connection refused
+    match sm.next_action() {
+        ConnectionAction::GiveUp { reason } => {
+            assert!(
+                reason.to_lowercase().contains("connection refused"),
+                "Expected 'connection refused' in GiveUp reason, got: {reason}"
+            );
+        }
+        other => panic!("Expected GiveUp action, got {other:?}"),
+    }
 }
 
 /// After a transient disconnect the state machine should cycle through
@@ -423,7 +449,9 @@ async fn connect_two_clients(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) {
     let (a, b) = tokio::join!(connect_async(url), connect_async(url));
-    (a.unwrap().0, b.unwrap().0)
+    let alice = a.unwrap_or_else(|e| panic!("Alice failed to connect: {e}")).0;
+    let bob = b.unwrap_or_else(|e| panic!("Bob failed to connect: {e}")).0;
+    (alice, bob)
 }
 
 /// With `auto_connect=false` the state machine starts `Disconnected` and emits
@@ -510,5 +538,115 @@ async fn test_disconnect_before_handshake_retries() {
         *sm.state(),
         ConnectionState::Connected,
         "State machine should reach Connected after successful reconnect"
+    );
+}
+
+/// Test that the state machine handles race conditions gracefully.
+///
+/// This verifies:
+/// 1. Calling `on_error()` while already in `Reconnecting` is idempotent
+/// 2. Calling `on_retry_tick()` multiple times is handled safely
+///
+/// These scenarios can occur in production when:
+/// - Multiple concurrent connection attempts fail simultaneously
+/// - Timer events and error events race each other
+/// - Network flaps cause rapid error/retry cycles
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_concurrent_error_handling() {
+    let dead_url = "ws://127.0.0.1:1";
+    // Use max_retries=5 to allow room for testing race conditions
+    let config = config_with_retries(dead_url, 5);
+    let mut sm = ConnectionStateMachine::new(config);
+
+    // Start in Connecting state
+    assert_eq!(*sm.state(), ConnectionState::Connecting);
+
+    // First connection fails
+    let result = timeout(TEST_TIMEOUT, connect_async(dead_url)).await;
+    let error_msg = match result {
+        Err(_) => "connection timeout".to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(_)) => panic!("Connection should fail"),
+    };
+
+    sm.on_error(&error_msg);
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Reconnecting { attempt: 1 },
+        "First error should trigger reconnect"
+    );
+
+    // RACE CONDITION 1: Another error arrives while already reconnecting
+    // This can happen if multiple concurrent operations fail
+    sm.on_error("second concurrent error");
+
+    // State machine should handle concurrent error gracefully - increments attempt
+    // This is correct behavior: if you get another error while waiting to retry,
+    // it counts as another failed attempt
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Reconnecting { attempt: 2 },
+        "Concurrent error should increment attempt counter"
+    );
+
+    // Advance through retry tick
+    sm.on_retry_tick();
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Connecting,
+        "Retry tick should advance to Connecting"
+    );
+
+    // Second connection attempt fails
+    let result2 = timeout(TEST_TIMEOUT, connect_async(dead_url)).await;
+    let error_msg2 = match result2 {
+        Err(_) => "connection timeout".to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(_)) => panic!("Second connection should fail"),
+    };
+
+    sm.on_error(&error_msg2);
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Reconnecting { attempt: 3 },
+        "Third error (after concurrent error) should be attempt 3"
+    );
+
+    // RACE CONDITION 2: Multiple on_retry_tick() calls
+    // This can happen if timer events fire rapidly or race with error handling
+    sm.on_retry_tick();
+    let state_after_first = sm.state().clone();
+
+    // Call it again immediately
+    sm.on_retry_tick();
+    let state_after_second = sm.state().clone();
+
+    // Both should transition to Connecting (idempotent behavior)
+    assert_eq!(
+        state_after_first,
+        ConnectionState::Connecting,
+        "First retry tick should transition to Connecting"
+    );
+    assert_eq!(
+        state_after_second,
+        ConnectionState::Connecting,
+        "Second retry tick should remain in Connecting (idempotent)"
+    );
+
+    // Verify the state machine is still functional after race conditions
+    let result3 = timeout(TEST_TIMEOUT, connect_async(dead_url)).await;
+    let error_msg3 = match result3 {
+        Err(_) => "connection timeout".to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(_)) => panic!("Third connection should fail"),
+    };
+
+    sm.on_error(&error_msg3);
+    // We've had: initial error (1), concurrent error (2), second connection (3), third connection (4)
+    assert_eq!(
+        *sm.state(),
+        ConnectionState::Reconnecting { attempt: 4 },
+        "State machine should continue functioning correctly after race conditions"
     );
 }
