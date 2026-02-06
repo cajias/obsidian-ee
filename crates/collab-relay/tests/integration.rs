@@ -119,7 +119,7 @@ async fn test_full_flow_connect_identify_subscribe_exchange() {
             assert_eq!(epoch, 1);
             assert_eq!(signature, vec![0xAB, 0xCD]);
         }
-        other => panic!("Expected YrsUpdate, got {:?}", other),
+        other => panic!("Expected YrsUpdate, got {other:?}"),
     }
 }
 
