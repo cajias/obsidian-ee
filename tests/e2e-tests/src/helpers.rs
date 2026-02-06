@@ -141,11 +141,25 @@ impl TestClient {
         }
     }
 
-    /// Try to receive a message, returning None if no message is available within timeout.
+    /// Try to receive a message, returning `Ok(None)` only on timeout.
     ///
-    /// Useful for checking that no unexpected messages are received.
-    pub async fn try_recv(&mut self, duration: Duration) -> Option<ServerMessage> {
-        self.recv_timeout(duration).await.ok()
+    /// Unlike [`recv_timeout`](Self::recv_timeout), this method distinguishes
+    /// timeouts from real errors structurally (via `tokio::time::timeout`)
+    /// rather than by string matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection fails or message is invalid.
+    /// Only returns `Ok(None)` on a legitimate `tokio::time::Elapsed` timeout.
+    pub async fn try_recv(&mut self, duration: Duration) -> anyhow::Result<Option<ServerMessage>> {
+        match timeout(duration, self.ws.next()).await {
+            Err(_elapsed) => Ok(None),
+            Ok(Some(Ok(Message::Text(text)))) => Ok(Some(serde_json::from_str(&text)?)),
+            Ok(Some(Ok(Message::Close(_)))) => anyhow::bail!("Connection closed unexpectedly"),
+            Ok(Some(Err(e))) => Err(e.into()),
+            Ok(None) => anyhow::bail!("WebSocket stream ended unexpectedly"),
+            Ok(Some(Ok(_))) => anyhow::bail!("Unexpected WebSocket message type"),
+        }
     }
 
     /// Subscribe to a document and wait for confirmation.
@@ -176,7 +190,15 @@ impl TestClient {
             doc_id: doc_id.clone(),
             encrypted: op.ciphertext.clone(),
             epoch: op.epoch,
-            signature: vec![], // TODO: Add proper signatures
+            // TODO(security): Implement message signatures for replay attack prevention
+            // Priority: Medium - MLS provides forward secrecy and authenticity, but not
+            // protection against replay attacks or message reordering by a compromised relay.
+            // Suggested approach:
+            // - Use Ed25519 for signing (fast, 64-byte signatures)
+            // - Sign: BLAKE3(doc_id || encrypted || epoch || sequence_number)
+            // - Track sequence numbers per sender to detect replays/reordering
+            // - Key distribution via MLS KeyPackage credential field
+            signature: vec![],
         })
         .await
     }
@@ -293,9 +315,14 @@ pub async fn setup_two_user_group(
     };
 
     // Bob joins using the welcome
-    // Note: commit is empty here since we received welcome via network.
-    // For 2-user groups, no commit processing is needed.
-    let bob_invite = Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
+    // MLS Protocol Detail: The Welcome message contains all state Bob needs to join.
+    // The Commit message (empty here) is only needed to update *other* existing members
+    // about the new joiner. In this 2-user case, Alice (the inviter) already processed
+    // the commit when creating the invite, and there are no other existing members to
+    // notify. For 3+ user groups, the commit would contain updates that existing members
+    // must process to learn about Bob.
+    let bob_invite =
+        Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
     let bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
 
     Ok((alice_doc, bob_doc))
@@ -310,6 +337,10 @@ pub async fn setup_two_user_group(
 /// # Errors
 ///
 /// Returns an error if any step of the setup fails.
+///
+/// # Panics
+///
+/// Panics if draining broadcast messages fails due to connection errors.
 pub async fn setup_three_user_group(
     alice: &mut TestClient,
     bob: &mut TestClient,
@@ -343,7 +374,11 @@ pub async fn setup_three_user_group(
     };
 
     // Charlie receives the handshake too (but can't use it - it's for Bob)
-    let _ = charlie.try_recv(SHORT_TIMEOUT).await;
+    // Drain broadcast message not meant for this client
+    let _ = charlie
+        .try_recv(SHORT_TIMEOUT)
+        .await
+        .expect("Connection error while draining broadcast message");
 
     let bob_doc = EncryptedDocument::join(
         &Invite { doc_id: doc_id.clone(), welcome: bob_welcome, commit: vec![], epoch: 1 },
@@ -369,7 +404,11 @@ pub async fn setup_three_user_group(
     };
 
     // Bob also receives the handshake (but can't use it)
-    let _ = bob.try_recv(SHORT_TIMEOUT).await;
+    // Drain broadcast message not meant for this client
+    let _ = bob
+        .try_recv(SHORT_TIMEOUT)
+        .await
+        .expect("Connection error while draining broadcast message");
 
     let charlie_doc = EncryptedDocument::join(
         &Invite { doc_id: doc_id.clone(), welcome: charlie_welcome, commit: vec![], epoch: 2 },

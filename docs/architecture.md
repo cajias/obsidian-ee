@@ -130,6 +130,73 @@ Retry policy: exponential backoff (1s, 2s, 4s, 8s, 16s) with 25% jitter, capped 
 
 The state machine is **synchronous and runtime-agnostic** - it emits `ConnectionAction` values that the caller executes, making it testable and portable across async runtimes.
 
+## Relay Broadcast Behavior
+
+The relay server acts as a **zero-knowledge message broker**, forwarding encrypted payloads between clients subscribed to the same document. It never inspects message content.
+
+### Subscription Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Relay
+
+    Client->>Relay: Identify { user_id }
+    Relay->>Client: Identified { user_id }
+    Client->>Relay: Subscribe { doc_id }
+    Relay->>Client: Subscribed { doc_id }
+    Note over Client,Relay: Client now receives broadcasts for doc_id
+    Client->>Relay: Unsubscribe { doc_id }
+    Relay->>Client: Unsubscribed { doc_id }
+    Note over Client,Relay: Client stops receiving broadcasts
+```
+
+- A client must `Identify` before subscribing. Attempts to subscribe or send messages without identification receive an `Error { code: NotIdentified }` response.
+- A client can subscribe to multiple documents simultaneously.
+- On disconnect, the relay automatically unregisters the client and removes it from all subscriptions.
+
+### Fan-Out Semantics
+
+When the relay receives a `YrsUpdate` or `MlsHandshake` message for a document:
+
+1. **Sender exclusion**: The message is routed to all subscribers of that document **except the sender**. This prevents echo effects where a client receives its own edits back.
+2. **Message cloning**: Each recipient gets a clone of the `ServerMessage`. This is necessary because the relay uses per-client unbounded channels for delivery.
+3. **Best-effort delivery**: If sending to a particular client fails (e.g., channel closed due to disconnect), the failure is logged as a warning but does **not** block delivery to other clients.
+4. **Delivery count**: `route_message()` returns the number of clients that were successfully sent the message, which can be used for observability.
+
+### Document Isolation
+
+Messages are scoped to their document ID. Subscribers to `doc-A` never receive messages sent to `doc-B`, even if the same users are subscribed to both. The `MessageRouter` maintains a `HashMap<DocumentId, HashSet<UserId>>` to enforce this isolation.
+
+### Message Flow
+
+```
+Client A (sender)
+  │
+  ├─ ClientMessage::YrsUpdate { doc_id, encrypted, epoch, signature }
+  │
+  ▼
+RelayServer::handle_yrs_update()
+  │
+  ├─ Wraps as ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch, signature }
+  │
+  ▼
+MessageRouter::route_message(doc_id, from_user, message)
+  │
+  ├─ Reads subscribers for doc_id
+  ├─ Filters out sender (from_user)
+  ├─ For each remaining subscriber:
+  │   ├─ Looks up ClientHandle (mpsc::UnboundedSender)
+  │   ├─ Clones the message
+  │   └─ Sends via channel (or logs warning on failure)
+  │
+  ▼
+Client B, C, ... (receivers)
+  └─ Receive ServerMessage::YrsUpdate via their WebSocket
+```
+
+The same flow applies to `MlsHandshake` messages used during MLS group formation and key exchange.
+
 ## Document Registry
 
 The `DocumentRegistry` manages multiple concurrent documents:

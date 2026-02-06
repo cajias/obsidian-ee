@@ -1,4 +1,4 @@
-//! End-to-end tests for DocumentRegistry with encrypted documents.
+//! End-to-end tests for `DocumentRegistry` with encrypted documents.
 //!
 //! These tests verify the registry's ability to manage both plain and encrypted
 //! documents, handle multi-user encrypted sessions, and maintain metadata correctly.
@@ -50,10 +50,7 @@ fn test_registry_mixed_documents() {
 
     // Access with correct methods
     assert_eq!(registry.get("plain-doc").unwrap().get_content(), "Plain text");
-    assert_eq!(
-        registry.get_encrypted("enc-doc").unwrap().get_content(),
-        "Secret text"
-    );
+    assert_eq!(registry.get_encrypted("enc-doc").unwrap().get_content(), "Secret text");
 
     // Cross-type access returns None
     assert!(registry.get("enc-doc").is_none());
@@ -102,9 +99,7 @@ fn test_registry_join_encrypted() {
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
 
     // Alice creates invite
-    let invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
 
     // Bob joins
     bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
@@ -129,9 +124,7 @@ fn test_registry_encrypted_message_exchange() {
     // Setup: Alice creates, Bob joins
     alice_registry.create_encrypted("doc1", "alice").unwrap();
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
     bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
 
     // Alice sends message
@@ -155,17 +148,11 @@ fn test_registry_encrypted_message_exchange() {
 
     // Verify ciphertexts are encrypted (don't contain plaintext)
     assert!(
-        !alice_op
-            .ciphertext
-            .windows(5)
-            .any(|w| w == b"Hello"),
+        !alice_op.ciphertext.windows(5).any(|w| w == b"Hello"),
         "Alice's ciphertext should not contain plaintext"
     );
     assert!(
-        !bob_op
-            .ciphertext
-            .windows(5)
-            .any(|w| w == b"Alice"),
+        !bob_op.ciphertext.windows(5).any(|w| w == b"Alice"),
         "Bob's ciphertext should not contain plaintext"
     );
 }
@@ -182,49 +169,23 @@ fn test_registry_three_user_collaboration() {
 
     // Bob joins
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let bob_invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let bob_invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
     bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
     // Carol joins (Alice adds her, Bob processes commit)
     let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
-    let carol_invite = alice_registry
-        .create_invite("doc1", carol_pending.key_package())
-        .unwrap();
+    let carol_invite = alice_registry.create_invite("doc1", carol_pending.key_package()).unwrap();
 
     // Bob must process the commit to stay in sync
-    bob_registry
-        .process_commit("doc1", &carol_invite.commit)
-        .unwrap();
+    bob_registry.process_commit("doc1", &carol_invite.commit).unwrap();
 
     // Carol joins
-    carol_registry
-        .join_encrypted(&carol_invite, carol_pending, carol_invite.epoch)
-        .unwrap();
+    carol_registry.join_encrypted(&carol_invite, carol_pending, carol_invite.epoch).unwrap();
 
     // Verify epochs
-    assert_eq!(
-        alice_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
-    assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
-    assert_eq!(
-        carol_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
+    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(carol_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
 
     // All three can communicate
     let alice_doc = alice_registry.get_encrypted_mut("doc1").unwrap();
@@ -275,9 +236,7 @@ fn test_registry_duplicate_encrypted() {
 
     // Try to join with same ID
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let invite = registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let invite = registry.create_invite("doc1", bob_pending.key_package()).unwrap();
     let result = registry.join_encrypted(&invite, bob_pending, invite.epoch);
     assert!(matches!(result, Err(RegistryError::AlreadyExists(_))));
 }
@@ -314,16 +273,8 @@ fn test_registry_encryption_metadata_tracking() {
 
     // Add Bob, check epoch updates
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
-    assert_eq!(
-        alice_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        1
-    );
+    let invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
+    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
 
     // Bob joins, check his metadata
     bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
@@ -334,28 +285,12 @@ fn test_registry_encryption_metadata_tracking() {
 
     // Add Carol, check epoch updates for both
     let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
-    let carol_invite = alice_registry
-        .create_invite("doc1", carol_pending.key_package())
-        .unwrap();
+    let carol_invite = alice_registry.create_invite("doc1", carol_pending.key_package()).unwrap();
 
-    bob_registry
-        .process_commit("doc1", &carol_invite.commit)
-        .unwrap();
+    bob_registry.process_commit("doc1", &carol_invite.commit).unwrap();
 
-    assert_eq!(
-        alice_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
-    assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
+    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
 }
 
 /// Test that regular document metadata works for encrypted documents.
@@ -373,14 +308,9 @@ fn test_registry_encrypted_has_document_metadata() {
     assert!(meta.created_at() <= after);
 
     // Can set custom metadata
-    registry
-        .set_custom_metadata("doc1", "purpose", "collaboration")
-        .unwrap();
+    registry.set_custom_metadata("doc1", "purpose", "collaboration").unwrap();
     let meta = registry.get_metadata("doc1").unwrap();
-    assert_eq!(
-        meta.custom().get("purpose"),
-        Some(&"collaboration".to_string())
-    );
+    assert_eq!(meta.custom().get("purpose"), Some(&"collaboration".to_string()));
 
     // Can touch to update last_modified
     let old_last_modified = meta.last_modified();
@@ -403,9 +333,7 @@ fn test_registry_concurrent_edits_converge() {
     // Setup
     alice_registry.create_encrypted("doc1", "alice").unwrap();
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
     bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
 
     // Alice and Bob make concurrent edits
@@ -444,50 +372,22 @@ fn test_registry_epoch_mismatch_rejected() {
 
     // Bob joins (both advance to epoch 1)
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let bob_invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let bob_invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
     bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
     // Verify both are at epoch 1
-    assert_eq!(
-        alice_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        1
-    );
-    assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        1
-    );
+    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
+    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
 
     // Alice adds Carol (Alice advances to epoch 2)
     let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
-    let carol_invite = alice_registry
-        .create_invite("doc1", carol_pending.key_package())
-        .unwrap();
+    let carol_invite = alice_registry.create_invite("doc1", carol_pending.key_package()).unwrap();
 
     // Verify Alice is now at epoch 2
-    assert_eq!(
-        alice_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
+    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
 
     // Bob is still at epoch 1 (hasn't processed Carol's commit yet)
-    assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        1
-    );
+    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
 
     // Alice encrypts a message at epoch 2
     let alice_doc = alice_registry.get_encrypted_mut("doc1").unwrap();
@@ -506,26 +406,15 @@ fn test_registry_epoch_mismatch_rejected() {
     // Verify Bob's state is unchanged after failed decryption
     assert_eq!(bob_doc.get_content(), "");
     assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
+        bob_registry.get_encryption_metadata("doc1").unwrap().epoch(),
         1,
         "Bob's epoch should remain unchanged after failed decryption"
     );
 
     // Now Bob processes the commit to catch up to epoch 2
-    bob_registry
-        .process_commit("doc1", &carol_invite.commit)
-        .unwrap();
+    bob_registry.process_commit("doc1", &carol_invite.commit).unwrap();
 
-    assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
-        2
-    );
+    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
 
     // Now Bob can decrypt Alice's message
     let bob_doc = bob_registry.get_encrypted_mut("doc1").unwrap();
@@ -548,24 +437,17 @@ fn test_registry_stale_invite_rejected() {
 
     // Alice creates invite for Bob (Alice advances to epoch 1)
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let stale_bob_invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let stale_bob_invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
 
     // Verify invite was created at epoch 1
     assert_eq!(stale_bob_invite.epoch, 1);
 
     // Before Bob joins, Alice creates another invite for Carol (Alice advances to epoch 2)
     let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
-    let _carol_invite = alice_registry
-        .create_invite("doc1", carol_pending.key_package())
-        .unwrap();
+    let _carol_invite = alice_registry.create_invite("doc1", carol_pending.key_package()).unwrap();
 
     // The current group epoch is now 2
-    let current_epoch = alice_registry
-        .get_encryption_metadata("doc1")
-        .unwrap()
-        .epoch();
+    let current_epoch = alice_registry.get_encryption_metadata("doc1").unwrap().epoch();
     assert_eq!(current_epoch, 2);
 
     // Bob tries to join with the stale invite from epoch 1.
@@ -588,7 +470,7 @@ fn test_registry_stale_invite_rejected() {
 
 /// Test that invalid commits are properly rejected.
 ///
-/// This test verifies that when process_commit() receives arbitrary or corrupted
+/// This test verifies that when `process_commit()` receives arbitrary or corrupted
 /// commit data that doesn't correspond to the group state, it properly rejects it
 /// without corrupting the group state.
 #[test]
@@ -601,32 +483,21 @@ fn test_registry_process_invalid_commit() {
 
     // Bob joins (both at epoch 1)
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let bob_invite = alice_registry
-        .create_invite("doc1", bob_pending.key_package())
-        .unwrap();
+    let bob_invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
     bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
     // Record Bob's epoch before the invalid commit
-    let bob_epoch_before = bob_registry
-        .get_encryption_metadata("doc1")
-        .unwrap()
-        .epoch();
+    let bob_epoch_before = bob_registry.get_encryption_metadata("doc1").unwrap().epoch();
     assert_eq!(bob_epoch_before, 1);
 
     // Try to process an invalid commit (arbitrary bytes)
     let invalid_commit = b"this is not a valid MLS commit";
     let result = bob_registry.process_commit("doc1", invalid_commit);
 
-    assert!(
-        result.is_err(),
-        "Should reject invalid commit data"
-    );
+    assert!(result.is_err(), "Should reject invalid commit data");
 
     // Verify Bob's state is unchanged after rejected commit
-    let bob_epoch_after = bob_registry
-        .get_encryption_metadata("doc1")
-        .unwrap()
-        .epoch();
+    let bob_epoch_after = bob_registry.get_encryption_metadata("doc1").unwrap().epoch();
     assert_eq!(
         bob_epoch_after, bob_epoch_before,
         "Epoch should remain unchanged after rejected commit"
@@ -651,24 +522,17 @@ fn test_registry_process_invalid_commit() {
     carol_registry.create_encrypted("doc2", "carol").unwrap();
 
     let wrong_group_pending = MlsDocumentGroup::generate_key_package("dave").unwrap();
-    let wrong_group_invite = carol_registry
-        .create_invite("doc2", wrong_group_pending.key_package())
-        .unwrap();
+    let wrong_group_invite =
+        carol_registry.create_invite("doc2", wrong_group_pending.key_package()).unwrap();
 
     // Try to process doc2's commit on doc1 - should be rejected
     let result = bob_registry.process_commit("doc1", &wrong_group_invite.commit);
 
-    assert!(
-        result.is_err(),
-        "Should reject commit from wrong group"
-    );
+    assert!(result.is_err(), "Should reject commit from wrong group");
 
     // Verify Bob's state remains unchanged
     assert_eq!(
-        bob_registry
-            .get_encryption_metadata("doc1")
-            .unwrap()
-            .epoch(),
+        bob_registry.get_encryption_metadata("doc1").unwrap().epoch(),
         bob_epoch_before,
         "Epoch should remain unchanged after rejected wrong-group commit"
     );
@@ -693,9 +557,7 @@ fn test_registry_large_document_encryption() {
 
     // Bob joins
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let bob_invite = alice_registry
-        .create_invite("large-doc", bob_pending.key_package())
-        .unwrap();
+    let bob_invite = alice_registry.create_invite("large-doc", bob_pending.key_package()).unwrap();
     bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
     // Create a large document (~1MB of text)
@@ -708,10 +570,7 @@ fn test_registry_large_document_encryption() {
 
     // Repeat to create ~1MB (paragraph is ~330 bytes, so ~3000 repetitions)
     let large_text = paragraph.repeat(3000);
-    assert!(
-        large_text.len() > 900_000,
-        "Document should be close to 1MB"
-    );
+    assert!(large_text.len() > 900_000, "Document should be close to 1MB");
 
     // Alice inserts large text
     let alice_doc = alice_registry.get_encrypted_mut("large-doc").unwrap();
@@ -722,10 +581,7 @@ fn test_registry_large_document_encryption() {
 
     // Verify the ciphertext doesn't leak plaintext
     assert!(
-        !alice_op
-            .ciphertext
-            .windows(5)
-            .any(|w| w == b"Lorem"),
+        !alice_op.ciphertext.windows(5).any(|w| w == b"Lorem"),
         "Ciphertext should not contain plaintext"
     );
 
@@ -734,11 +590,7 @@ fn test_registry_large_document_encryption() {
     bob_doc.apply_encrypted_update(&alice_op).unwrap();
 
     // Verify content matches
-    assert_eq!(
-        bob_doc.get_content(),
-        large_text,
-        "Large document should decrypt correctly"
-    );
+    assert_eq!(bob_doc.get_content(), large_text, "Large document should decrypt correctly");
 
     // Verify we can make incremental updates after large document
     alice_doc.insert(0, "HEADER: ");

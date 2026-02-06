@@ -472,8 +472,12 @@ async fn test_two_users_collaborate() {
     };
 
     // Bob joins using the welcome
-    let bob_invite =
-        collab_core::Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
+    let bob_invite = collab_core::Invite {
+        doc_id: doc_id.clone(),
+        welcome: welcome_payload,
+        commit: vec![],
+        epoch: 1,
+    };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
 
     // Alice edits the document
@@ -567,8 +571,12 @@ async fn test_offline_message_delivery() {
         panic!("Expected MlsHandshake Welcome message")
     };
 
-    let bob_invite =
-        collab_core::Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
+    let bob_invite = collab_core::Invite {
+        doc_id: doc_id.clone(),
+        welcome: welcome_payload,
+        commit: vec![],
+        epoch: 1,
+    };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
 
     // Bob goes offline (drop connection)

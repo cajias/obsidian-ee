@@ -387,7 +387,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == VaultEventKind::Created && e.path == PathBuf::from("note.md")),
+                .any(|e| e.kind == VaultEventKind::Created && e.path == Path::new("note.md")),
             "should detect .md file creation, got: {events:?}"
         );
 
@@ -410,8 +410,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == VaultEventKind::Modified
-                    && e.path == PathBuf::from("existing.md")),
+                .any(|e| e.kind == VaultEventKind::Modified && e.path == Path::new("existing.md")),
             "should detect .md file modification, got: {events:?}"
         );
 
@@ -434,8 +433,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == VaultEventKind::Deleted
-                    && e.path == PathBuf::from("to-delete.md")),
+                .any(|e| e.kind == VaultEventKind::Deleted && e.path == Path::new("to-delete.md")),
             "should detect .md file deletion, got: {events:?}"
         );
 
@@ -457,7 +455,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == VaultEventKind::Deleted && e.path == PathBuf::from("cycle.md")),
+                .any(|e| e.kind == VaultEventKind::Deleted && e.path == Path::new("cycle.md")),
             "should detect deletion, got: {events:?}"
         );
 
@@ -467,7 +465,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == VaultEventKind::Created && e.path == PathBuf::from("cycle.md")),
+                .any(|e| e.kind == VaultEventKind::Created && e.path == Path::new("cycle.md")),
             "should detect recreation as Created (not Modified), got: {events:?}"
         );
 
@@ -507,7 +505,7 @@ mod tests {
 
         let events = collect_events(&mut rx, Duration::from_secs(2)).await;
         assert!(
-            events.iter().any(|e| e.path == PathBuf::from("board.canvas")),
+            events.iter().any(|e| e.path == Path::new("board.canvas")),
             "should detect .canvas files with custom config, got: {events:?}"
         );
 
@@ -530,7 +528,7 @@ mod tests {
 
         let events = collect_events(&mut rx, Duration::from_secs(2)).await;
         assert!(
-            events.iter().any(|e| e.path == PathBuf::from("subfolder/nested.md")),
+            events.iter().any(|e| e.path == Path::new("subfolder/nested.md")),
             "should detect files in subdirectories with relative paths, got: {events:?}"
         );
 
