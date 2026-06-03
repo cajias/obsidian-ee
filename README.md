@@ -9,6 +9,8 @@
 
 <p align="center"><em>End-to-end encrypted collaborative editing with Yrs CRDT and MLS</em></p>
 
+<p align="center"><img src="docs/demo.gif" width="700" alt="obsidian-ee demo"></p>
+
 <p align="center">
   <img src="https://img.shields.io/github/languages/top/cajias/obsidian-ee?style=for-the-badge" alt="Language">
   <a href="https://github.com/cajias/obsidian-ee/actions"><img src="https://img.shields.io/github/actions/workflow/status/cajias/obsidian-ee/ci.yml?style=for-the-badge" alt="Build"></a>
@@ -83,7 +85,12 @@ Commands:
 
 > Note: the `connect` subcommand (live relay collaboration) is scaffolded but **not yet implemented**.
 
-_Demo: run `vhs docs/demo.tape` after install to regenerate the terminal cast._
+The terminal cast above is generated from [`docs/demo.tape`](docs/demo.tape) with [VHS](https://github.com/charmbracelet/vhs). To regenerate it after building the CLI:
+
+```bash
+cargo build -p collab-cli
+vhs docs/demo.tape   # writes docs/demo.gif
+```
 
 ## Configuration
 

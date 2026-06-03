@@ -27,6 +27,8 @@ infra/cdk.out/
 # Test artifacts
 *.cast
 *.gif
+# Tracked demo asset (regenerated via docs/demo.tape)
+!docs/demo.gif
 
 # Coverage
 *.profraw
