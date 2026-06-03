@@ -1,8 +1,13 @@
-<p align="center">
-  <img src="assets/banner.png" alt="obsidian-ee" width="100%">
-</p>
+```
+ ██████╗ ██████╗ ███████╗██╗██████╗ ██╗ █████╗ ███╗   ██╗      ███████╗███████╗
+██╔═══██╗██╔══██╗██╔════╝██║██╔══██╗██║██╔══██╗████╗  ██║      ██╔════╝██╔════╝
+██║   ██║██████╔╝███████╗██║██║  ██║██║███████║██╔██╗ ██║█████╗█████╗  █████╗
+██║   ██║██╔══██╗╚════██║██║██║  ██║██║██╔══██║██║╚██╗██║╚════╝██╔══╝  ██╔══╝
+╚██████╔╝██████╔╝███████║██║██████╔╝██║██║  ██║██║ ╚████║      ███████╗███████╗
+ ╚═════╝ ╚═════╝ ╚══════╝╚═╝╚═════╝ ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝      ╚══════╝╚══════╝
+```
 
-# obsidian-ee
+<p align="center"><em>End-to-end encrypted collaborative editing with Yrs CRDT and MLS</em></p>
 
 <p align="center">
   <img src="https://img.shields.io/github/languages/top/cajias/obsidian-ee?style=for-the-badge" alt="Language">
