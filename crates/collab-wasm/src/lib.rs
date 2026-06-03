@@ -108,6 +108,7 @@ impl CollabCore {
         let mut nonce_bytes = [0u8; 12];
         getrandom(&mut nonce_bytes)
             .map_err(|e| CollabError::encryption(format!("Failed to generate nonce: {}", e)))?;
+        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice; upgrade tracked separately
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext =
@@ -135,6 +136,7 @@ impl CollabCore {
             Aes256Gcm::new_from_slice(key).map_err(|e| CollabError::decryption(e.to_string()))?;
 
         let (nonce_bytes, encrypted) = ciphertext.split_at(12);
+        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice; upgrade tracked separately
         let nonce = Nonce::from_slice(nonce_bytes);
 
         cipher.decrypt(nonce, encrypted).map_err(|e| CollabError::decryption(e.to_string()))

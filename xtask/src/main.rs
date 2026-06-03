@@ -126,7 +126,7 @@ fn run_lint() -> ExitCode {
 
 fn is_command_available(cmd: &str) -> bool {
     // Use --version check for cross-platform compatibility (works on Windows too)
-    Command::new(cmd).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new(cmd).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 fn run_code_analysis() {
