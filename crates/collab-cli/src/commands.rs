@@ -28,7 +28,7 @@ pub fn init(doc_id: &str, user_id: &str, state_file: Option<&Path>) -> anyhow::R
         let state = DocumentState {
             doc_id: doc_id.to_string(),
             user_id: user_id.to_string(),
-            role: Role::Owner,
+            role: "owner".to_string(),
         };
         fs::write(path, serde_json::to_string_pretty(&state)?)?;
     }
@@ -58,17 +58,8 @@ pub struct DocumentState {
     pub doc_id: String,
     /// The user ID.
     pub user_id: String,
-    /// User's role.
-    pub role: Role,
-}
-
-// ponytail: write-only enum — Role is serialized to state files but never read back for branching, remove when state file format changes
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Role {
-    /// Document owner/creator.
-    Owner,
-    /// Document collaborator.
-    Collaborator,
+    /// User's role (e.g. "owner", "collaborator").
+    pub role: String,
 }
 
 /// Generate a key package for joining a group.
@@ -205,7 +196,7 @@ pub fn join(
                 let state = DocumentState {
                     doc_id: invite.doc_id.clone(),
                     user_id: user_id.to_string(),
-                    role: Role::Collaborator,
+                    role: "collaborator".to_string(),
                 };
                 fs::write(path, serde_json::to_string_pretty(&state)?)?;
             }
