@@ -1,8 +1,29 @@
 //! Protocol message types for collaborative editing.
 //!
 //! This crate defines the message types exchanged between clients and the relay server.
+//!
+//! ## Vault-wide synchronisation
+//!
+//! Full vault sync is built on top of the existing [`ClientMessage::YrsUpdate`] /
+//! [`ServerMessage::YrsUpdate`] mechanism. A special document whose `doc_id` equals
+//! [`MANIFEST_DOC_ID`] carries a Yrs Map that tracks every file path and its
+//! alive/deleted state. Clients subscribe to this document on connect and react to
+//! updates by opening or closing documents in their local registry.
+//!
+//! No new relay-level message types are required: the manifest is just another
+//! Yrs document forwarded opaquely by the relay.
 
 use serde::{Deserialize, Serialize};
+
+/// The well-known document identifier for the vault manifest.
+///
+/// All clients participating in vault-wide sync must subscribe to this document
+/// immediately after identifying themselves. The manifest uses a Yrs Map (not
+/// Text) to store file paths and their alive/deleted state.
+///
+/// This constant mirrors [`collab_core::MANIFEST_DOC_ID`] so protocol consumers
+/// that do not depend on `collab-core` can still refer to the canonical value.
+pub const MANIFEST_DOC_ID: &str = "__vault_manifest__";
 
 /// Unique identifier for a document.
 pub type DocumentId = String;

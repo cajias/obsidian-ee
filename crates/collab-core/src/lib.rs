@@ -5,12 +5,17 @@
 //! - [`MlsDocumentGroup`]: MLS group operations for end-to-end encryption
 //! - [`EncryptedDocument`]: Combined encrypted collaborative document
 //! - [`DocumentRegistry`]: Multi-document session management with metadata tracking
+//! - [`VaultManifest`]: CRDT-backed file registry for full vault synchronisation
+//! - [`VaultSyncConfig`]: Settings controlling which files are included in sync
+//! - [`VaultSyncManager`]: Coordination layer between watcher, registry, and manifest
 
 mod connection;
 mod document;
 mod encryption;
 mod mls;
 mod registry;
+mod vault_manifest;
+mod vault_sync;
 
 pub use connection::{
     ConnectionAction, ConnectionConfig, ConnectionState, ConnectionStateMachine, RetryPolicy,
@@ -22,6 +27,8 @@ pub use registry::{
     DocumentEntry, DocumentMetadata, DocumentRegistry, DocumentVariant, EncryptionMetadata,
     RegistryError,
 };
+pub use vault_manifest::{VaultManifest, MANIFEST_DOC_ID};
+pub use vault_sync::{SyncAction, SyncActionKind, VaultSyncConfig, VaultSyncManager};
 
 /// Document identifier type.
 pub type DocumentId = String;
