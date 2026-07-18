@@ -2,7 +2,7 @@
 //!
 //! This crate defines the message types exchanged between clients and the relay server.
 //!
-//! ## Vault-wide synchronisation
+//! ## Vault-wide synchronization
 //!
 //! Full vault sync is built on top of the existing [`ClientMessage::YrsUpdate`] /
 //! [`ServerMessage::YrsUpdate`] mechanism. A special document whose `doc_id` equals

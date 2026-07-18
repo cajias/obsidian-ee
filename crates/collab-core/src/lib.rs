@@ -5,7 +5,7 @@
 //! - [`MlsDocumentGroup`]: MLS group operations for end-to-end encryption
 //! - [`EncryptedDocument`]: Combined encrypted collaborative document
 //! - [`DocumentRegistry`]: Multi-document session management with metadata tracking
-//! - [`VaultManifest`]: CRDT-backed file registry for full vault synchronisation
+//! - [`VaultManifest`]: CRDT-backed file registry for full vault synchronization
 //! - [`VaultSyncConfig`]: Settings controlling which files are included in sync
 //! - [`VaultSyncManager`]: Coordination layer between watcher, registry, and manifest
 

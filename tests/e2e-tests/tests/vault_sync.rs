@@ -1,4 +1,4 @@
-//! End-to-end tests for full vault synchronisation.
+//! End-to-end tests for full vault synchronization.
 //!
 //! These tests verify that [`VaultSyncManager`] and [`VaultManifest`] correctly
 //! implement the acceptance criteria from issue #4:

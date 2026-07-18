@@ -1,4 +1,4 @@
-//! Vault synchronisation configuration and manager.
+//! Vault synchronization configuration and manager.
 //!
 //! [`VaultSyncConfig`] controls *which* files are included in a collaborative
 //! session. [`VaultSyncManager`] acts as the coordination layer between the
@@ -11,7 +11,7 @@ use crate::registry::{DocumentRegistry, RegistryError};
 use crate::vault_manifest::{VaultManifest, MANIFEST_DOC_ID};
 use crate::DocumentId;
 
-/// Settings that control vault-wide synchronisation.
+/// Settings that control vault-wide synchronization.
 ///
 /// # Defaults
 ///
