@@ -53,56 +53,6 @@ pub enum DocumentVariant {
     Encrypted(Box<EncryptedDocument>),
 }
 
-impl DocumentVariant {
-    /// Returns true if this is an encrypted document.
-    #[must_use]
-    pub const fn is_encrypted(&self) -> bool {
-        matches!(self, Self::Encrypted(_))
-    }
-
-    /// Returns true if this is a plain document.
-    #[must_use]
-    pub const fn is_plain(&self) -> bool {
-        matches!(self, Self::Plain(_))
-    }
-
-    /// Returns a reference to the plain document, if this is a plain variant.
-    #[must_use]
-    pub const fn as_plain(&self) -> Option<&CollabDocument> {
-        match self {
-            Self::Plain(doc) => Some(doc),
-            Self::Encrypted(_) => None,
-        }
-    }
-
-    /// Returns a mutable reference to the plain document, if this is a plain variant.
-    #[must_use]
-    pub fn as_plain_mut(&mut self) -> Option<&mut CollabDocument> {
-        match self {
-            Self::Plain(doc) => Some(doc),
-            Self::Encrypted(_) => None,
-        }
-    }
-
-    /// Returns a reference to the encrypted document, if this is an encrypted variant.
-    #[must_use]
-    pub fn as_encrypted(&self) -> Option<&EncryptedDocument> {
-        match self {
-            Self::Encrypted(doc) => Some(doc.as_ref()),
-            Self::Plain(_) => None,
-        }
-    }
-
-    /// Returns a mutable reference to the encrypted document, if this is an encrypted variant.
-    #[must_use]
-    pub fn as_encrypted_mut(&mut self) -> Option<&mut EncryptedDocument> {
-        match self {
-            Self::Encrypted(doc) => Some(doc.as_mut()),
-            Self::Plain(_) => None,
-        }
-    }
-}
-
 /// Metadata about document encryption state.
 ///
 /// # Clone Semantics
@@ -124,7 +74,7 @@ pub struct EncryptionMetadata {
     user_id: String,
     /// Whether this user is the owner (creator) of the encrypted document.
     is_owner: bool,
-    /// The current MLS epoch (increments on membership changes).
+    // ponytail: duplicated epoch — EncryptedDocument already tracks this via MlsDocumentGroup, remove when registry delegates epoch reads to the document directly
     epoch: u64,
 }
 
@@ -1474,28 +1424,4 @@ mod tests {
         assert!(entry.encryption_metadata().is_none());
     }
 
-    #[test]
-    fn test_document_variant_convenience_methods() {
-        // Test plain variant
-        let plain_doc = CollabDocument::new("test".to_string());
-        let plain_variant = DocumentVariant::Plain(plain_doc);
-
-        assert!(plain_variant.is_plain());
-        assert!(!plain_variant.is_encrypted());
-        assert!(plain_variant.as_plain().is_some());
-        assert!(plain_variant.as_encrypted().is_none());
-
-        // Test encrypted variant
-        let encrypted_doc = EncryptedDocument::create("test", "alice").unwrap();
-        let mut encrypted_variant = DocumentVariant::Encrypted(Box::new(encrypted_doc));
-
-        assert!(encrypted_variant.is_encrypted());
-        assert!(!encrypted_variant.is_plain());
-        assert!(encrypted_variant.as_encrypted().is_some());
-        assert!(encrypted_variant.as_plain().is_none());
-
-        // Test mutable accessors
-        assert!(encrypted_variant.as_encrypted_mut().is_some());
-        assert!(encrypted_variant.as_plain_mut().is_none());
-    }
 }

@@ -248,12 +248,6 @@ impl Default for CollabCore {
     }
 }
 
-/// A simple greeting function to verify the WASM build works.
-#[wasm_bindgen]
-pub fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to collab-wasm.", name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,11 +277,6 @@ mod tests {
 
         core2.apply_update_internal(&update).unwrap();
         assert_eq!(core2.get_text(), "Hello from core1!");
-    }
-
-    #[test]
-    fn test_greet() {
-        assert_eq!(greet("Alice"), "Hello, Alice! Welcome to collab-wasm.");
     }
 
     #[test]

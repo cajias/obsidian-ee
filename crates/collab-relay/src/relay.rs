@@ -339,7 +339,20 @@ async fn run_accept_loop(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                handle_accept_result(result, &server);
+                match result {
+                    Ok((stream, peer_addr)) => {
+                        tracing::debug!("New connection from {}", peer_addr);
+                        let server = Arc::clone(&server);
+                        tokio::spawn(async move {
+                            if let Err(e) = server.handle_connection(stream).await {
+                                tracing::error!("Connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Accept error: {}", e);
+                    }
+                }
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("Shutting down server");
@@ -347,31 +360,6 @@ async fn run_accept_loop(
             }
         }
     }
-}
-
-/// Handle the result of accepting a new connection.
-fn handle_accept_result(
-    result: std::io::Result<(TcpStream, SocketAddr)>,
-    server: &Arc<RelayServer>,
-) {
-    let Ok((stream, peer_addr)) = result else {
-        if let Err(e) = &result {
-            tracing::error!("Accept error: {}", e);
-        }
-        return;
-    };
-    tracing::debug!("New connection from {}", peer_addr);
-    let server = Arc::clone(server);
-    spawn_connection_handler(server, stream);
-}
-
-/// Spawn a connection handler task.
-fn spawn_connection_handler(server: Arc<RelayServer>, stream: TcpStream) {
-    tokio::spawn(async move {
-        if let Err(e) = server.handle_connection(stream).await {
-            tracing::error!("Connection error: {}", e);
-        }
-    });
 }
 
 /// Send a "not identified" error message.

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use collab_core::{
     ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument,
-    MlsDocumentGroup, PendingMember,
+    MlsDocumentGroup,
 };
 use collab_proto::Invite;
 use futures::{SinkExt, StreamExt};
@@ -62,7 +62,7 @@ pub struct DocumentState {
     pub role: Role,
 }
 
-/// User's role in the document.
+// ponytail: write-only enum — Role is serialized to state files but never read back for branching, remove when state file format changes
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Role {
     /// Document owner/creator.
@@ -118,14 +118,6 @@ pub struct KeygenOutput {
     pub user_id: String,
     /// Base64-encoded key package.
     pub key_package: String,
-}
-
-/// State for a pending member waiting to join.
-pub struct PendingMemberState {
-    /// The pending member (must be kept for joining).
-    pub pending: PendingMember,
-    /// The serialized key package to send to the group owner.
-    pub key_package: Vec<u8>,
 }
 
 /// Create an invite for a new member.

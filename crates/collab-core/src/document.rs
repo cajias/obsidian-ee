@@ -2,7 +2,6 @@
 
 use crate::{DocumentId, Error, Result};
 use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, Text, TextRef, Transact};
 
 /// A collaborative document backed by Yrs CRDT.
@@ -13,8 +12,6 @@ pub struct CollabDocument {
     doc: Doc,
     /// Text content reference.
     text: TextRef,
-    /// State vector for tracking updates.
-    state_vector: Vec<u8>,
 }
 
 impl CollabDocument {
@@ -23,9 +20,8 @@ impl CollabDocument {
     pub fn new(id: DocumentId) -> Self {
         let doc = Doc::new();
         let text = doc.get_or_insert_text("content");
-        let state_vector = doc.transact().state_vector().encode_v1();
 
-        Self { id, doc, text, state_vector }
+        Self { id, doc, text }
     }
 
     /// Get the document identifier.
@@ -38,14 +34,12 @@ impl CollabDocument {
     pub fn insert(&mut self, index: u32, text: &str) {
         let mut txn = self.doc.transact_mut();
         self.text.insert(&mut txn, index, text);
-        self.state_vector = txn.state_vector().encode_v1();
     }
 
     /// Delete text starting at the specified index.
     pub fn delete(&mut self, index: u32, len: u32) {
         let mut txn = self.doc.transact_mut();
         self.text.remove_range(&mut txn, index, len);
-        self.state_vector = txn.state_vector().encode_v1();
     }
 
     /// Get the current text content.
@@ -62,23 +56,16 @@ impl CollabDocument {
         txn.encode_state_as_update_v1(&yrs::StateVector::default())
     }
 
-    /// Encode only the changes since the last sync.
-    #[must_use]
-    pub fn encode_update(&self) -> Vec<u8> {
-        self.encode_state()
-    }
-
     /// Apply an update from another document.
     ///
     /// # Errors
     ///
     /// Returns an error if the update cannot be applied.
     pub fn apply_update(&mut self, update: &[u8]) -> Result<()> {
-        let mut txn = self.doc.transact_mut();
-        txn.apply_update(yrs::Update::decode_v1(update).map_err(|e| Error::Yrs(e.to_string()))?)
+        self.doc
+            .transact_mut()
+            .apply_update(yrs::Update::decode_v1(update).map_err(|e| Error::Yrs(e.to_string()))?)
             .map_err(|e| Error::Yrs(e.to_string()))?;
-        self.state_vector = txn.state_vector().encode_v1();
-        drop(txn);
         Ok(())
     }
 }
@@ -114,7 +101,7 @@ mod tests {
         let mut doc_b = CollabDocument::new("test-doc".into());
 
         doc_a.insert(0, "Hello");
-        let update = doc_a.encode_update();
+        let update = doc_a.encode_state();
 
         doc_b.apply_update(&update).unwrap();
         assert_eq!(doc_b.get_content(), "Hello");
@@ -127,15 +114,15 @@ mod tests {
 
         // Both start with same state
         doc_a.insert(0, "Hello");
-        let update_a = doc_a.encode_update();
+        let update_a = doc_a.encode_state();
         doc_b.apply_update(&update_a).unwrap();
 
         // Concurrent edits
         doc_a.insert(5, " World");
         doc_b.insert(5, " Rust");
 
-        let alice_update = doc_a.encode_update();
-        let bob_update = doc_b.encode_update();
+        let alice_update = doc_a.encode_state();
+        let bob_update = doc_b.encode_state();
 
         doc_a.apply_update(&bob_update).unwrap();
         doc_b.apply_update(&alice_update).unwrap();

@@ -68,7 +68,7 @@ impl EncryptedDocument {
     ///
     /// Returns an error if encryption fails.
     pub fn get_encrypted_update(&mut self) -> Result<EncryptedOp> {
-        let update = self.doc.encode_update();
+        let update = self.doc.encode_state();
         let ciphertext = self.mls.encrypt(&update)?;
 
         Ok(EncryptedOp { ciphertext, epoch: self.mls.epoch() })
