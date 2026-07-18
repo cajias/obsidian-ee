@@ -84,7 +84,6 @@ pub struct CollabCore {
 /// Internal implementation (testable without WASM)
 impl CollabCore {
     /// Set the encryption key (32 bytes for AES-256).
-    /// This is an MVP implementation - will be replaced with MLS later.
     pub fn set_encryption_key_internal(&mut self, key: &[u8]) -> Result<(), CollabError> {
         if key.len() != 32 {
             return Err(CollabError::key_error("Key must be 32 bytes"));
@@ -107,7 +106,7 @@ impl CollabCore {
         let mut nonce_bytes = [0u8; 12];
         getrandom(&mut nonce_bytes)
             .map_err(|e| CollabError::encryption(format!("Failed to generate nonce: {}", e)))?;
-        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice; upgrade tracked separately
+        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext =
@@ -135,7 +134,7 @@ impl CollabCore {
             Aes256Gcm::new_from_slice(key).map_err(|e| CollabError::decryption(e.to_string()))?;
 
         let (nonce_bytes, encrypted) = ciphertext.split_at(12);
-        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice; upgrade tracked separately
+        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice
         let nonce = Nonce::from_slice(nonce_bytes);
 
         cipher.decrypt(nonce, encrypted).map_err(|e| CollabError::decryption(e.to_string()))
@@ -209,7 +208,6 @@ impl CollabCore {
     }
 
     /// Set the encryption key (32 bytes for AES-256).
-    /// This is an MVP implementation - will be replaced with MLS later.
     pub fn set_encryption_key(&mut self, key: &[u8]) -> Result<(), JsValue> {
         self.set_encryption_key_internal(key).map_err(Into::into)
     }

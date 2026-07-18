@@ -167,9 +167,6 @@ pub struct InviteResult {
 
 /// Join an existing collaborative document.
 ///
-/// Note: This is a simplified version. In a real implementation,
-/// we'd need to persist the `PendingMember` state from keygen.
-///
 /// # Errors
 ///
 /// Returns an error if joining fails.
