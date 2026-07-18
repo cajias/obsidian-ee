@@ -247,7 +247,7 @@ async fn process_single_event(
 
     // Determine event kind based on file existence and whether we knew about the file before.
     let kind = if path.exists() {
-        let mut known = known_files.lock().unwrap();
+        let mut known = known_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if known.contains(path) {
             VaultEventKind::Modified
         } else {
@@ -255,7 +255,7 @@ async fn process_single_event(
             VaultEventKind::Created
         }
     } else {
-        known_files.lock().unwrap().remove(path);
+        known_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(path);
         VaultEventKind::Deleted
     };
 

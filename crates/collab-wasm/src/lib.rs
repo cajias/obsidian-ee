@@ -67,10 +67,9 @@ impl std::error::Error for CollabError {}
 
 impl From<CollabError> for JsValue {
     fn from(err: CollabError) -> Self {
-        // Create a structured JS object with type and message fields
         let obj = js_sys::Object::new();
-        js_sys::Reflect::set(&obj, &"type".into(), &err.error_type.as_str().into()).unwrap();
-        js_sys::Reflect::set(&obj, &"message".into(), &err.message.into()).unwrap();
+        let _ = js_sys::Reflect::set(&obj, &"type".into(), &err.error_type.as_str().into());
+        let _ = js_sys::Reflect::set(&obj, &"message".into(), &err.message.into());
         obj.into()
     }
 }
