@@ -51,8 +51,7 @@ Send an encrypted CRDT update to all subscribers of a document.
   "type": "yrs_update",
   "doc_id": "my-document",
   "encrypted": [72, 101, 108, ...],
-  "epoch": 3,
-  "signature": [45, 67, 89, ...]
+  "epoch": 3
 }
 ```
 
@@ -61,7 +60,11 @@ Send an encrypted CRDT update to all subscribers of a document.
 | `doc_id` | string | Target document identifier |
 | `encrypted` | byte array | MLS-encrypted Yrs update (opaque to relay) |
 | `epoch` | u64 | MLS epoch when message was encrypted |
-| `signature` | byte array | Cryptographic signature for authenticity |
+
+Authenticity and replay protection are provided by MLS itself: the `encrypted`
+payload is an MLS application message, signed by the sender's credential and
+protected against replay by the MLS secret-tree generation counters. No
+separate transport-level signature field is used.
 
 #### `mls_handshake`
 Exchange MLS protocol messages for group key management.
@@ -121,12 +124,11 @@ Forwarded encrypted CRDT update from another client.
   "doc_id": "my-document",
   "from": "alice",
   "encrypted": [72, 101, 108, ...],
-  "epoch": 3,
-  "signature": [45, 67, 89, ...]
+  "epoch": 3
 }
 ```
 
-The `from` field identifies the sender. The `encrypted` and `signature` fields are passed through unchanged from the original client message.
+The `from` field identifies the sender. The `encrypted` field is passed through unchanged from the original client message.
 
 #### `mls_handshake`
 Forwarded MLS handshake message from another client.

@@ -72,7 +72,6 @@ The relay server is designed to have zero knowledge of document contents:
 - Encryption keys or secrets
 - CRDT operation details
 - Collaboration history or edits
-- Cryptographic signatures (opaque bytes)
 
 ### Implementation Guarantees
 
@@ -83,11 +82,10 @@ YrsUpdate {
     from: String,           // Relay reads this for routing
     encrypted: Vec<u8>,     // Relay passes through unchanged
     epoch: u64,             // Relay passes through unchanged
-    signature: Vec<u8>,     // Relay passes through unchanged
 }
 ```
 
-The relay deserializes only the JSON message envelope for routing. The `encrypted`, `signature`, and MLS `payload` fields are never inspected.
+The relay deserializes only the JSON message envelope for routing. The `encrypted` and MLS `payload` fields are never inspected. Message authenticity and replay protection live inside the MLS application message itself (signed by the sender's credential; replay-protected by secret-tree generation counters), not in a separate transport field.
 
 ## MLS Group Lifecycle
 

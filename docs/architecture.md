@@ -43,7 +43,7 @@ Additionally:
 flowchart TD
     A["Alice types 'Hello'"] --> B["1. CollabDocument (Yrs CRDT)<br/>Text inserted via Yrs transaction<br/>State vector updated<br/>Incremental update encoded (V1)"]
     B --> C["2. EncryptedDocument (MLS Layer)<br/>Yrs update encrypted with MLS group key<br/>Produces EncryptedOp { ciphertext, epoch }"]
-    C --> D["3. WebSocket Transport<br/>Serialized as ClientMessage::YrsUpdate (JSON)<br/>Contains: doc_id, encrypted, epoch, signature"]
+    C --> D["3. WebSocket Transport<br/>Serialized as ClientMessage::YrsUpdate (JSON)<br/>Contains: doc_id, encrypted, epoch"]
     D --> E["4. Relay Server<br/>Deserializes header (doc_id, from)<br/>Forwards to subscribers EXCEPT sender<br/>Never inspects encrypted payload"]
     E --> F["5. Bob's Client Receives ServerMessage::YrsUpdate<br/>MLS decryption with group key<br/>Yrs update applied to local document<br/>CRDT conflict resolution (automatic)"]
     F --> G["Both Alice and Bob have identical document state"]
@@ -173,12 +173,12 @@ Messages are scoped to their document ID. Subscribers to `doc-A` never receive m
 ```
 Client A (sender)
   │
-  ├─ ClientMessage::YrsUpdate { doc_id, encrypted, epoch, signature }
+  ├─ ClientMessage::YrsUpdate { doc_id, encrypted, epoch }
   │
   ▼
 RelayServer::handle_yrs_update()
   │
-  ├─ Wraps as ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch, signature }
+  ├─ Wraps as ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch }
   │
   ▼
 MessageRouter::route_message(doc_id, from_user, message)
