@@ -6,7 +6,27 @@ exists so a deferral can't quietly become permanent.
 
 ## Ledger
 
-**No `ponytail:` debt. Clean ledger.** (0 markers, 0 with no trigger.)
+### Deferred: fine-grained per-document `Subscribe` authorization
+
+**Ceiling:** the relay authorizes `Subscribe` only by *authenticated identity*
+(the optional `RELAY_AUTH_TOKEN` gate) plus resource caps — it does **not**
+verify that the subscriber is a member of the document's MLS group. Any
+authenticated client can therefore subscribe to any `doc_id`'s ciphertext
+stream and observe metadata (epochs, sender ids, sizes, timing).
+
+**Why deferred:** a zero-knowledge relay cannot see MLS group membership by
+design. Real enforcement needs a relay-checkable, signed subscription capability
+scoped to `doc_id`+epoch (a small capability-token scheme), which is a feature,
+not a cleanup. MLS already prevents non-members from decrypting content, and the
+residual metadata exposure is explicitly out of scope per `docs/security.md`.
+
+**Upgrade path:** issue members a signed subscription capability (e.g. HMAC or
+signature over `doc_id`+epoch from a group-derived key the relay can verify), and
+reject `Subscribe` messages that lack a valid capability.
+
+**Tracked in:** `TECH-DEBT-AUDIT.md` (the `Subscribe` medium finding).
+
+---
 
 The single tracked deferral — the empty `signature` field on `YrsUpdate` — was
 resolved on branch `claude/ponytail-tech-debt-f4xdy5`. See below for the record.

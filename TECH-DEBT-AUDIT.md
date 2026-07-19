@@ -6,8 +6,43 @@ each finding adversarially verified by an independent skeptic, then
 deduplicated and synthesized). 28 confirmed findings → 25 distinct after dedup:
 **4 high, 4 medium, ~17 low.**
 
-This is a discovery ledger only — nothing here is fixed yet. (The separate
-`PONYTAIL-DEBT.md` ledger is clean; the replay-protection work is done.)
+## Resolution status
+
+**All 25 findings below have been addressed on branch
+`claude/ponytail-tech-debt-f4xdy5`.** Summary:
+
+- **4 high** — resolved. Relay `Identify` now supports optional bearer-token
+  authentication (`RELAY_AUTH_TOKEN`); sessions are connection-id-scoped with
+  compare-and-remove teardown and explicit takeover on duplicate `Identify`
+  (fixes the impersonation/overwrite and reconnect-TOCTOU cluster); resource
+  bounds added (bounded per-client channels with slow-consumer disconnect,
+  1 MiB frame cap, global connection cap, subscription caps); and `OfflineQueue`
+  is wired into routing (subscriptions retained across disconnect, queued for
+  offline subscribers, drained on reconnect).
+- **4 medium** — resolved, with one documented residual. Unused AWS deps
+  removed; `cargo deny` runs as a real gate (all sections, no
+  `continue-on-error`, on PRs) with `deny.toml` migrated to schema v2;
+  `unregister_client` no longer creates empty subscription sets.
+  **Residual (tracked):** the `Subscribe` authorization finding is *mitigated*
+  (all operations require an authenticated identity behind the optional relay
+  token, and subscriptions are capped), but fine-grained per-document MLS
+  membership enforcement at a zero-knowledge relay requires a signed
+  subscription-capability scheme and is tracked in `PONYTAIL-DEBT.md`. Note
+  that MLS already prevents non-members from decrypting anything, so the residual
+  exposure is limited to metadata (which is explicitly out of scope, see
+  `docs/security.md`) plus frame injection (bounded by the size/rate caps).
+- **~17 low** — resolved. CLI base64 now errors on invalid input (via the
+  `base64` crate); the file-based invite carries `welcome`/`commit`/`epoch` and
+  `join` propagates real MLS failures; `connect` distinguishes graceful shutdown
+  from error; the dead `RegistryError::IsEncrypted` variant is removed; unused
+  deps (`bincode`, `serde_json`, `aws-sdk-lambda`) dropped and `tokio` features
+  narrowed; the real MSRV (1.87) is declared and CI-enforced; `deny.toml`
+  modernized; Docker images pinned, `redis`/`localstack` (now unused) removed,
+  healthcheck + resource limits added, `version:` key dropped; and the
+  nonexistent `infra/` CDK references were removed from the docs.
+
+The original discovery ledger follows. (The separate `PONYTAIL-DEBT.md` ledger
+tracks the one residual above; the replay-protection work is done.)
 
 **Overview:** The dominant risk cluster is the `collab-relay` server's session
 and resource handling. Because `Identify` is completely unauthenticated, an

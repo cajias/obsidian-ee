@@ -84,6 +84,8 @@ pub struct Invite {
     pub doc_id: DocumentId,
     pub welcome: Vec<u8>,
     pub commit: Vec<u8>,
+    pub epoch: u64,
+    pub relay_url: String,
 }
 ```
 
@@ -193,21 +195,22 @@ Document-based pub/sub routing. When a message arrives for a document, the route
 
 ```rust
 pub struct OfflineQueue {
-    queues: Arc<RwLock<HashMap<UserId, VecDeque<ServerMessage>>>>,
+    inner: Arc<RwLock<Inner>>,  // queues + insertion order
     max_per_user: usize,  // Default: 1000
+    max_users: usize,     // Default: 10_000
 }
 ```
 
-In-memory FIFO queue per user. When the queue exceeds `max_per_user`, the oldest messages are dropped. DynamoDB persistence is planned (SDK already imported).
+In-memory FIFO queue per user. Memory is bounded on two axes: `max_per_user` caps the messages retained for a single user (oldest dropped first), and `max_users` caps the number of distinct users tracked (the least-recently-inserted user's queue is evicted when full). A DynamoDB-backed implementation is planned, behind a future Cargo feature; it is not wired up today.
 
 ### Configuration
 
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
 | `RELAY_ADDR` | `0.0.0.0:8080` | Listen address |
+| `RELAY_AUTH_TOKEN` | - | Optional bearer token. If set, clients must present a matching `token` in their `Identify` message or the relay replies with an `Unauthorized` error. If unset, authentication is disabled. |
+| `RELAY_MAX_CONNECTIONS` | `10000` | Global cap on concurrent connections |
 | `RUST_LOG` | `collab_relay=debug` | Log level |
-| `DYNAMODB_ENDPOINT` | - | DynamoDB endpoint (for offline queue) |
-| `REDIS_URL` | - | Redis URL (for presence) |
 
 ### Dependencies
 
@@ -217,9 +220,10 @@ tokio-tungstenite = "0.24"
 serde = "1.0"
 serde_json = "1.0"
 collab-proto = { path = "../collab-proto" }
-aws-sdk-dynamodb = "1.104"  # Planned
 tracing = "0.1"
 ```
+
+The relay is a zero-knowledge, in-memory router with no AWS or Redis dependencies. Beyond the offline-queue bounds, it enforces connection-id-scoped sessions (a fresh `Identify` for the same `user_id` takes over and closes the prior session, while a stale connection cannot evict a newer one), bounded per-client channels (slow consumers are disconnected), a 1 MiB max WebSocket frame size, a global connection cap, and per-document / document-count subscription caps.
 
 ---
 
@@ -229,11 +233,11 @@ Minimal protocol definition crate (120 lines). Contains only data types and seri
 
 ### Types
 
-- `ClientMessage` - 5 variants (Identify, Subscribe, Unsubscribe, YrsUpdate, MlsHandshake)
+- `ClientMessage` - 5 variants (Identify, Subscribe, Unsubscribe, YrsUpdate, MlsHandshake). `Identify` carries an optional `token` field for relay authentication.
 - `ServerMessage` - 6 variants (Identified, Subscribed, Unsubscribed, YrsUpdate, MlsHandshake, Error)
 - `MlsMessageType` - 4 variants (KeyPackage, Welcome, Commit, Application)
-- `ErrorCode` - 5 variants
-- `Invite` - Out-of-band invitation structure
+- `ErrorCode` - includes `Unauthorized`, `LimitExceeded`, and `SessionReplaced`
+- `Invite` - Out-of-band invitation structure (`doc_id`, `welcome`, `commit`, `epoch`, `relay_url`)
 - `DocumentId` / `UserId` - Type aliases for `String`
 
 All enums use `#[serde(tag = "type", rename_all = "snake_case")]` for JSON serialization.
