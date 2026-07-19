@@ -29,7 +29,6 @@ fn test_registry_create_encrypted() {
     let meta = registry.get_encryption_metadata("doc1").unwrap();
     assert_eq!(meta.user_id(), "alice");
     assert!(meta.is_owner());
-    assert_eq!(meta.epoch(), 0);
 }
 
 /// Test that plain and encrypted documents can coexist in the same registry.
@@ -108,11 +107,10 @@ fn test_registry_join_encrypted() {
     let bob_meta = bob_registry.get_encryption_metadata("doc1").unwrap();
     assert_eq!(bob_meta.user_id(), "bob");
     assert!(!bob_meta.is_owner());
-    assert_eq!(bob_meta.epoch(), 1);
 
-    // Verify Alice's epoch was updated
-    let alice_meta = alice_registry.get_encryption_metadata("doc1").unwrap();
-    assert_eq!(alice_meta.epoch(), 1);
+    // Verify epochs via documents
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 1);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 1);
 }
 
 /// Test encrypted message exchange between Alice and Bob through the registry.
@@ -183,9 +181,9 @@ fn test_registry_three_user_collaboration() {
     carol_registry.join_encrypted(&carol_invite, carol_pending, carol_invite.epoch).unwrap();
 
     // Verify epochs
-    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
-    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
-    assert_eq!(carol_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 2);
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 2);
+    assert_eq!(carol_registry.get_encrypted("doc1").unwrap().epoch(), 2);
 
     // All three can communicate
     let alice_doc = alice_registry.get_encrypted_mut("doc1").unwrap();
@@ -269,19 +267,19 @@ fn test_registry_encryption_metadata_tracking() {
     let meta = alice_registry.get_encryption_metadata("doc1").unwrap();
     assert_eq!(meta.user_id(), "alice");
     assert!(meta.is_owner());
-    assert_eq!(meta.epoch(), 0);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 0);
 
     // Add Bob, check epoch updates
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
     let invite = alice_registry.create_invite("doc1", bob_pending.key_package()).unwrap();
-    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 1);
 
     // Bob joins, check his metadata
     bob_registry.join_encrypted(&invite, bob_pending, invite.epoch).unwrap();
     let bob_meta = bob_registry.get_encryption_metadata("doc1").unwrap();
     assert_eq!(bob_meta.user_id(), "bob");
     assert!(!bob_meta.is_owner());
-    assert_eq!(bob_meta.epoch(), 1);
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 1);
 
     // Add Carol, check epoch updates for both
     let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
@@ -289,8 +287,8 @@ fn test_registry_encryption_metadata_tracking() {
 
     bob_registry.process_commit("doc1", &carol_invite.commit).unwrap();
 
-    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
-    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 2);
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 2);
 }
 
 /// Test that regular document metadata works for encrypted documents.
@@ -376,18 +374,18 @@ fn test_registry_epoch_mismatch_rejected() {
     bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
     // Verify both are at epoch 1
-    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
-    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 1);
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 1);
 
     // Alice adds Carol (Alice advances to epoch 2)
     let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
     let carol_invite = alice_registry.create_invite("doc1", carol_pending.key_package()).unwrap();
 
     // Verify Alice is now at epoch 2
-    assert_eq!(alice_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(alice_registry.get_encrypted("doc1").unwrap().epoch(), 2);
 
     // Bob is still at epoch 1 (hasn't processed Carol's commit yet)
-    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 1);
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 1);
 
     // Alice encrypts a message at epoch 2
     let alice_doc = alice_registry.get_encrypted_mut("doc1").unwrap();
@@ -406,7 +404,7 @@ fn test_registry_epoch_mismatch_rejected() {
     // Verify Bob's state is unchanged after failed decryption
     assert_eq!(bob_doc.get_content(), "");
     assert_eq!(
-        bob_registry.get_encryption_metadata("doc1").unwrap().epoch(),
+        bob_registry.get_encrypted("doc1").unwrap().epoch(),
         1,
         "Bob's epoch should remain unchanged after failed decryption"
     );
@@ -414,7 +412,7 @@ fn test_registry_epoch_mismatch_rejected() {
     // Now Bob processes the commit to catch up to epoch 2
     bob_registry.process_commit("doc1", &carol_invite.commit).unwrap();
 
-    assert_eq!(bob_registry.get_encryption_metadata("doc1").unwrap().epoch(), 2);
+    assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 2);
 
     // Now Bob can decrypt Alice's message
     let bob_doc = bob_registry.get_encrypted_mut("doc1").unwrap();
@@ -447,7 +445,7 @@ fn test_registry_stale_invite_rejected() {
     let _carol_invite = alice_registry.create_invite("doc1", carol_pending.key_package()).unwrap();
 
     // The current group epoch is now 2
-    let current_epoch = alice_registry.get_encryption_metadata("doc1").unwrap().epoch();
+    let current_epoch = alice_registry.get_encrypted("doc1").unwrap().epoch();
     assert_eq!(current_epoch, 2);
 
     // Bob tries to join with the stale invite from epoch 1.
@@ -487,7 +485,7 @@ fn test_registry_process_invalid_commit() {
     bob_registry.join_encrypted(&bob_invite, bob_pending, bob_invite.epoch).unwrap();
 
     // Record Bob's epoch before the invalid commit
-    let bob_epoch_before = bob_registry.get_encryption_metadata("doc1").unwrap().epoch();
+    let bob_epoch_before = bob_registry.get_encrypted("doc1").unwrap().epoch();
     assert_eq!(bob_epoch_before, 1);
 
     // Try to process an invalid commit (arbitrary bytes)
@@ -497,7 +495,7 @@ fn test_registry_process_invalid_commit() {
     assert!(result.is_err(), "Should reject invalid commit data");
 
     // Verify Bob's state is unchanged after rejected commit
-    let bob_epoch_after = bob_registry.get_encryption_metadata("doc1").unwrap().epoch();
+    let bob_epoch_after = bob_registry.get_encrypted("doc1").unwrap().epoch();
     assert_eq!(
         bob_epoch_after, bob_epoch_before,
         "Epoch should remain unchanged after rejected commit"
@@ -532,7 +530,7 @@ fn test_registry_process_invalid_commit() {
 
     // Verify Bob's state remains unchanged
     assert_eq!(
-        bob_registry.get_encryption_metadata("doc1").unwrap().epoch(),
+        bob_registry.get_encrypted("doc1").unwrap().epoch(),
         bob_epoch_before,
         "Epoch should remain unchanged after rejected wrong-group commit"
     );

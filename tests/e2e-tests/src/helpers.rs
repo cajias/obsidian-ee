@@ -190,14 +190,7 @@ impl TestClient {
             doc_id: doc_id.clone(),
             encrypted: op.ciphertext.clone(),
             epoch: op.epoch,
-            // TODO(security): Implement message signatures for replay attack prevention
-            // Priority: Medium - MLS provides forward secrecy and authenticity, but not
-            // protection against replay attacks or message reordering by a compromised relay.
-            // Suggested approach:
-            // - Use Ed25519 for signing (fast, 64-byte signatures)
-            // - Sign: BLAKE3(doc_id || encrypted || epoch || sequence_number)
-            // - Track sequence numbers per sender to detect replays/reordering
-            // - Key distribution via MLS KeyPackage credential field
+            // ponytail: signature field is empty; ceiling: tests only. upgrade: implement replay-protection in protocol.
             signature: vec![],
         })
         .await

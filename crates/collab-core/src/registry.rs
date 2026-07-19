@@ -53,79 +53,16 @@ pub enum DocumentVariant {
     Encrypted(Box<EncryptedDocument>),
 }
 
-impl DocumentVariant {
-    /// Returns true if this is an encrypted document.
-    #[must_use]
-    pub const fn is_encrypted(&self) -> bool {
-        matches!(self, Self::Encrypted(_))
-    }
-
-    /// Returns true if this is a plain document.
-    #[must_use]
-    pub const fn is_plain(&self) -> bool {
-        matches!(self, Self::Plain(_))
-    }
-
-    /// Returns a reference to the plain document, if this is a plain variant.
-    #[must_use]
-    pub const fn as_plain(&self) -> Option<&CollabDocument> {
-        match self {
-            Self::Plain(doc) => Some(doc),
-            Self::Encrypted(_) => None,
-        }
-    }
-
-    /// Returns a mutable reference to the plain document, if this is a plain variant.
-    #[must_use]
-    pub fn as_plain_mut(&mut self) -> Option<&mut CollabDocument> {
-        match self {
-            Self::Plain(doc) => Some(doc),
-            Self::Encrypted(_) => None,
-        }
-    }
-
-    /// Returns a reference to the encrypted document, if this is an encrypted variant.
-    #[must_use]
-    pub fn as_encrypted(&self) -> Option<&EncryptedDocument> {
-        match self {
-            Self::Encrypted(doc) => Some(doc.as_ref()),
-            Self::Plain(_) => None,
-        }
-    }
-
-    /// Returns a mutable reference to the encrypted document, if this is an encrypted variant.
-    #[must_use]
-    pub fn as_encrypted_mut(&mut self) -> Option<&mut EncryptedDocument> {
-        match self {
-            Self::Encrypted(doc) => Some(doc.as_mut()),
-            Self::Plain(_) => None,
-        }
-    }
-}
-
 /// Metadata about document encryption state.
 ///
-/// # Clone Semantics
-///
-/// `EncryptionMetadata` derives [`Clone`] and produces a fully independent copy.
-/// All fields are simple owned types ([`String`], [`bool`], [`u64`]) — there are
-/// no `Arc` references, interior mutability, or shared state. Cloning is cheap
-/// (one heap allocation for the `user_id` string).
-///
 /// This struct holds **no cryptographic key material**. Keys live exclusively in
-/// [`MlsDocumentGroup`]. Cloning `EncryptionMetadata` therefore has no security
-/// implications — the clone is plain metadata.
-///
-/// Cloned instances track epoch independently; advancing the epoch on one copy
-/// does not affect the other.
+/// [`MlsDocumentGroup`].
 #[derive(Debug, Clone)]
 pub struct EncryptionMetadata {
     /// The user ID of the local participant.
     user_id: String,
     /// Whether this user is the owner (creator) of the encrypted document.
     is_owner: bool,
-    /// The current MLS epoch (increments on membership changes).
-    epoch: u64,
 }
 
 impl EncryptionMetadata {
@@ -138,7 +75,7 @@ impl EncryptionMetadata {
         if user_id.is_empty() {
             return Err(RegistryError::InvalidState("User ID cannot be empty".to_string()));
         }
-        Ok(Self { user_id, is_owner, epoch: 0 })
+        Ok(Self { user_id, is_owner })
     }
 
     /// The user ID of the local participant.
@@ -151,29 +88,6 @@ impl EncryptionMetadata {
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         self.is_owner
-    }
-
-    /// The current MLS epoch.
-    #[must_use]
-    pub const fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    /// Update the epoch.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RegistryError::InvalidState` if the new epoch is less than
-    /// the current epoch. Epochs must only increase (monotonicity).
-    fn set_epoch(&mut self, epoch: u64) -> Result<(), RegistryError> {
-        if epoch < self.epoch {
-            return Err(RegistryError::InvalidState(format!(
-                "Epoch regression: attempted to set epoch {} but current epoch is {}",
-                epoch, self.epoch
-            )));
-        }
-        self.epoch = epoch;
-        Ok(())
     }
 }
 
@@ -541,28 +455,7 @@ impl DocumentRegistry {
             RegistryError::MlsError(Arc::new(e))
         })?;
 
-        let mut entry = DocumentEntry::new_encrypted(doc, user_id.to_string(), true)?;
-
-        // Set the epoch from the document
-        let meta = entry
-            .encryption_metadata
-            .as_mut()
-            .ok_or_else(|| {
-                error!(document_id = %id, "Internal error: encrypted document missing encryption metadata");
-                RegistryError::InternalError(
-                    "Encrypted document missing encryption metadata".to_string(),
-                )
-            })?;
-        let doc = match &entry.variant {
-            DocumentVariant::Encrypted(d) => d,
-            DocumentVariant::Plain(_) => {
-                error!("Internal error: plain variant after encrypted document operation");
-                return Err(RegistryError::InternalError(
-                    "Document has plain variant after encrypted operation".to_string(),
-                ));
-            }
-        };
-        meta.set_epoch(doc.epoch())?;
+        let entry = DocumentEntry::new_encrypted(doc, user_id.to_string(), true)?;
 
         self.documents.insert(id.clone(), entry);
 
@@ -636,28 +529,7 @@ impl DocumentRegistry {
         })?;
 
         let epoch = doc.epoch();
-        let mut entry = DocumentEntry::new_encrypted(doc, user_id.clone(), false)?;
-
-        // Set the epoch from the document
-        let meta = entry
-            .encryption_metadata
-            .as_mut()
-            .ok_or_else(|| {
-                error!(document_id = %doc_id, "Internal error: encrypted document missing encryption metadata");
-                RegistryError::InternalError(
-                    "Encrypted document missing encryption metadata".to_string(),
-                )
-            })?;
-        let doc_ref = match &entry.variant {
-            DocumentVariant::Encrypted(d) => d,
-            DocumentVariant::Plain(_) => {
-                error!("Internal error: plain variant after encrypted document operation");
-                return Err(RegistryError::InternalError(
-                    "Document has plain variant after encrypted operation".to_string(),
-                ));
-            }
-        };
-        meta.set_epoch(doc_ref.epoch())?;
+        let entry = DocumentEntry::new_encrypted(doc, user_id.clone(), false)?;
 
         self.documents.insert(doc_id.clone(), entry);
 
@@ -745,20 +617,7 @@ impl DocumentRegistry {
             RegistryError::MlsError(Arc::new(e))
         })?;
 
-        // Use the invite's epoch directly (authoritative post-add_member epoch)
         let new_epoch = invite.epoch;
-
-        // Update epoch in metadata after adding member
-        let meta = entry
-            .encryption_metadata
-            .as_mut()
-            .ok_or_else(|| {
-                error!(document_id = %id, "Internal error: encrypted document missing encryption metadata");
-                RegistryError::InternalError(
-                    "Encrypted document missing encryption metadata".to_string(),
-                )
-            })?;
-        meta.set_epoch(new_epoch)?;
 
         info!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
               "Invite created successfully, epoch advanced");
@@ -798,18 +657,6 @@ impl DocumentRegistry {
         })?;
 
         let new_epoch = doc.epoch();
-
-        // Update epoch in metadata after processing commit
-        let meta = entry
-            .encryption_metadata
-            .as_mut()
-            .ok_or_else(|| {
-                error!(document_id = %id, "Internal error: encrypted document missing encryption metadata");
-                RegistryError::InternalError(
-                    "Encrypted document missing encryption metadata".to_string(),
-                )
-            })?;
-        meta.set_epoch(new_epoch)?;
 
         debug!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
                "Commit processed successfully, epoch updated");
@@ -1132,47 +979,12 @@ mod tests {
         let meta = EncryptionMetadata::new("alice".to_string(), true).unwrap();
         assert_eq!(meta.user_id(), "alice");
         assert!(meta.is_owner());
-        assert_eq!(meta.epoch(), 0);
     }
 
     #[test]
     fn test_encryption_metadata_rejects_empty_user_id() {
         let result = EncryptionMetadata::new(String::new(), true);
         assert!(matches!(result, Err(RegistryError::InvalidState(_))));
-    }
-
-    #[test]
-    fn test_encryption_metadata_epoch_update() {
-        let mut meta = EncryptionMetadata::new("bob".to_string(), false).unwrap();
-        assert_eq!(meta.epoch(), 0);
-        meta.set_epoch(5).unwrap();
-        assert_eq!(meta.epoch(), 5);
-    }
-
-    #[test]
-    fn test_encryption_metadata_epoch_monotonicity() {
-        let mut meta = EncryptionMetadata::new("alice".to_string(), true).unwrap();
-        assert_eq!(meta.epoch(), 0);
-
-        // Epoch can increase
-        meta.set_epoch(1).unwrap();
-        assert_eq!(meta.epoch(), 1);
-
-        meta.set_epoch(5).unwrap();
-        assert_eq!(meta.epoch(), 5);
-
-        // Epoch can stay the same
-        meta.set_epoch(5).unwrap();
-        assert_eq!(meta.epoch(), 5);
-
-        // Epoch regression is rejected
-        let result = meta.set_epoch(3);
-        assert!(
-            matches!(result, Err(RegistryError::InvalidState(_))),
-            "Epoch regression should be rejected"
-        );
-        // Epoch should remain unchanged after rejected regression
-        assert_eq!(meta.epoch(), 5);
     }
 
     // ==================== Phase 2: Create Encrypted ====================
@@ -1251,7 +1063,6 @@ mod tests {
 
         assert_eq!(meta.user_id(), "alice");
         assert!(meta.is_owner());
-        assert_eq!(meta.epoch(), 0);
     }
 
     // ==================== Phase 3: Join Encrypted ====================
@@ -1392,8 +1203,8 @@ mod tests {
         bob_registry.process_commit("doc-1", &carol_invite.commit).unwrap();
 
         // Bob's epoch should have advanced
-        let bob_meta = bob_registry.get_encryption_metadata("doc-1").unwrap();
-        assert!(bob_meta.epoch() > 1);
+        let bob_doc = bob_registry.get_encrypted("doc-1").unwrap();
+        assert!(bob_doc.epoch() > 1);
     }
 
     #[test]
@@ -1472,30 +1283,5 @@ mod tests {
         assert!(matches!(entry.variant(), DocumentVariant::Plain(_)));
         assert!(entry.document().is_some());
         assert!(entry.encryption_metadata().is_none());
-    }
-
-    #[test]
-    fn test_document_variant_convenience_methods() {
-        // Test plain variant
-        let plain_doc = CollabDocument::new("test".to_string());
-        let plain_variant = DocumentVariant::Plain(plain_doc);
-
-        assert!(plain_variant.is_plain());
-        assert!(!plain_variant.is_encrypted());
-        assert!(plain_variant.as_plain().is_some());
-        assert!(plain_variant.as_encrypted().is_none());
-
-        // Test encrypted variant
-        let encrypted_doc = EncryptedDocument::create("test", "alice").unwrap();
-        let mut encrypted_variant = DocumentVariant::Encrypted(Box::new(encrypted_doc));
-
-        assert!(encrypted_variant.is_encrypted());
-        assert!(!encrypted_variant.is_plain());
-        assert!(encrypted_variant.as_encrypted().is_some());
-        assert!(encrypted_variant.as_plain().is_none());
-
-        // Test mutable accessors
-        assert!(encrypted_variant.as_encrypted_mut().is_some());
-        assert!(encrypted_variant.as_plain_mut().is_none());
     }
 }

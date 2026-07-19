@@ -20,7 +20,7 @@ pub struct MlsDocumentGroup {
     /// The signature key pair.
     signature_keys: SignatureKeyPair,
     /// The credential with key.
-    credential_with_key: CredentialWithKey,
+    _credential_with_key: CredentialWithKey,
 }
 
 /// A pending member waiting to join a group.
@@ -123,7 +123,7 @@ impl PendingMember {
             group,
             crypto: self.crypto,
             signature_keys: self.signature_keys,
-            credential_with_key: self.credential_with_key,
+            _credential_with_key: self.credential_with_key,
         })
     }
 }
@@ -176,7 +176,7 @@ impl MlsDocumentGroup {
                 group,
                 crypto,
                 signature_keys,
-                credential_with_key,
+                _credential_with_key: credential_with_key,
             },
             key_package_bytes,
         ))
@@ -336,22 +336,6 @@ impl MlsDocumentGroup {
             }
             _ => Err(Error::Mls("Expected commit message".to_string())),
         }
-    }
-
-    /// Export the key package for sharing with others.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if key package creation fails.
-    pub fn export(&self) -> Result<Vec<u8>> {
-        let key_package = Self::create_key_package(
-            &self.crypto,
-            &self.signature_keys,
-            &self.credential_with_key,
-        )?;
-        key_package
-            .tls_serialize_detached()
-            .map_err(|e| Error::Mls(format!("Failed to serialize key package: {e:?}")))
     }
 }
 

@@ -490,7 +490,8 @@ async fn test_two_users_collaborate() {
             doc_id: doc_id.clone(),
             encrypted: alice_update.ciphertext.clone(),
             epoch: alice_update.epoch,
-            signature: vec![], // TODO: Add proper signatures in T12
+            // ponytail: signature field is empty; ceiling: tests only. upgrade: implement replay-protection in protocol.
+            signature: vec![],
         })
         .await
         .unwrap();
@@ -526,7 +527,7 @@ async fn test_two_users_collaborate() {
 /// implemented in the relay routing layer. The `OfflineMessageQueue` exists
 /// in `storage.rs` but needs to be integrated into the relay message handlers.
 #[tokio::test]
-#[ignore = "Requires offline queue integration (TODO: integrate storage::OfflineMessageQueue)"]
+#[ignore = "Requires offline queue integration"]
 #[allow(clippy::too_many_lines)]
 async fn test_offline_message_delivery() {
     // Skip this test until offline queue is integrated
@@ -613,8 +614,6 @@ async fn test_offline_message_delivery() {
     let _ = bob.recv().await.unwrap(); // Subscription confirmation
 
     // Bob should receive the queued messages
-    // Note: The relay should deliver offline messages on reconnect
-    // This may need adjustment based on the actual relay implementation
     let msg1 = bob.recv().await.unwrap();
     if let ServerMessage::YrsUpdate { encrypted, epoch, .. } = msg1 {
         let op = EncryptedOp { ciphertext: encrypted, epoch };

@@ -22,9 +22,7 @@ pub struct WatcherConfig {
 
 impl Default for WatcherConfig {
     fn default() -> Self {
-        let mut extensions = HashSet::new();
-        extensions.insert("md".to_string());
-        Self { extensions, debounce: Duration::from_millis(200) }
+        Self { extensions: HashSet::from(["md".to_string()]), debounce: Duration::from_millis(200) }
     }
 }
 
@@ -51,11 +49,7 @@ pub struct VaultEvent {
 /// Watches an Obsidian vault directory for file changes.
 #[derive(Debug)]
 pub struct VaultWatcher {
-    _vault_path: PathBuf,
-    _config: WatcherConfig,
-    // Keep the debouncer alive so it continues watching.
     _debouncer: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
-    // Signal the background task to stop.
     _stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -100,24 +94,9 @@ impl VaultWatcher {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
-        spawn_event_loop(
-            bridge_rx,
-            event_tx,
-            stop_rx,
-            config.extensions.clone(),
-            vault_path.clone(),
-            known_files,
-        );
+        spawn_event_loop(bridge_rx, event_tx, stop_rx, config.extensions, vault_path, known_files);
 
-        Ok((
-            Self {
-                _vault_path: vault_path,
-                _config: config,
-                _debouncer: debouncer,
-                _stop_tx: stop_tx,
-            },
-            event_rx,
-        ))
+        Ok((Self { _debouncer: debouncer, _stop_tx: stop_tx }, event_rx))
     }
 
     /// Stop watching and clean up resources.
@@ -138,16 +117,6 @@ impl VaultWatcher {
 /// A type alias for the debouncer result channel receiver.
 type BridgeReceiver = std::sync::mpsc::Receiver<notify_debouncer_mini::DebounceEventResult>;
 
-/// Result of polling the bridge channel for debounced events.
-enum BridgePoll {
-    /// A batch of debounced events was received.
-    Events(Vec<notify_debouncer_mini::DebouncedEvent>),
-    /// No events available yet; the caller should sleep briefly.
-    Empty,
-    /// The debouncer channel disconnected; the event loop should stop.
-    Disconnected,
-}
-
 /// Spawn a tokio task that bridges debouncer events into the async channel.
 fn spawn_event_loop(
     bridge_rx: BridgeReceiver,
@@ -158,70 +127,37 @@ fn spawn_event_loop(
     known_files: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
     tokio::spawn(async move {
-        loop {
+        'outer: loop {
             tokio::select! {
                 _ = &mut stop_rx => {
                     tracing::debug!("vault watcher stop signal received");
                     break;
                 }
                 () = tokio::task::yield_now() => {
-                    match poll_bridge(&bridge_rx) {
-                        BridgePoll::Events(events) => {
-                            if !forward_events(events, &event_tx, &extensions, &vault_root, &known_files).await {
-                                break;
+                    match bridge_rx.try_recv() {
+                        Ok(Ok(events)) => {
+                            for ev in events {
+                                if !process_single_event(&ev.path, &event_tx, &extensions, &vault_root, &known_files).await {
+                                    break 'outer;
+                                }
                             }
                         }
-                        BridgePoll::Empty => {
+                        Ok(Err(e)) => {
+                            tracing::warn!("notify error: {e}");
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
-                        BridgePoll::Disconnected => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            tracing::debug!("debouncer channel disconnected");
+                            break;
+                        }
                     }
                 }
             }
         }
     });
-}
-
-/// Try to receive debounced events from the bridge channel (non-blocking).
-fn poll_bridge(bridge_rx: &BridgeReceiver) -> BridgePoll {
-    match bridge_rx.try_recv() {
-        Ok(Ok(events)) => BridgePoll::Events(events),
-        Ok(Err(e)) => {
-            tracing::warn!("notify error: {e}");
-            BridgePoll::Empty
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => BridgePoll::Empty,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            tracing::debug!("debouncer channel disconnected");
-            BridgePoll::Disconnected
-        }
-    }
-}
-
-/// Forward a batch of debounced events as `VaultEvent`s.
-///
-/// Returns `false` if the event channel is closed and the loop should stop.
-async fn forward_events(
-    events: Vec<notify_debouncer_mini::DebouncedEvent>,
-    event_tx: &mpsc::Sender<VaultEvent>,
-    extensions: &HashSet<String>,
-    vault_root: &Path,
-    known_files: &Arc<Mutex<HashSet<PathBuf>>>,
-) -> bool {
-    for debounced_event in events {
-        if !process_single_event(
-            &debounced_event.path,
-            event_tx,
-            extensions,
-            vault_root,
-            known_files,
-        )
-        .await
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// Process a single debounced filesystem event.
@@ -247,7 +183,10 @@ async fn process_single_event(
 
     // Determine event kind based on file existence and whether we knew about the file before.
     let kind = if path.exists() {
-        let mut known = known_files.lock().unwrap();
+        let mut known = known_files.lock().unwrap_or_else(|e| {
+            tracing::warn!("known_files mutex was poisoned (recovering): {e}");
+            e.into_inner()
+        });
         if known.contains(path) {
             VaultEventKind::Modified
         } else {
@@ -255,7 +194,13 @@ async fn process_single_event(
             VaultEventKind::Created
         }
     } else {
-        known_files.lock().unwrap().remove(path);
+        known_files
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("known_files mutex was poisoned (recovering): {e}");
+                e.into_inner()
+            })
+            .remove(path);
         VaultEventKind::Deleted
     };
 

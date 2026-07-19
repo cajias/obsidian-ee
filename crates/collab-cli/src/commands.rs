@@ -4,8 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use collab_core::{
-    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument,
-    MlsDocumentGroup, PendingMember,
+    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument, MlsDocumentGroup,
 };
 use collab_proto::Invite;
 use futures::{SinkExt, StreamExt};
@@ -28,7 +27,7 @@ pub fn init(doc_id: &str, user_id: &str, state_file: Option<&Path>) -> anyhow::R
         let state = DocumentState {
             doc_id: doc_id.to_string(),
             user_id: user_id.to_string(),
-            role: Role::Owner,
+            role: "owner".to_string(),
         };
         fs::write(path, serde_json::to_string_pretty(&state)?)?;
     }
@@ -58,17 +57,8 @@ pub struct DocumentState {
     pub doc_id: String,
     /// The user ID.
     pub user_id: String,
-    /// User's role.
-    pub role: Role,
-}
-
-/// User's role in the document.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Role {
-    /// Document owner/creator.
-    Owner,
-    /// Document collaborator.
-    Collaborator,
+    /// User's role (e.g. "owner", "collaborator").
+    pub role: String,
 }
 
 /// Generate a key package for joining a group.
@@ -118,14 +108,6 @@ pub struct KeygenOutput {
     pub user_id: String,
     /// Base64-encoded key package.
     pub key_package: String,
-}
-
-/// State for a pending member waiting to join.
-pub struct PendingMemberState {
-    /// The pending member (must be kept for joining).
-    pub pending: PendingMember,
-    /// The serialized key package to send to the group owner.
-    pub key_package: Vec<u8>,
 }
 
 /// Create an invite for a new member.
@@ -184,9 +166,6 @@ pub struct InviteResult {
 
 /// Join an existing collaborative document.
 ///
-/// Note: This is a simplified version. In a real implementation,
-/// we'd need to persist the `PendingMember` state from keygen.
-///
 /// # Errors
 ///
 /// Returns an error if joining fails.
@@ -213,7 +192,7 @@ pub fn join(
                 let state = DocumentState {
                     doc_id: invite.doc_id.clone(),
                     user_id: user_id.to_string(),
-                    role: Role::Collaborator,
+                    role: "collaborator".to_string(),
                 };
                 fs::write(path, serde_json::to_string_pretty(&state)?)?;
             }

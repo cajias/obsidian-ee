@@ -67,10 +67,13 @@ impl std::error::Error for CollabError {}
 
 impl From<CollabError> for JsValue {
     fn from(err: CollabError) -> Self {
-        // Create a structured JS object with type and message fields
+        let fallback = err.to_string();
         let obj = js_sys::Object::new();
-        js_sys::Reflect::set(&obj, &"type".into(), &err.error_type.as_str().into()).unwrap();
-        js_sys::Reflect::set(&obj, &"message".into(), &err.message.into()).unwrap();
+        let type_set = js_sys::Reflect::set(&obj, &"type".into(), &err.error_type.as_str().into());
+        let msg_set = js_sys::Reflect::set(&obj, &"message".into(), &err.message.into());
+        if type_set.is_err() || msg_set.is_err() {
+            return JsValue::from_str(&fallback);
+        }
         obj.into()
     }
 }
@@ -85,7 +88,6 @@ pub struct CollabCore {
 /// Internal implementation (testable without WASM)
 impl CollabCore {
     /// Set the encryption key (32 bytes for AES-256).
-    /// This is an MVP implementation - will be replaced with MLS later.
     pub fn set_encryption_key_internal(&mut self, key: &[u8]) -> Result<(), CollabError> {
         if key.len() != 32 {
             return Err(CollabError::key_error("Key must be 32 bytes"));
@@ -108,7 +110,7 @@ impl CollabCore {
         let mut nonce_bytes = [0u8; 12];
         getrandom(&mut nonce_bytes)
             .map_err(|e| CollabError::encryption(format!("Failed to generate nonce: {}", e)))?;
-        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice; upgrade tracked separately
+        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext =
@@ -136,7 +138,7 @@ impl CollabCore {
             Aes256Gcm::new_from_slice(key).map_err(|e| CollabError::decryption(e.to_string()))?;
 
         let (nonce_bytes, encrypted) = ciphertext.split_at(12);
-        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice; upgrade tracked separately
+        #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice
         let nonce = Nonce::from_slice(nonce_bytes);
 
         cipher.decrypt(nonce, encrypted).map_err(|e| CollabError::decryption(e.to_string()))
@@ -210,7 +212,6 @@ impl CollabCore {
     }
 
     /// Set the encryption key (32 bytes for AES-256).
-    /// This is an MVP implementation - will be replaced with MLS later.
     pub fn set_encryption_key(&mut self, key: &[u8]) -> Result<(), JsValue> {
         self.set_encryption_key_internal(key).map_err(Into::into)
     }
@@ -249,12 +250,6 @@ impl Default for CollabCore {
     }
 }
 
-/// A simple greeting function to verify the WASM build works.
-#[wasm_bindgen]
-pub fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to collab-wasm.", name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,11 +279,6 @@ mod tests {
 
         core2.apply_update_internal(&update).unwrap();
         assert_eq!(core2.get_text(), "Hello from core1!");
-    }
-
-    #[test]
-    fn test_greet() {
-        assert_eq!(greet("Alice"), "Hello, Alice! Welcome to collab-wasm.");
     }
 
     #[test]
