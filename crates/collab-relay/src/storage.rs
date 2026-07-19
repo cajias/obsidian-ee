@@ -89,7 +89,6 @@ mod tests {
             from: from.into(),
             encrypted: vec![data],
             epoch: 1,
-            signature: vec![],
         }
     }
 

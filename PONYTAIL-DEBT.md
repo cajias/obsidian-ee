@@ -6,81 +6,71 @@ exists so a deferral can't quietly become permanent.
 
 ## Ledger
 
-| File:line | Simplified | Ceiling | Upgrade trigger |
-|---|---|---|---|
-| `tests/e2e-tests/src/helpers.rs:193` | `signature` field sent empty on `YrsUpdate` | tests only | implement replay-protection in protocol |
-| `tests/e2e-tests/tests/full_flow.rs:493` | `signature` field sent empty on `YrsUpdate` | tests only | implement replay-protection in protocol |
+**No `ponytail:` debt. Clean ledger.** (0 markers, 0 with no trigger.)
 
-**2 markers, 0 with no trigger.**
-
-Both markers describe the same underlying deferral (below).
+The single tracked deferral — the empty `signature` field on `YrsUpdate` — was
+resolved on branch `claude/ponytail-tech-debt-f4xdy5`. See below for the record.
 
 ---
 
-## Deferral: transport-level `signature` on `YrsUpdate`
+## Resolved: transport-level `signature` on `YrsUpdate`
 
-### Current state
+### The deferral (as it stood)
 
-The `signature: Vec<u8>` field is threaded through the protocol
-(`collab-proto/src/lib.rs:34,66`), the relay (`collab-relay/src/relay.rs:263`,
-`routing.rs`), and every client, but is **always empty and never verified** —
-`handle_yrs_update` passes it straight through to subscribers, and all send
-sites use `signature: vec![]`.
+The `signature: Vec<u8>` field was threaded through the protocol
+(`collab-proto`), the relay (`collab-relay`), and every client, but was
+**always empty and never verified** — the relay passed it through unchanged and
+every send site used `signature: vec![]`. Two `ponytail:` markers
+(`tests/e2e-tests/src/helpers.rs`, `tests/e2e-tests/tests/full_flow.rs`) named
+the upgrade path: *implement replay-protection in protocol*.
 
-### Why the field is redundant
+### Why the field was redundant
 
 MLS already covers authenticity. `MlsDocumentGroup::encrypt`
-(`collab-core/src/mls.rs:262`) calls
+(`collab-core/src/mls.rs`) calls
 `group.create_message(&crypto, &signature_keys, plaintext)`, producing an MLS
-`PrivateMessage` that is **already signed** by the sender's MLS credential and
-**verified** in `decrypt`'s `process_message`. A second transport-level
-signature adds nothing for integrity or sender authenticity.
+`PrivateMessage` that is already signed by the sender's MLS credential and
+verified in `decrypt`'s `process_message`. The genuine gap was **replay
+protection**, not authenticity.
 
-| Property | Status |
-|---|---|
-| Confidentiality | ✅ MLS `PrivateMessage` |
-| Sender authenticity / integrity | ✅ MLS-signed, verified on decrypt |
-| Replay / reorder protection | ❌ missing at the app layer |
+### Resolution — Option B: lean on MLS generation counters
 
-The genuine gap named by the marker (`implement replay-protection`) is **replay
-protection**: a relay or on-path attacker can re-send a captured `YrsUpdate`
-frame.
+An empirical probe against openmls 0.7.4 confirmed the secret tree assigns each
+application message a per-sender generation key and destroys it after a single
+use. Re-presenting the same ciphertext therefore fails deterministically with
+`SecretTreeError::SecretReuseError`
+(`ProcessMessageError::ValidationError(UnableToDecrypt(...))`), while legitimate
+out-of-order delivery within the retention window still succeeds.
 
-### Chosen upgrade path — Option B: lean on MLS generation counters
+Changes made:
 
-Rather than repurpose the `signature` field with a signed sequence number, rely
-on openmls' secret-tree ratchet, which already assigns each application message
-a per-sender generation and rejects reused generations within an epoch. Then
-**delete the now-purely-redundant `signature` field** from the protocol.
-
-Steps (TDD per `CLAUDE.md`: RED → GREEN → REFACTOR):
-
-1. **`collab-core/src/mls.rs`** — surface a replayed/stale application message
-   (a `process_message` failure caused by a consumed generation key) as a
-   distinct error, e.g. `Error::Replay`, instead of a generic MLS error.
-2. **`collab-core/src/encryption.rs`** — have `apply_encrypted_update` propagate
-   `Error::Replay` so callers can distinguish replay from corruption.
-3. **`collab-proto/src/lib.rs`** — remove `signature` from
+1. **`collab-core`** — added the `Error::Replay` variant and
+   `map_process_message_error`, which maps the specific `SecretReuseError` leaf
+   to `Error::Replay` and leaves every other decrypt failure as `Error::Mls`.
+   `decrypt` (and therefore `apply_encrypted_update`) now surfaces replays as a
+   distinct, typed error. Covered by `test_replay_is_rejected` and
+   `test_out_of_order_within_window_is_accepted`.
+2. **`collab-proto`** — removed the now-redundant `signature` field from
    `ClientMessage::YrsUpdate` and `ServerMessage::YrsUpdate`.
-4. **`collab-relay`** — drop the `signature` parameter from `handle_yrs_update`
-   and every `signature: vec![]` construction in `relay.rs` / `routing.rs`.
-   Relay stays zero-knowledge; no verification moves server-side.
-5. **Tests** — add a RED test that captures an encrypted op and replays it,
-   asserting `Error::Replay`; remove the two `ponytail:` markers and their
-   `signature: vec![]` lines in `helpers.rs` and `full_flow.rs`.
-6. **Verify** — `cargo test --workspace`, `cargo lint`, `cargo fmt --all`, and
-   the local e2e flow.
+3. **`collab-relay`** — dropped the `signature` parameter from
+   `handle_yrs_update` and every `signature: vec![]` construction in
+   `relay.rs`, `routing.rs`, and `storage.rs`. The relay stays zero-knowledge;
+   no verification moved server-side.
+4. **Tests** — removed both `ponytail:` markers and their `signature: vec![]`
+   lines, and updated the relay integration test that asserted signature
+   round-trip.
 
-### Risk / scope
+### Caveat (documented, not a defect)
 
-- Protocol wire-format change (field removal): all peers upgrade together —
-  acceptable pre-1.0.
-- Verify openmls' out-of-order key-retention window matches the replay
-  guarantee we want to advertise; document it in the RED test.
-- No infra/CDK changes.
+An aged-out generation (`TooDistantInThePast`) also surfaces as
+`UnableToDecrypt`, so the app distinguishes *exact replay* (`SecretReuseError`
+→ `Error::Replay`) but not *replay vs. too-old-window* in general. Replay
+**rejection** is a hard cryptographic property of the secret tree; only the
+error *classification* of aged-out messages is coarser, which is acceptable —
+those are still rejected, just as generic MLS errors.
 
-### Definition of done
+### Verification
 
-Both `ponytail:` markers deleted, `signature` field gone from the protocol, and
-a passing replay-rejection test. Re-running `/ponytail-debt` then reports
-`No ponytail: debt. Clean ledger.`
+`cargo build --workspace`, `cargo test --workspace` (all suites green,
+including the two new replay tests), `cargo lint`, and `cargo fmt --all` all
+pass. Re-running `/ponytail-debt` reports `No ponytail: debt. Clean ledger.`

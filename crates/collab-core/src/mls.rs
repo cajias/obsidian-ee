@@ -1,6 +1,7 @@
 //! MLS (Messaging Layer Security) group operations for E2E encryption.
 
 use crate::{Error, Result};
+use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::tls_codec::{Deserialize, Serialize};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -8,6 +9,28 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 
 /// The ciphersuite to use for MLS operations.
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+/// Maps a `process_message` failure to a crate [`Error`], distinguishing a
+/// replayed message from other decryption failures.
+///
+/// The MLS secret tree assigns each application message a per-sender
+/// generation key and destroys it after a single use. Re-presenting the same
+/// message therefore surfaces as `SecretReuseError`, which is mapped to
+/// [`Error::Replay`]. A message whose generation has aged out of the retention
+/// window (`TooDistantInThePast`) is a different error and remains a generic
+/// [`Error::Mls`].
+fn map_process_message_error<S: std::fmt::Debug>(err: &ProcessMessageError<S>) -> Error {
+    if matches!(
+        err,
+        ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+            MessageDecryptionError::SecretTreeError(SecretTreeError::SecretReuseError)
+        ))
+    ) {
+        Error::Replay
+    } else {
+        Error::Mls(format!("Failed to process message: {err:?}"))
+    }
+}
 
 /// An MLS group for a document, managing encryption keys and group membership.
 pub struct MlsDocumentGroup {
@@ -287,7 +310,7 @@ impl MlsDocumentGroup {
                     .try_into_protocol_message()
                     .map_err(|_| Error::Mls("Expected protocol message".to_string()))?,
             )
-            .map_err(|e| Error::Mls(format!("Failed to process message: {e:?}")))?;
+            .map_err(|e| map_process_message_error(&e))?;
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(app_msg.into_bytes()),
@@ -412,6 +435,44 @@ mod tests {
         // Bob decrypts
         let decrypted = bob.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_replay_is_rejected() {
+        // Alice creates a group; Bob joins.
+        let (mut alice, _) = MlsDocumentGroup::create("alice").unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let bob_kp = bob_pending.key_package().to_vec();
+        let (_commit, welcome) = alice.add_member(&bob_kp).unwrap();
+        let mut bob = bob_pending.join(&welcome).unwrap();
+
+        let ciphertext = alice.encrypt(b"replay me").unwrap();
+
+        // First delivery succeeds.
+        assert_eq!(bob.decrypt(&ciphertext).unwrap(), b"replay me");
+
+        // Re-presenting the exact same ciphertext must be rejected as a replay,
+        // not surfaced as a generic MLS error.
+        let err = bob.decrypt(&ciphertext).unwrap_err();
+        assert!(matches!(err, Error::Replay), "expected Error::Replay on replay, got {err:?}");
+    }
+
+    #[test]
+    fn test_out_of_order_within_window_is_accepted() {
+        // Replay protection must not break legitimate out-of-order delivery:
+        // the MLS secret tree retains a bounded window of past generations.
+        let (mut alice, _) = MlsDocumentGroup::create("alice").unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let bob_kp = bob_pending.key_package().to_vec();
+        let (_commit, welcome) = alice.add_member(&bob_kp).unwrap();
+        let mut bob = bob_pending.join(&welcome).unwrap();
+
+        let m1 = alice.encrypt(b"message-one").unwrap();
+        let m2 = alice.encrypt(b"message-two").unwrap();
+
+        // Deliver in reverse order; both must decrypt successfully.
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"message-two");
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"message-one");
     }
 
     #[test]

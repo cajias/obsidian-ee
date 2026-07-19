@@ -154,7 +154,6 @@ mod tests {
             from: "alice".into(),
             encrypted: vec![1, 2, 3],
             epoch: 1,
-            signature: vec![],
         };
 
         let sent = router.route_message("doc1", "alice", message).await;
@@ -195,7 +194,6 @@ mod tests {
             from: "alice".into(),
             encrypted: vec![1, 2, 3],
             epoch: 1,
-            signature: vec![],
         };
 
         let sent = router.route_message("doc1", "alice", message).await;
@@ -221,7 +219,6 @@ mod tests {
             from: "alice".into(),
             encrypted: vec![1, 2, 3],
             epoch: 1,
-            signature: vec![],
         };
 
         let sent = router.route_message("doc1", "alice", message).await;
@@ -252,7 +249,6 @@ mod tests {
             from: "alice".into(),
             encrypted: vec![1, 2, 3],
             epoch: 1,
-            signature: vec![],
         };
 
         let sent = router.route_message("doc1", "alice", message).await;
@@ -286,7 +282,6 @@ mod tests {
             from: "alice".into(),
             encrypted: vec![1],
             epoch: 1,
-            signature: vec![],
         };
         router.route_message("doc1", "alice", msg1).await;
 
@@ -300,7 +295,6 @@ mod tests {
             from: "alice".into(),
             encrypted: vec![2],
             epoch: 1,
-            signature: vec![],
         };
         router.route_message("doc2", "alice", msg2).await;
 

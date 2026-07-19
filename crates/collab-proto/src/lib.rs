@@ -30,8 +30,6 @@ pub enum ClientMessage {
         encrypted: Vec<u8>,
         /// MLS epoch for key rotation tracking.
         epoch: u64,
-        /// Signature for authenticity.
-        signature: Vec<u8>,
     },
 
     /// MLS handshake message (welcome, commit, etc.).
@@ -58,13 +56,7 @@ pub enum ServerMessage {
     Unsubscribed { doc_id: DocumentId },
 
     /// Forwarded Yrs update from another user.
-    YrsUpdate {
-        doc_id: DocumentId,
-        from: UserId,
-        encrypted: Vec<u8>,
-        epoch: u64,
-        signature: Vec<u8>,
-    },
+    YrsUpdate { doc_id: DocumentId, from: UserId, encrypted: Vec<u8>, epoch: u64 },
 
     /// Forwarded MLS handshake message.
     MlsHandshake {

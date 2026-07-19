@@ -47,6 +47,14 @@ pub enum Error {
     /// Invalid state error.
     #[error("Invalid state: {0}")]
     InvalidState(String),
+
+    /// A replayed message was detected and rejected.
+    ///
+    /// Returned when a previously-processed encrypted update is presented
+    /// again. Replay protection is provided by the MLS secret tree, which
+    /// destroys each per-sender generation key after a single use.
+    #[error("Replayed message rejected")]
+    Replay,
 }
 
 /// Result type for collab-core operations.
