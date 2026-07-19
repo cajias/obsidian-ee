@@ -93,7 +93,7 @@ async fn send_identify(
     >,
     user_id: &str,
 ) {
-    let msg = ClientMessage::Identify { user_id: user_id.to_string() };
+    let msg = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
     let json = serde_json::to_string(&msg)
         .unwrap_or_else(|e| panic!("Failed to serialize Identify message for {user_id}: {e}"));
 
@@ -361,7 +361,7 @@ async fn test_app_layer_error_after_identify_triggers_retry() {
     let (user_id, _doc_id) = extract_identify_subscribe(&action);
 
     // Send Identify message
-    let msg = ClientMessage::Identify { user_id: user_id.clone() };
+    let msg = ClientMessage::Identify { user_id: user_id.clone(), token: None };
     let json = serde_json::to_string(&msg)
         .unwrap_or_else(|e| panic!("Failed to serialize Identify for {user_id}: {e}"));
     ws.send(Message::Text(json)).await.unwrap_or_else(|e| panic!("Failed to send Identify: {e}"));

@@ -65,7 +65,7 @@ impl TestClient {
 
 /// Helper to identify a client.
 async fn identify(client: &mut TestClient, user_id: &str) {
-    client.send(ClientMessage::Identify { user_id: user_id.into() }).await;
+    client.send(ClientMessage::Identify { user_id: user_id.into(), token: None }).await;
     let response = client.recv().await;
     assert!(matches!(
         response,
@@ -135,7 +135,7 @@ async fn test_multiple_clients_concurrent_connect() {
                 let (mut write, mut read) = ws.split();
 
                 // Identify
-                let msg = ClientMessage::Identify { user_id: format!("user{i}") };
+                let msg = ClientMessage::Identify { user_id: format!("user{i}"), token: None };
                 let json = serde_json::to_string(&msg).unwrap();
                 write.send(Message::Text(json)).await.unwrap();
 

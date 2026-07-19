@@ -1,4 +1,18 @@
-//! Persistent storage for offline message queuing.
+//! Storage for offline message queuing.
+//!
+//! Messages destined for a subscribed-but-disconnected user are buffered here
+//! and drained when the user reconnects, so briefly-offline peers do not lose
+//! updates (which would cause the CRDT replicas to diverge permanently).
+//!
+//! This is an in-memory implementation. Memory is bounded on two axes to keep
+//! the zero-knowledge relay safe from a client that queues without ever
+//! reconnecting:
+//! - `max_per_user` caps the messages retained for a single user (oldest first).
+//! - `max_users` caps the number of distinct users tracked; when full, the
+//!   least-recently-inserted user's queue is evicted.
+//!
+//! A `DynamoDB`-backed implementation can be introduced later behind a Cargo
+//! feature (see `Cargo.toml`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -6,70 +20,124 @@ use std::sync::Arc;
 use collab_proto::{ServerMessage, UserId};
 use tokio::sync::RwLock;
 
-/// Stores messages for offline clients.
-///
-/// In-memory implementation for now; will be backed by `DynamoDB` later.
-pub struct OfflineQueue {
+/// Internal, lock-guarded state for [`OfflineQueue`].
+#[derive(Default)]
+struct Inner {
     /// Queued messages per user.
-    queues: Arc<RwLock<HashMap<UserId, VecDeque<ServerMessage>>>>,
-    /// Maximum messages to store per user (prevents unbounded memory growth).
+    queues: HashMap<UserId, VecDeque<ServerMessage>>,
+    /// Insertion order of the currently-tracked users, used to evict the
+    /// least-recently-inserted user when `max_users` is exceeded. Kept in sync
+    /// with `queues`: every key in `queues` appears exactly once here.
+    order: VecDeque<UserId>,
+}
+
+/// Evict the least-recently-inserted user's queue while at or above capacity.
+fn evict_if_full(inner: &mut Inner, max_users: usize) {
+    while inner.queues.len() >= max_users {
+        let Some(oldest) = inner.order.pop_front() else {
+            break;
+        };
+        if inner.queues.remove(&oldest).is_some() {
+            tracing::warn!(evicted = %oldest, "Offline queue at capacity; evicted oldest user");
+            break;
+        }
+    }
+}
+
+/// Stores messages for offline clients.
+pub struct OfflineQueue {
+    inner: Arc<RwLock<Inner>>,
+    /// Maximum messages to store per user (prevents unbounded per-user growth).
     max_per_user: usize,
+    /// Maximum number of distinct users tracked (prevents unbounded key growth).
+    max_users: usize,
 }
 
 impl OfflineQueue {
     /// Default maximum messages per user.
     pub const DEFAULT_MAX_PER_USER: usize = 1000;
 
+    /// Default maximum number of distinct users tracked.
+    pub const DEFAULT_MAX_USERS: usize = 10_000;
+
     /// Create a new offline queue with default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            queues: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(Inner::default())),
             max_per_user: Self::DEFAULT_MAX_PER_USER,
+            max_users: Self::DEFAULT_MAX_USERS,
         }
     }
 
     /// Create a new offline queue with a custom max messages per user.
     #[must_use]
     pub fn with_max_per_user(max_per_user: usize) -> Self {
-        Self { queues: Arc::new(RwLock::new(HashMap::new())), max_per_user }
+        Self {
+            inner: Arc::new(RwLock::new(Inner::default())),
+            max_per_user,
+            max_users: Self::DEFAULT_MAX_USERS,
+        }
+    }
+
+    /// Create a new offline queue with custom per-user and user-count caps.
+    #[must_use]
+    pub fn with_limits(max_per_user: usize, max_users: usize) -> Self {
+        Self { inner: Arc::new(RwLock::new(Inner::default())), max_per_user, max_users }
     }
 
     /// Queue a message for an offline user.
     ///
-    /// If the queue exceeds `max_per_user`, the oldest message is dropped.
+    /// If the user's queue exceeds `max_per_user`, the oldest message is
+    /// dropped. If tracking this user would exceed `max_users`, the
+    /// least-recently-inserted user's entire queue is evicted first.
     pub async fn enqueue(&self, user_id: &str, message: ServerMessage) {
-        let mut queues = self.queues.write().await;
-        let queue = queues.entry(user_id.to_string()).or_default();
+        let mut inner = self.inner.write().await;
 
+        if !inner.queues.contains_key(user_id) {
+            evict_if_full(&mut inner, self.max_users);
+            inner.order.push_back(user_id.to_string());
+        }
+
+        let queue = inner.queues.entry(user_id.to_string()).or_default();
         queue.push_back(message);
-
-        // Enforce max limit
         while queue.len() > self.max_per_user {
             queue.pop_front();
         }
-        drop(queues);
+        drop(inner);
     }
 
     /// Retrieve and clear all queued messages for a user.
     ///
     /// Returns messages in the order they were queued (FIFO).
     pub async fn drain(&self, user_id: &str) -> Vec<ServerMessage> {
-        let mut queues = self.queues.write().await;
-        queues.remove(user_id).map(Vec::from).unwrap_or_default()
+        let mut inner = self.inner.write().await;
+        let drained = inner.queues.remove(user_id).map(Vec::from);
+        if drained.is_some() {
+            inner.order.retain(|u| u != user_id);
+        }
+        drop(inner);
+        drained.unwrap_or_default()
     }
 
     /// Check if there are queued messages for a user.
     pub async fn has_messages(&self, user_id: &str) -> bool {
-        let queues = self.queues.read().await;
-        queues.get(user_id).is_some_and(|q| !q.is_empty())
+        let inner = self.inner.read().await;
+        inner.queues.get(user_id).is_some_and(|q| !q.is_empty())
     }
 
     /// Get the number of queued messages for a user.
     #[cfg(test)]
     pub async fn message_count(&self, user_id: &str) -> usize {
-        let queues = self.queues.read().await;
-        queues.get(user_id).map_or(0, VecDeque::len)
+        let inner = self.inner.read().await;
+        inner.queues.get(user_id).map_or(0, VecDeque::len)
+    }
+
+    /// Get the number of distinct users currently tracked.
+    #[cfg(test)]
+    pub async fn tracked_users(&self) -> usize {
+        let inner = self.inner.read().await;
+        inner.queues.len()
     }
 }
 
@@ -179,5 +247,39 @@ mod tests {
 
         assert!(!queue.has_messages("nobody").await);
         assert!(queue.drain("nobody").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_max_users_evicts_oldest() {
+        // Capacity for 2 users, 10 messages each.
+        let queue = OfflineQueue::with_limits(10, 2);
+
+        queue.enqueue("alice", make_update("doc1", "x", 1)).await;
+        queue.enqueue("bob", make_update("doc1", "x", 2)).await;
+        assert_eq!(queue.tracked_users().await, 2);
+
+        // Adding a third user evicts the oldest (alice).
+        queue.enqueue("carol", make_update("doc1", "x", 3)).await;
+        assert_eq!(queue.tracked_users().await, 2);
+        assert!(!queue.has_messages("alice").await, "oldest user should be evicted");
+        assert!(queue.has_messages("bob").await);
+        assert!(queue.has_messages("carol").await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_frees_capacity_and_order() {
+        let queue = OfflineQueue::with_limits(10, 2);
+
+        queue.enqueue("alice", make_update("doc1", "x", 1)).await;
+        queue.enqueue("bob", make_update("doc1", "x", 2)).await;
+
+        // Draining alice frees a slot; carol can be tracked without evicting bob.
+        let drained = queue.drain("alice").await;
+        assert_eq!(drained.len(), 1);
+
+        queue.enqueue("carol", make_update("doc1", "x", 3)).await;
+        assert_eq!(queue.tracked_users().await, 2);
+        assert!(queue.has_messages("bob").await, "bob must not be evicted after alice drained");
+        assert!(queue.has_messages("carol").await);
     }
 }

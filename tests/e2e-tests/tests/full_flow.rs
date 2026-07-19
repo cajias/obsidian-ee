@@ -518,20 +518,14 @@ async fn test_two_users_collaborate() {
 /// This is critical for real-world usage where users may have intermittent
 /// connectivity or close their laptop while collaborating.
 ///
-/// Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
-/// Test offline message delivery - queued messages delivered on reconnect.
+/// The relay retains a disconnected subscriber's subscription and queues
+/// updates for them, draining the queue when they re-identify on reconnect.
 ///
-/// NOTE: This test requires offline queue integration which is not yet
-/// implemented in the relay routing layer. The `OfflineMessageQueue` exists
-/// in `storage.rs` but needs to be integrated into the relay message handlers.
+/// Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
 #[tokio::test]
-#[ignore = "Requires offline queue integration"]
+#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
 #[allow(clippy::too_many_lines)]
 async fn test_offline_message_delivery() {
-    // Skip this test until offline queue is integrated
-    if std::env::var("RUN_OFFLINE_TESTS").is_err() {
-        return;
-    }
     let relay_url = "ws://localhost:8080/ws";
     let doc_id: DocumentId = "test-doc-offline".to_string();
 
@@ -604,22 +598,23 @@ async fn test_offline_message_delivery() {
         .await
         .unwrap();
 
-    // Bob reconnects
+    // Bob reconnects. The queued updates are drained on Identify, so they may
+    // arrive before or after the Subscribe confirmation; re-subscribing is
+    // idempotent. Drain messages until Bob's content matches Alice's.
     let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
     bob.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await.unwrap();
-    let _ = bob.recv().await.unwrap(); // Subscription confirmation
 
-    // Bob should receive the queued messages
-    let msg1 = bob.recv().await.unwrap();
-    if let ServerMessage::YrsUpdate { encrypted, epoch, .. } = msg1 {
-        let op = EncryptedOp { ciphertext: encrypted, epoch };
-        bob_doc.apply_encrypted_update(&op).unwrap();
-    }
-
-    let msg2 = bob.recv().await.unwrap();
-    if let ServerMessage::YrsUpdate { encrypted, epoch, .. } = msg2 {
-        let op = EncryptedOp { ciphertext: encrypted, epoch };
-        bob_doc.apply_encrypted_update(&op).unwrap();
+    let expected = alice_doc.get_content();
+    let idle = std::time::Duration::from_secs(2);
+    while bob_doc.get_content() != expected {
+        match bob.try_recv(idle).await.unwrap() {
+            Some(ServerMessage::YrsUpdate { encrypted, epoch, .. }) => {
+                let op = EncryptedOp { ciphertext: encrypted, epoch };
+                bob_doc.apply_encrypted_update(&op).unwrap();
+            }
+            Some(_) => {} // Subscribed confirmation or other control message
+            None => panic!("Timed out before Bob caught up to Alice"),
+        }
     }
 
     // Verify Bob has caught up with Alice
