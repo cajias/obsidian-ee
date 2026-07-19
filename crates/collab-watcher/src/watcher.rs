@@ -94,22 +94,9 @@ impl VaultWatcher {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
-        spawn_event_loop(
-            bridge_rx,
-            event_tx,
-            stop_rx,
-            config.extensions,
-            vault_path,
-            known_files,
-        );
+        spawn_event_loop(bridge_rx, event_tx, stop_rx, config.extensions, vault_path, known_files);
 
-        Ok((
-            Self {
-                _debouncer: debouncer,
-                _stop_tx: stop_tx,
-            },
-            event_rx,
-        ))
+        Ok((Self { _debouncer: debouncer, _stop_tx: stop_tx }, event_rx))
     }
 
     /// Stop watching and clean up resources.
@@ -155,7 +142,10 @@ fn spawn_event_loop(
                                 }
                             }
                         }
-                        Ok(Err(e)) => tracing::warn!("notify error: {e}"),
+                        Ok(Err(e)) => {
+                            tracing::warn!("notify error: {e}");
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
@@ -193,7 +183,10 @@ async fn process_single_event(
 
     // Determine event kind based on file existence and whether we knew about the file before.
     let kind = if path.exists() {
-        let mut known = known_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut known = known_files.lock().unwrap_or_else(|e| {
+            tracing::warn!("known_files mutex was poisoned (recovering): {e}");
+            e.into_inner()
+        });
         if known.contains(path) {
             VaultEventKind::Modified
         } else {
@@ -201,7 +194,13 @@ async fn process_single_event(
             VaultEventKind::Created
         }
     } else {
-        known_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(path);
+        known_files
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("known_files mutex was poisoned (recovering): {e}");
+                e.into_inner()
+            })
+            .remove(path);
         VaultEventKind::Deleted
     };
 

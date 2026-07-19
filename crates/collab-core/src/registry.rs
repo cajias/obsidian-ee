@@ -987,7 +987,6 @@ mod tests {
         assert!(matches!(result, Err(RegistryError::InvalidState(_))));
     }
 
-
     // ==================== Phase 2: Create Encrypted ====================
 
     #[test]
@@ -1285,5 +1284,4 @@ mod tests {
         assert!(entry.document().is_some());
         assert!(entry.encryption_metadata().is_none());
     }
-
 }

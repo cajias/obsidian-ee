@@ -337,7 +337,6 @@ impl MlsDocumentGroup {
             _ => Err(Error::Mls("Expected commit message".to_string())),
         }
     }
-
 }
 
 #[cfg(test)]

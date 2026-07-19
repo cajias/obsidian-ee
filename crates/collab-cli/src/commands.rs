@@ -4,8 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use collab_core::{
-    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument,
-    MlsDocumentGroup,
+    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument, MlsDocumentGroup,
 };
 use collab_proto::Invite;
 use futures::{SinkExt, StreamExt};
