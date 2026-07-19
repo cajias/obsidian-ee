@@ -24,7 +24,6 @@ export interface YrsUpdateMessage {
     encrypted: number[];
     doc_id?: string;
     epoch?: number;
-    signature?: number[];
 }
 
 /**
@@ -430,7 +429,6 @@ export class CollabClient {
                 doc_id: this.config.docId,
                 encrypted: [...encrypted],
                 epoch: 0,
-                signature: [],
             });
         } catch (error) {
             console.error('Failed to send update:', error);
