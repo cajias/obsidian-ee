@@ -188,7 +188,6 @@ describe('Encrypted Collaboration Integration', () => {
                 type: 'yrs_update',
                 doc_id: 'doc1',
                 epoch: 0,
-                signature: [],
             });
             expect(updateMsg.encrypted).toBeDefined();
             expect(updateMsg.encrypted.length).toBeGreaterThan(0);
@@ -225,7 +224,6 @@ describe('Encrypted Collaboration Integration', () => {
                 from: 'user2',
                 encrypted: encryptedData,
                 epoch: 0,
-                signature: [],
             });
 
             expect(core.apply_update_encrypted).toHaveBeenCalled();
@@ -265,7 +263,6 @@ describe('Encrypted Collaboration Integration', () => {
                 from: 'user2',
                 encrypted: [1, 1, 1, 1, 68, 101, 99], // Mock encrypted data
                 epoch: 0,
-                signature: [],
             });
 
             expect(updateCallback).toHaveBeenCalledWith('Decrypted content');
@@ -307,7 +304,6 @@ describe('Encrypted Collaboration Integration', () => {
                     from: 'user2',
                     encrypted: [1, 2, 3, 4],
                     epoch: 0,
-                    signature: [],
                 });
             }).not.toThrow();
 
@@ -391,7 +387,6 @@ describe('Encrypted Collaboration Integration', () => {
                 from: 'user1',
                 encrypted: sentUpdate.encrypted,
                 epoch: 0,
-                signature: [],
             });
 
             expect(core2.apply_update_encrypted).toHaveBeenCalled();

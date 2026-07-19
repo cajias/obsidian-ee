@@ -490,8 +490,6 @@ async fn test_two_users_collaborate() {
             doc_id: doc_id.clone(),
             encrypted: alice_update.ciphertext.clone(),
             epoch: alice_update.epoch,
-            // ponytail: signature field is empty; ceiling: tests only. upgrade: implement replay-protection in protocol.
-            signature: vec![],
         })
         .await
         .unwrap();
@@ -591,7 +589,6 @@ async fn test_offline_message_delivery() {
             doc_id: doc_id.clone(),
             encrypted: update1.ciphertext.clone(),
             epoch: update1.epoch,
-            signature: vec![],
         })
         .await
         .unwrap();
@@ -603,7 +600,6 @@ async fn test_offline_message_delivery() {
             doc_id: doc_id.clone(),
             encrypted: update2.ciphertext.clone(),
             epoch: update2.epoch,
-            signature: vec![],
         })
         .await
         .unwrap();

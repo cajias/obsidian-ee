@@ -190,8 +190,6 @@ impl TestClient {
             doc_id: doc_id.clone(),
             encrypted: op.ciphertext.clone(),
             epoch: op.epoch,
-            // ponytail: signature field is empty; ceiling: tests only. upgrade: implement replay-protection in protocol.
-            signature: vec![],
         })
         .await
     }

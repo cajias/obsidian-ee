@@ -188,9 +188,8 @@ impl RelayServer {
             ClientMessage::Unsubscribe { doc_id } => {
                 self.handle_unsubscribe(user_id.as_ref(), tx, doc_id).await;
             }
-            ClientMessage::YrsUpdate { doc_id, encrypted, epoch, signature } => {
-                self.handle_yrs_update(user_id.as_ref(), tx, doc_id, encrypted, epoch, signature)
-                    .await;
+            ClientMessage::YrsUpdate { doc_id, encrypted, epoch } => {
+                self.handle_yrs_update(user_id.as_ref(), tx, doc_id, encrypted, epoch).await;
             }
             ClientMessage::MlsHandshake { doc_id, payload, message_type } => {
                 self.handle_mls_handshake(user_id.as_ref(), tx, doc_id, payload, message_type)
@@ -267,7 +266,6 @@ impl RelayServer {
         doc_id: String,
         encrypted: Vec<u8>,
         epoch: u64,
-        signature: Vec<u8>,
     ) {
         let Some(uid) = user_id else {
             send_not_identified_error(tx, "sending updates");
@@ -279,7 +277,6 @@ impl RelayServer {
             from: uid.clone(),
             encrypted,
             epoch,
-            signature,
         };
 
         self.router.route_message(&doc_id, uid, message).await;

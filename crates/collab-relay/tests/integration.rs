@@ -105,19 +105,17 @@ async fn test_full_flow_connect_identify_subscribe_exchange() {
             doc_id: "doc1".into(),
             encrypted: vec![1, 2, 3, 4, 5],
             epoch: 1,
-            signature: vec![0xAB, 0xCD],
         })
         .await;
 
     // Bob should receive the update from Alice
     let response = bob.recv().await;
     match response {
-        ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch, signature } => {
+        ServerMessage::YrsUpdate { doc_id, from, encrypted, epoch } => {
             assert_eq!(doc_id, "doc1");
             assert_eq!(from, "alice");
             assert_eq!(encrypted, vec![1, 2, 3, 4, 5]);
             assert_eq!(epoch, 1);
-            assert_eq!(signature, vec![0xAB, 0xCD]);
         }
         other => panic!("Expected YrsUpdate, got {other:?}"),
     }
@@ -200,7 +198,6 @@ async fn test_error_on_yrs_update_without_identify() {
             doc_id: "doc1".into(),
             encrypted: vec![1, 2, 3],
             epoch: 1,
-            signature: vec![],
         })
         .await;
 
