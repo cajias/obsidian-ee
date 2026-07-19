@@ -23,9 +23,6 @@ pub enum RegistryError {
     /// Document is not encrypted (attempted encrypted operation on plain doc).
     #[error("Document is not encrypted: {0}")]
     NotEncrypted(DocumentId),
-    /// Document is encrypted (attempted plain operation on encrypted doc).
-    #[error("Document is encrypted: {0}")]
-    IsEncrypted(DocumentId),
     /// MLS operation failed.
     #[error("MLS error: {0}")]
     MlsError(#[from] Arc<crate::Error>),
@@ -956,13 +953,6 @@ mod tests {
     fn test_not_encrypted_error() {
         let err = RegistryError::NotEncrypted("doc-1".to_string());
         assert!(err.to_string().contains("not encrypted"));
-        assert!(err.to_string().contains("doc-1"));
-    }
-
-    #[test]
-    fn test_is_encrypted_error() {
-        let err = RegistryError::IsEncrypted("doc-1".to_string());
-        assert!(err.to_string().contains("encrypted"));
         assert!(err.to_string().contains("doc-1"));
     }
 

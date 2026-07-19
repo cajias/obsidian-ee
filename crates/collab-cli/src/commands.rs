@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use collab_core::{
@@ -134,10 +135,12 @@ pub fn create_invite(
     // Create invite
     let invite = doc.create_invite(&key_package_bytes)?;
 
-    // Write invite to file
+    // Write the complete invite (welcome + commit + epoch) to file.
     let invite_proto = Invite {
         doc_id: invite.doc_id.clone(),
-        key_package: invite.welcome,
+        welcome: invite.welcome,
+        commit: invite.commit,
+        epoch: invite.epoch,
         relay_url: String::new(),
     };
     fs::write(invite_output, serde_json::to_string_pretty(&invite_proto)?)?;
@@ -178,42 +181,39 @@ pub fn join(
     let invite_content = fs::read_to_string(invite_file)?;
     let invite: Invite = serde_json::from_str(&invite_content)?;
 
-    // In a real implementation, we'd load the PendingMember from keygen.
-    // For now, we regenerate (which won't actually work with MLS, but
-    // demonstrates the structure).
+    // NOTE: the file-based flow cannot yet reconstruct the exact `PendingMember`
+    // produced by `keygen` — its MLS private state is not persisted — so we
+    // regenerate a key package here. It will not match the invite's welcome, so
+    // the MLS join fails. That failure is surfaced honestly as an error (a
+    // non-zero exit) rather than a fake `success: false` with exit code 0.
+    // Persisting keygen state is tracked as future work; use `demo` for the
+    // working in-process flow.
     let pending = MlsDocumentGroup::generate_key_package(user_id)?;
+    let _group = pending.join(&invite.welcome).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to join document '{}': {e}. The file-based join flow requires \
+             the key-package state produced by `keygen`, which is not yet persisted \
+             across processes. See `collab-cli demo` for the working flow.",
+            invite.doc_id
+        )
+    })?;
 
-    // Try to join (this will fail if the key package doesn't match,
-    // but we handle the error gracefully)
-    match pending.join(&invite.key_package) {
-        Ok(_group) => {
-            // Save state if requested
-            if let Some(path) = state_output {
-                let state = DocumentState {
-                    doc_id: invite.doc_id.clone(),
-                    user_id: user_id.to_string(),
-                    role: "collaborator".to_string(),
-                };
-                fs::write(path, serde_json::to_string_pretty(&state)?)?;
-            }
-
-            Ok(JoinResult {
-                doc_id: invite.doc_id,
-                user_id: user_id.to_string(),
-                success: true,
-                message: "Successfully joined document".to_string(),
-            })
-        }
-        Err(e) => {
-            // Expected to fail if key packages don't match
-            Ok(JoinResult {
-                doc_id: invite.doc_id,
-                user_id: user_id.to_string(),
-                success: false,
-                message: format!("Join failed (expected if key package doesn't match invite): {e}"),
-            })
-        }
+    // Save state if requested.
+    if let Some(path) = state_output {
+        let state = DocumentState {
+            doc_id: invite.doc_id.clone(),
+            user_id: user_id.to_string(),
+            role: "collaborator".to_string(),
+        };
+        fs::write(path, serde_json::to_string_pretty(&state)?)?;
     }
+
+    Ok(JoinResult {
+        doc_id: invite.doc_id,
+        user_id: user_id.to_string(),
+        success: true,
+        message: "Successfully joined document".to_string(),
+    })
 }
 
 /// Result of joining a document.
@@ -378,29 +378,31 @@ pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Re
     let mut sm = ConnectionStateMachine::new(config);
 
     loop {
-        match sm.next_action() {
+        // Each arm yields whether to keep looping; a graceful session end or a
+        // terminal state breaks the loop with a successful (Ok) exit.
+        let flow = match sm.next_action() {
             ConnectionAction::Connect { relay_url: url } => {
                 println!("Connecting to {url}...");
-                handle_connect_action(&mut sm, &url).await?;
+                handle_connect_action(&mut sm, &url).await?
             }
             ConnectionAction::WaitAndRetry { delay, attempt } => {
                 println!("Retry attempt {attempt} in {delay:?}...");
                 tokio::time::sleep(delay).await;
                 sm.on_retry_tick();
+                ControlFlow::Continue(())
             }
             ConnectionAction::GiveUp { reason } => {
                 return Err(anyhow::anyhow!("Connection failed permanently: {reason}"));
             }
-            ConnectionAction::DoNothing => {
-                // Only occurs when auto_connect is false (not current usage)
-                break;
-            }
             ConnectionAction::IdentifyAndSubscribe { .. } => {
-                // Should only appear inside handle_connect_action
                 debug_assert!(false, "IdentifyAndSubscribe at top of connect loop");
-                break;
+                ControlFlow::Break(())
             }
-            _ => break,
+            // `DoNothing` (auto_connect disabled) and any future variant: stop.
+            _ => ControlFlow::Break(()),
+        };
+        if flow.is_break() {
+            break;
         }
     }
 
@@ -409,15 +411,21 @@ pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Re
 
 /// Handle a single [`ConnectionAction::Connect`] attempt.
 ///
-/// On success, runs the WebSocket session and signals disconnection when it ends.
-/// On failure, signals the error to the state machine for retry handling.
-async fn handle_connect_action(sm: &mut ConnectionStateMachine, url: &str) -> anyhow::Result<()> {
+/// Returns [`ControlFlow::Break`] when the session ended **gracefully** (a clean
+/// server-side close) so the caller can exit successfully. Returns
+/// [`ControlFlow::Continue`] when a connection or session **error** occurred and
+/// was signalled to the state machine for retry handling — a clean shutdown is
+/// no longer indistinguishable from a failure.
+async fn handle_connect_action(
+    sm: &mut ConnectionStateMachine,
+    url: &str,
+) -> anyhow::Result<ControlFlow<()>> {
     let (ws, _) = match connect_async(url).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("Connection failed: {e}");
             sm.on_error(&e.to_string());
-            return Ok(());
+            return Ok(ControlFlow::Continue(()));
         }
     };
 
@@ -427,91 +435,40 @@ async fn handle_connect_action(sm: &mut ConnectionStateMachine, url: &str) -> an
     let ConnectionAction::IdentifyAndSubscribe { user_id: uid, doc_id: did } = action else {
         eprintln!("Unexpected action after connect: {action:?}");
         sm.on_error("unexpected state after connect");
-        return Ok(());
+        return Ok(ControlFlow::Continue(()));
     };
 
     match run_ws_session(ws, &uid, &did).await {
-        Ok(()) => sm.on_disconnected(),
+        Ok(()) => {
+            println!("Disconnected cleanly.");
+            Ok(ControlFlow::Break(()))
+        }
         Err(e) => {
             eprintln!("Session error: {e}");
             sm.on_error(&e.to_string());
+            Ok(ControlFlow::Continue(()))
         }
     }
-
-    Ok(())
 }
 
-// Helper functions for base64 encoding/decoding using standard approach
+// Base64 encoding/decoding backed by the `base64` crate (standard alphabet).
 fn base64_encode(data: &[u8]) -> String {
-    const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut result = String::new();
-    let mut i = 0;
-
-    while i < data.len() {
-        let b0 = data[i];
-        let b1 = data.get(i + 1).copied().unwrap_or(0);
-        let b2 = data.get(i + 2).copied().unwrap_or(0);
-
-        result.push(BASE64_CHARS[(b0 >> 2) as usize] as char);
-        result.push(BASE64_CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-
-        if i + 1 < data.len() {
-            result.push(BASE64_CHARS[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            result.push('=');
-        }
-
-        if i + 2 < data.len() {
-            result.push(BASE64_CHARS[(b2 & 0x3f) as usize] as char);
-        } else {
-            result.push('=');
-        }
-
-        i += 3;
-    }
-
-    result
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-#[allow(clippy::unnecessary_wraps)] // Result used for error propagation at call sites
+/// Decode standard base64, ignoring ASCII whitespace.
+///
+/// # Errors
+///
+/// Returns an error if the input is not valid base64 (invalid characters,
+/// bad padding, or a wrong length).
 fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    const fn decode_char(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None, // includes b'=' padding
-        }
-    }
-
-    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
-    let mut result = Vec::new();
-
-    for chunk in bytes.chunks(4) {
-        if chunk.len() < 4 {
-            break;
-        }
-
-        let b0 = decode_char(chunk[0]).unwrap_or(0);
-        let b1 = decode_char(chunk[1]).unwrap_or(0);
-        let b2 = decode_char(chunk[2]);
-        let b3 = decode_char(chunk[3]);
-
-        result.push((b0 << 2) | (b1 >> 4));
-
-        if let Some(v2) = b2 {
-            result.push(((b1 & 0x0f) << 4) | (v2 >> 2));
-        }
-
-        if let (Some(v2), Some(v3)) = (b2, b3) {
-            result.push(((v2 & 0x03) << 6) | v3);
-        }
-    }
-
-    Ok(result)
+    use base64::Engine as _;
+    let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid base64 input: {e}"))
 }
 
 #[cfg(test)]
