@@ -92,10 +92,7 @@ impl ClientHandle {
     ///
     /// Returns an error if the channel is closed or full (the consumer is too
     /// slow); callers treat either case as a delivery failure.
-    pub fn send(
-        &self,
-        msg: ServerMessage,
-    ) -> Result<(), mpsc::error::TrySendError<ServerMessage>> {
+    pub fn send(&self, msg: ServerMessage) -> Result<(), mpsc::error::TrySendError<ServerMessage>> {
         self.tx.try_send(msg)
     }
 
@@ -280,10 +277,13 @@ impl RelayServer {
             }
             Err(e) => {
                 tracing::warn!("Invalid message: {}", e);
-                send_msg(tx, ServerMessage::Error {
-                    code: ErrorCode::InvalidMessage,
-                    message: format!("Invalid message format: {e}"),
-                })
+                send_msg(
+                    tx,
+                    ServerMessage::Error {
+                        code: ErrorCode::InvalidMessage,
+                        message: format!("Invalid message format: {e}"),
+                    },
+                )
                 .await;
             }
         }
@@ -329,25 +329,29 @@ impl RelayServer {
         user_id: &mut Option<String>,
         session_close: &mut Option<Arc<Notify>>,
     ) {
-        let unauthorized = self
-            .auth_token
-            .as_deref()
-            .is_some_and(|expected| token.as_deref() != Some(expected));
+        let unauthorized =
+            self.auth_token.as_deref().is_some_and(|expected| token.as_deref() != Some(expected));
         if unauthorized {
             tracing::warn!(user = %uid, "Rejected Identify: invalid or missing auth token");
-            send_msg(tx, ServerMessage::Error {
-                code: ErrorCode::Unauthorized,
-                message: "Invalid or missing authentication token".to_string(),
-            })
+            send_msg(
+                tx,
+                ServerMessage::Error {
+                    code: ErrorCode::Unauthorized,
+                    message: "Invalid or missing authentication token".to_string(),
+                },
+            )
             .await;
             return;
         }
 
         if uid.len() > MAX_ID_LEN {
-            send_msg(tx, ServerMessage::Error {
-                code: ErrorCode::LimitExceeded,
-                message: format!("user_id exceeds maximum length of {MAX_ID_LEN}"),
-            })
+            send_msg(
+                tx,
+                ServerMessage::Error {
+                    code: ErrorCode::LimitExceeded,
+                    message: format!("user_id exceeds maximum length of {MAX_ID_LEN}"),
+                },
+            )
             .await;
             return;
         }
@@ -385,10 +389,13 @@ impl RelayServer {
         if self.router.subscribe(uid, &doc_id).await {
             send_msg(tx, ServerMessage::Subscribed { doc_id }).await;
         } else {
-            send_msg(tx, ServerMessage::Error {
-                code: ErrorCode::LimitExceeded,
-                message: "Subscription limit reached".to_string(),
-            })
+            send_msg(
+                tx,
+                ServerMessage::Error {
+                    code: ErrorCode::LimitExceeded,
+                    message: "Subscription limit reached".to_string(),
+                },
+            )
             .await;
         }
     }
@@ -483,10 +490,13 @@ async fn wait_for_close(signal: Option<Arc<Notify>>) {
 /// Returns `true` if the id is acceptable.
 async fn validate_doc_id(tx: &mpsc::Sender<ServerMessage>, doc_id: &str) -> bool {
     if doc_id.len() > MAX_ID_LEN {
-        send_msg(tx, ServerMessage::Error {
-            code: ErrorCode::LimitExceeded,
-            message: format!("doc_id exceeds maximum length of {MAX_ID_LEN}"),
-        })
+        send_msg(
+            tx,
+            ServerMessage::Error {
+                code: ErrorCode::LimitExceeded,
+                message: format!("doc_id exceeds maximum length of {MAX_ID_LEN}"),
+            },
+        )
         .await;
         return false;
     }
@@ -548,10 +558,13 @@ impl Drop for ConnectionGuard {
 
 /// Send a "not identified" error message.
 async fn send_not_identified_error(tx: &mpsc::Sender<ServerMessage>, action: &str) {
-    send_msg(tx, ServerMessage::Error {
-        code: ErrorCode::NotIdentified,
-        message: format!("Must identify before {action}"),
-    })
+    send_msg(
+        tx,
+        ServerMessage::Error {
+            code: ErrorCode::NotIdentified,
+            message: format!("Must identify before {action}"),
+        },
+    )
     .await;
 }
 

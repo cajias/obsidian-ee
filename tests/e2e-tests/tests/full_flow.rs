@@ -518,6 +518,23 @@ async fn test_two_users_collaborate() {
 /// This is critical for real-world usage where users may have intermittent
 /// connectivity or close their laptop while collaborating.
 ///
+/// Receive the next message and, if it is a `YrsUpdate`, decrypt and apply it.
+/// Non-update control messages (e.g. `Subscribed`) are ignored. Panics on a
+/// receive timeout.
+async fn apply_next_update(
+    client: &mut TestClient,
+    doc: &mut EncryptedDocument,
+    idle: std::time::Duration,
+) {
+    let Some(msg) = client.try_recv(idle).await.unwrap() else {
+        panic!("Timed out waiting to catch up");
+    };
+    if let ServerMessage::YrsUpdate { encrypted, epoch, .. } = msg {
+        let op = EncryptedOp { ciphertext: encrypted, epoch };
+        doc.apply_encrypted_update(&op).unwrap();
+    }
+}
+
 /// The relay retains a disconnected subscriber's subscription and queues
 /// updates for them, draining the queue when they re-identify on reconnect.
 ///
@@ -607,14 +624,7 @@ async fn test_offline_message_delivery() {
     let expected = alice_doc.get_content();
     let idle = std::time::Duration::from_secs(2);
     while bob_doc.get_content() != expected {
-        match bob.try_recv(idle).await.unwrap() {
-            Some(ServerMessage::YrsUpdate { encrypted, epoch, .. }) => {
-                let op = EncryptedOp { ciphertext: encrypted, epoch };
-                bob_doc.apply_encrypted_update(&op).unwrap();
-            }
-            Some(_) => {} // Subscribed confirmation or other control message
-            None => panic!("Timed out before Bob caught up to Alice"),
-        }
+        apply_next_update(&mut bob, &mut bob_doc, idle).await;
     }
 
     // Verify Bob has caught up with Alice

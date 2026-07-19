@@ -1,8 +1,11 @@
 [package]
 name = "collab-wasm"
-version = "0.1.0"
-edition = "2021"
 description = "WebAssembly bindings for collaborative editing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

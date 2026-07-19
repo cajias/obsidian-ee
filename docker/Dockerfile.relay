@@ -1,5 +1,5 @@
-# Build stage
-FROM rust:latest AS builder
+# Build stage — pinned to the workspace MSRV for reproducible builds.
+FROM rust:1.87-bookworm AS builder
 
 WORKDIR /app
 
@@ -12,12 +12,14 @@ COPY xtask/ xtask/
 # Build release binary
 RUN cargo build --release -p collab-relay
 
-# Runtime stage
+# Runtime stage — pinned Debian slim.
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+# Install runtime dependencies. `netcat-openbsd` backs the compose healthcheck
+# (the relay is a raw WebSocket server with no HTTP health endpoint).
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder

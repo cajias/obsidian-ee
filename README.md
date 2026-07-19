@@ -24,14 +24,14 @@
 <tr><td><b>Zero-knowledge relay</b></td><td>The WebSocket relay routes encrypted payloads only — it can never decrypt document content or edit operations.</td></tr>
 <tr><td><b>CRDT sync (Yrs)</b></td><td>Conflict-free replicated data types merge concurrent edits from every peer without a central authority or merge conflicts.</td></tr>
 <tr><td><b>MLS group encryption</b></td><td>RFC 9420 Messaging Layer Security provides forward secrecy and secure group-membership changes via key packages, invites, and welcomes.</td></tr>
-<tr><td><b>Offline queueing</b></td><td>DynamoDB-backed message queue holds encrypted updates for disconnected clients until they reconnect.</td></tr>
+<tr><td><b>Offline queueing</b></td><td>An in-memory queue holds encrypted updates for briefly-disconnected subscribers and delivers them on reconnect (DynamoDB-backed persistence is planned behind a Cargo feature).</td></tr>
 <tr><td><b>CLI workflow</b></td><td><code>collab-cli</code> drives the full keygen → invite → join → edit lifecycle, plus a self-contained <code>demo</code> of the encryption flow.</td></tr>
 <tr><td><b>WASM-ready core</b></td><td>The crypto/CRDT core compiles to <code>wasm32-unknown-unknown</code> for in-browser and Obsidian-plugin clients.</td></tr>
 </table>
 
 ## Installation
 
-obsidian-ee is a Rust workspace built from source (not published to crates.io). You need **Rust 1.75+** and, for end-to-end testing, **Docker & Docker Compose**.
+obsidian-ee is a Rust workspace built from source (not published to crates.io). You need **Rust 1.87+** (the CI-enforced MSRV) and, for end-to-end testing, **Docker & Docker Compose**.
 
 ```bash
 git clone https://github.com/cajias/obsidian-ee.git
@@ -100,7 +100,13 @@ Logging is controlled via the standard `RUST_LOG` environment variable (parsed b
 RUST_LOG=debug cargo run -p collab-cli -- demo
 ```
 
-The relay's offline queue uses the AWS SDK and resolves credentials from the standard AWS environment (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, etc.) or your `~/.aws` config.
+The relay reads a few optional environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RELAY_ADDR` | `0.0.0.0:8080` | Bind address. |
+| `RELAY_AUTH_TOKEN` | _(unset)_ | If set, clients must present a matching bearer token in `Identify`; otherwise authentication is disabled. |
+| `RELAY_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. |
 
 ## How it works
 
@@ -113,7 +119,7 @@ flowchart LR
 
     subgraph Server["Relay Server (Zero-Knowledge)"]
         R[WebSocket<br/>Router]
-        Q[(DynamoDB<br/>Offline Queue)]
+        Q[(In-memory<br/>Offline Queue)]
     end
 
     A <-->|"🔒 MLS Encrypted"| R
