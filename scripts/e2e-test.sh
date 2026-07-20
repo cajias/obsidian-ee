@@ -15,7 +15,7 @@ if command -v docker >/dev/null 2>&1; then
 
     echo "Waiting for the relay to become healthy..."
     for i in $(seq 1 30); do
-        if $COMPOSE ps relay 2>/dev/null | grep -q healthy; then
+        if $COMPOSE ps relay 2>/dev/null | grep -q "(healthy)"; then
             echo "Relay is ready!"
             break
         fi

@@ -25,6 +25,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+    # NOTE: `deploy.resources.limits` is a Docker Swarm field and is NOT
+    # enforced by `docker compose` by default. To apply these limits locally,
+    # run with `docker compose --compatibility up`.
     deploy:
       resources:
         limits:
