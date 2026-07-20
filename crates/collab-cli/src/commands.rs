@@ -328,7 +328,7 @@ async fn run_ws_session(
 
     let (mut write, mut read) = ws.split();
 
-    let identify = ClientMessage::Identify { user_id: user_id.to_string() };
+    let identify = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
     write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 
     let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string() };
