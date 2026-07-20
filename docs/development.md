@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.75+ (edition 2021)
+- Rust 1.87+ (edition 2021; MSRV 1.87 is CI-enforced)
 - Docker & Docker Compose
 - Node.js (for Obsidian plugin development)
 - `wasm-pack` (for building WASM module)
@@ -39,7 +39,6 @@ obsidian-ee/
 ├── tests/
 │   └── e2e-tests/         # Integration tests
 ├── docker/                # Docker Compose + Dockerfiles
-├── infra/                 # AWS CDK infrastructure
 ├── scripts/               # Helper scripts
 └── xtask/                 # Development task runner
 ```
@@ -101,31 +100,25 @@ Hooks run automatically on commit:
 
 ### Docker Compose
 
-The local environment includes three services:
+The local environment defines a single service, the relay. The relay is a
+zero-knowledge, in-memory router with no external dependencies (the offline
+queue is in-memory; a DynamoDB-backed implementation is planned behind a future
+Cargo feature).
 
 ```bash
-# Start all services
+# Start the relay
 docker compose -f docker/docker-compose.yml up -d
 
-# Stop all services
+# Stop the relay
 docker compose -f docker/docker-compose.yml down
 ```
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| LocalStack | 4566 | AWS service mocks (DynamoDB, SQS) |
-| Redis | 6379 | Presence and pub/sub |
 | Relay Server | 8080 | WebSocket relay |
 
-### LocalStack Resources
-
-Automatically created on startup via `docker/localstack-init/init-aws.sh`:
-
-| Resource | Type | Purpose |
-|----------|------|---------|
-| `Documents` | DynamoDB table | Document state storage |
-| `MLSMessages` | DynamoDB table | Offline message queue |
-| `collab-updates` | SQS queue | Async update processing |
+To require client authentication, set `RELAY_AUTH_TOKEN` in the environment (or a
+`.env` file) before starting the relay.
 
 ### Running the Relay Independently
 
@@ -220,7 +213,6 @@ For parallel development across crates, use git worktrees:
 ```bash
 git worktree add ../obsidian-ee-core -b feature/core-work
 git worktree add ../obsidian-ee-relay -b feature/relay-work
-git worktree add ../obsidian-ee-infra -b feature/infra-work
 ```
 
 ## CI/CD Pipeline

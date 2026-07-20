@@ -1,32 +1,36 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "=== Starting E2E Test Suite ==="
 
-# Check if Docker Compose is running
-if ! docker compose -f docker/docker-compose.yml ps --quiet 2>/dev/null | grep -q .; then
-    echo "Starting Docker Compose environment..."
-    docker compose -f docker/docker-compose.yml up -d
-    sleep 10
+COMPOSE="docker compose -f docker/docker-compose.yml"
+
+# Best-effort: bring up the relay. E2E infra failures must not mask the actual
+# test result, so infra bring-up is tolerant; the test command below is not.
+if command -v docker >/dev/null 2>&1; then
+    if ! $COMPOSE ps --quiet 2>/dev/null | grep -q .; then
+        echo "Starting relay via Docker Compose..."
+        $COMPOSE up -d || echo "WARN: could not start Docker Compose; Docker-gated tests will be skipped"
+    fi
+
+    echo "Waiting for the relay to become healthy..."
+    for i in $(seq 1 30); do
+        if $COMPOSE ps relay 2>/dev/null | grep -q "(healthy)"; then
+            echo "Relay is ready!"
+            break
+        fi
+        sleep 2
+    done
+else
+    echo "WARN: docker not available; running only the Docker-independent E2E tests"
 fi
 
-# Wait for services to be healthy
-echo "Waiting for services to be healthy..."
-for i in {1..30}; do
-    if curl -s http://localhost:4566/_localstack/health | grep -q '"dynamodb": "running"'; then
-        echo "LocalStack is ready!"
-        break
-    fi
-    echo "Waiting for LocalStack... ($i/30)"
-    sleep 2
-done
-
-# Build release binaries
 echo "Building release binaries..."
 cargo build --workspace --release
 
-# Run E2E tests
+# Real gate: the Docker-independent full-flow tests must pass. The Docker-gated
+# tests are #[ignore]d and only run manually with a live relay.
 echo "Running E2E tests..."
-cargo test --package e2e-tests --test full_flow 2>/dev/null || echo "E2E tests not yet implemented"
+cargo test --package e2e-tests --test full_flow
 
 echo "=== E2E Test Suite Complete ==="
