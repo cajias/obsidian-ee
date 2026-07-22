@@ -77,7 +77,7 @@ impl MessageRouter {
             .get(&handle.user_id)
             .is_some_and(|previous| previous.conn_id() != handle.conn_id());
 
-        // ponytail: shared-token model — per-identity binding deferred until multi-tenant auth exists
+        // ponytail: no-auth mode permits self-takeover (no identity to protect); shared-token binding + session liveness detection (ping/pong or idle-read timeout to reap dead sessions promptly) deferred until multi-tenant auth exists
         if has_stale_session && !allow_takeover {
             tracing::warn!(
                 user = %handle.user_id,
@@ -610,6 +610,24 @@ mod tests {
             router.has_offline_messages("u2").await,
             "u2's subscription must track its offline-queue retention"
         );
+    }
+
+    #[tokio::test]
+    async fn test_register_refuses_takeover_when_disallowed() {
+        // Defense-in-depth guard: with takeover disallowed, a duplicate Identify
+        // for a live user id is refused and the existing session keeps its slot.
+        // (Unreachable from the relay in auth mode — the token check rejects an
+        // unauthenticated Identify before register_client — but the guard stays.)
+        let router = MessageRouter::new();
+
+        let (first_handle, _first_rx) = create_test_client("alice", 1);
+        let (second_handle, _second_rx) = create_test_client("alice", 2);
+        assert!(router.register_client(first_handle, false).await);
+
+        // The duplicate is refused; the original (conn 1) is left untouched.
+        assert!(!router.register_client(second_handle, false).await);
+        assert_eq!(router.client_count().await, 1);
+        assert_eq!(router.get_client("alice").await.map(|h| h.conn_id()), Some(1));
     }
 
     #[tokio::test]

@@ -6,9 +6,15 @@ exists so a deferral can't quietly become permanent.
 
 ## Ledger
 
-**No `ponytail:` debt. Clean ledger.** (0 markers, 0 with no trigger.)
+- **Session liveness detection** (`collab-relay/src/routing.rs`, takeover gate) —
+  no ping/pong, idle-read timeout, or SO_KEEPALIVE, so a session dropped uncleanly
+  (wifi/sleep/NAT half-open socket) lingers in `clients` until TCP reaps it (minutes
+  to hours). No-auth self-takeover on reconnect papers over this for the reconnecting
+  user; a returning user is unaffected but the dead slot still holds memory until TCP
+  cleanup. Upgrade path: add ping/pong or an idle-read timeout to reap dead sessions
+  promptly. Deferred until multi-tenant auth exists (bundled with shared-token binding).
 
-The single tracked deferral — the empty `signature` field on `YrsUpdate` — was
+The earlier tracked deferral — the empty `signature` field on `YrsUpdate` — was
 resolved on branch `claude/ponytail-tech-debt-f4xdy5`. See below for the record.
 
 ---

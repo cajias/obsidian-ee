@@ -360,12 +360,16 @@ impl RelayServer {
 
         let handle = ClientHandle::new(uid.clone(), conn_id, tx.clone());
         let close_signal = handle.close_signal();
-        // A session takeover evicts whoever currently holds this user id, so it
-        // is only safe for an *authenticated* Identify. Having passed the
-        // `unauthorized` gate above, `auth_token.is_some()` means auth is enabled
-        // and the presented token matched. With auth disabled, any peer could
-        // claim any user id, so a duplicate Identify must be rejected instead.
-        let allow_takeover = self.auth_token.is_some();
+        // Permit self-takeover on reconnect when EITHER auth is disabled OR the
+        // Identify is authenticated. In no-auth mode a duplicate Identify is just
+        // the same user reconnecting (there is no identity to protect); rejecting
+        // it would lock them out of their own user_id after an unclean disconnect
+        // until TCP reaps the half-open socket. `unauthorized` is always false
+        // here — the gate above returns early otherwise — so this stays true for
+        // authenticated Identify and is defense-in-depth should that early return
+        // ever be refactored: it goes false only for an unauthenticated duplicate
+        // Identify while auth is enabled.
+        let allow_takeover = !unauthorized;
         if !self.router.register_client(handle, allow_takeover).await {
             tracing::warn!(user = %uid, "Rejected Identify: user already has an active session");
             send_msg(
@@ -811,10 +815,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unauthenticated_duplicate_identify_is_rejected() {
-        // With auth disabled, any peer could claim any user id. A duplicate
-        // Identify for a live user must be rejected, not allowed to force-evict
-        // the existing session.
+    async fn test_no_auth_duplicate_identify_takes_over() {
+        // With auth disabled there is no identity to protect, so a duplicate
+        // Identify is treated as the same user reconnecting: it takes over the
+        // prior session (which is signalled it was replaced). This is what makes
+        // reconnect work after an unclean disconnect leaves a stale half-open
+        // session lingering in `clients` until TCP reaps it.
         let server = TestServer::start().await;
 
         let mut first = TestClient::connect(&server).await;
@@ -823,10 +829,13 @@ mod tests {
 
         let mut second = TestClient::connect(&server).await;
         second.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
-        // The impostor is rejected; the original session keeps its slot.
+        // The reconnecting session is accepted.
+        assert!(matches!(second.recv().await, ServerMessage::Identified { .. }));
+
+        // The stale session is told it was replaced.
         assert!(matches!(
-            second.recv().await,
-            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+            first.recv().await,
+            ServerMessage::Error { code: ErrorCode::SessionReplaced, .. }
         ));
     }
 
