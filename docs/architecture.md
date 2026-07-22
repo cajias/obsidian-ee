@@ -8,8 +8,7 @@ Obsidian E2E is an end-to-end encrypted collaborative document editing system. I
 graph TD
     A1[Obsidian App<br/>Plugin + WASM<br/>CollabCore / CollabClient] -->|Encrypted WebSocket wss://| R
     A2[Obsidian App<br/>Plugin + WASM<br/>CollabCore / CollabClient] -->|Encrypted WebSocket wss://| R
-    R[WebSocket Relay Server<br/>Zero-Knowledge: cannot read content] --> D[(DynamoDB<br/>Offline Queue)]
-    R --> Redis[(Redis<br/>Presence)]
+    R[WebSocket Relay Server<br/>Zero-Knowledge: cannot read content] --> D[(In-memory<br/>Offline Queue)]
 ```
 
 ## Core Principles
@@ -80,7 +79,7 @@ block-beta
     C["Protocol (collab-proto)\nClientMessage | ServerMessage | MlsMessageType"]
     D["Core Library (collab-core)\nCollabDocument | MlsDocumentGroup | Registry\nEncryptedDocument | ConnectionStateMachine"]
     E["Relay Server (collab-relay)\nRelayServer | MessageRouter | OfflineQueue"]
-    F["Infrastructure\nDynamoDB | Redis | Docker | AWS CDK"]
+    F["Infrastructure\nDocker (DynamoDB persistence planned)"]
 
     A --> B --> C --> D
     D --> E --> F
@@ -141,7 +140,7 @@ sequenceDiagram
     participant Client
     participant Relay
 
-    Client->>Relay: Identify { user_id }
+    Client->>Relay: Identify { user_id, token? }
     Relay->>Client: Identified { user_id }
     Client->>Relay: Subscribe { doc_id }
     Relay->>Client: Subscribed { doc_id }
@@ -152,8 +151,11 @@ sequenceDiagram
 ```
 
 - A client must `Identify` before subscribing. Attempts to subscribe or send messages without identification receive an `Error { code: NotIdentified }` response.
-- A client can subscribe to multiple documents simultaneously.
+- If the relay is configured with `RELAY_AUTH_TOKEN`, the `Identify` message must carry a matching `token`; otherwise the relay replies with `Error { code: Unauthorized }`.
+- Sessions are connection-id-scoped: a fresh `Identify` for an already-connected `user_id` takes over and closes the prior session, while a stale connection cannot evict a newer one (the replaced session receives `SessionReplaced`).
+- A client can subscribe to multiple documents simultaneously, subject to per-document and document-count subscription caps (`LimitExceeded` when exceeded).
 - On disconnect, the relay automatically unregisters the client and removes it from all subscriptions.
+- The relay bounds resources: a global connection cap, bounded per-client channels (slow consumers are disconnected), and a 1 MiB max WebSocket frame size.
 
 ### Fan-Out Semantics
 

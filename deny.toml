@@ -1,16 +1,32 @@
-# cargo-deny configuration
+# cargo-deny configuration (schema version 2)
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-db-path = "~/.cargo/advisory-db"
-db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
+# `version = 2` implies: vulnerabilities and unmaintained crates are errors,
+# and the deprecated `vulnerability`/`unmaintained`/`yanked`/`notice` keys are
+# gone. Yanked crates are denied by default.
+version = 2
+# Documented waivers for advisories in transitive dependencies we do not
+# control. Each is tracked against the next openmls / crypto-backend bump; the
+# gate still fails on any *new*, unlisted advisory. Revisit on every dependency
+# update and remove entries as upstream fixes land.
+ignore = [
+    # Unmaintained-crate advisories (not vulnerabilities), no safe upgrade:
+    #   proc-macro-error2 via openmls_rust_crypto -> hpke-rs -> hax-lib-macros
+    "RUSTSEC-2026-0173",
+    #   instant, pulled in transitively; upstream is unmaintained.
+    "RUSTSEC-2024-0384",
+    # libcrux (openmls's crypto backend, pinned at 0.0.x by openmls_rust_crypto
+    # 0.4.x) advisories with no semver-compatible fix available yet:
+    "RUSTSEC-2026-0207", # incremental portable SHAKE incorrect output
+    "RUSTSEC-2026-0208", # potential panic in AVX2 SHAKE-256
+    "RUSTSEC-2026-0212", # constant-time swap/select on aarch64
+]
 
 [licenses]
-unlicensed = "deny"
+# `version = 2` denies any crate whose license is not in `allow` (the old
+# `unlicensed`/`copyleft` keys are removed).
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -21,14 +37,18 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    # openmls and its crypto backend (openmls_rust_crypto, hpke-rs, ...) are
+    # MPL-2.0 (weak, file-level copyleft — fine to use as a dependency).
+    "MPL-2.0",
+    # A few small transitive dev/build deps are public-domain equivalent.
+    "CC0-1.0",
 ]
-copyleft = "warn"
 
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
-skip = []
 
 [sources]
 unknown-registry = "deny"

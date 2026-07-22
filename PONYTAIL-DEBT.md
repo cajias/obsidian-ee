@@ -6,13 +6,41 @@ exists so a deferral can't quietly become permanent.
 
 ## Ledger
 
-- **Session liveness detection** (`collab-relay/src/routing.rs`, takeover gate) —
-  no ping/pong, idle-read timeout, or SO_KEEPALIVE, so a session dropped uncleanly
-  (wifi/sleep/NAT half-open socket) lingers in `clients` until TCP reaps it (minutes
-  to hours). No-auth self-takeover on reconnect papers over this for the reconnecting
-  user; a returning user is unaffected but the dead slot still holds memory until TCP
-  cleanup. Upgrade path: add ping/pong or an idle-read timeout to reap dead sessions
-  promptly. Deferred until multi-tenant auth exists (bundled with shared-token binding).
+### Deferred: session liveness detection
+
+**Ceiling:** `collab-relay` has no ping/pong, idle-read timeout, or SO_KEEPALIVE
+(`collab-relay/src/routing.rs`, takeover gate), so a session dropped uncleanly
+(wifi/sleep/NAT half-open socket) lingers in `clients` until TCP reaps it (minutes
+to hours). No-auth self-takeover on reconnect papers over this for the reconnecting
+user; a returning user is unaffected but the dead slot still holds memory until TCP
+cleanup.
+
+**Upgrade path:** add ping/pong or an idle-read timeout to reap dead sessions
+promptly. Deferred until multi-tenant auth exists (bundled with shared-token binding).
+
+---
+
+### Deferred: fine-grained per-document `Subscribe` authorization
+
+**Ceiling:** the relay authorizes `Subscribe` only by *authenticated identity*
+(the optional `RELAY_AUTH_TOKEN` gate) plus resource caps — it does **not**
+verify that the subscriber is a member of the document's MLS group. Any
+authenticated client can therefore subscribe to any `doc_id`'s ciphertext
+stream and observe metadata (epochs, sender ids, sizes, timing).
+
+**Why deferred:** a zero-knowledge relay cannot see MLS group membership by
+design. Real enforcement needs a relay-checkable, signed subscription capability
+scoped to `doc_id`+epoch (a small capability-token scheme), which is a feature,
+not a cleanup. MLS already prevents non-members from decrypting content, and the
+residual metadata exposure is explicitly out of scope per `docs/security.md`.
+
+**Upgrade path:** issue members a signed subscription capability (e.g. HMAC or
+signature over `doc_id`+epoch from a group-derived key the relay can verify), and
+reject `Subscribe` messages that lack a valid capability.
+
+**Tracked in:** `TECH-DEBT-AUDIT.md` (the `Subscribe` medium finding).
+
+---
 
 The earlier tracked deferral — the empty `signature` field on `YrsUpdate` — was
 resolved on branch `claude/ponytail-tech-debt-f4xdy5`. See below for the record.

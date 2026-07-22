@@ -10,9 +10,11 @@ obsidian-ee/
 │   ├── collab-core/     # Yrs CRDT + MLS encryption
 │   ├── collab-relay/    # WebSocket relay server
 │   ├── collab-cli/      # CLI client
-│   └── collab-proto/    # Protocol message types
-├── infra/               # AWS CDK infrastructure
+│   ├── collab-proto/    # Protocol message types
+│   ├── collab-wasm/     # WASM bindings for browser/Obsidian clients
+│   └── collab-watcher/  # Filesystem watcher for local document sync
 ├── docker/              # Docker Compose for local dev
+├── plugins/obsidian-ee/ # Obsidian plugin
 ├── tests/e2e-tests/     # End-to-end tests
 └── scripts/             # Helper scripts
 ```
@@ -47,7 +49,6 @@ This project uses strict TDD:
 For parallel development, use git worktrees:
 - `obsidian-ee-core` - collab-core development
 - `obsidian-ee-relay` - collab-relay development
-- `obsidian-ee-infra` - CDK infrastructure
 
 ### Local E2E Testing
 
@@ -66,5 +67,8 @@ docker compose -f docker/docker-compose.yml down
 
 - **Yrs CRDT**: Conflict-free replicated data types for concurrent editing
 - **MLS (RFC 9420)**: End-to-end encryption with forward secrecy
-- **WebSocket Relay**: Routes encrypted messages (zero-knowledge)
-- **DynamoDB**: Persistent storage for offline message queuing
+- **WebSocket Relay**: Routes encrypted messages (zero-knowledge); authenticates
+  clients (optional bearer token), bounds resources, and queues updates for
+  briefly-offline subscribers
+- **Offline queue**: In-memory today; DynamoDB-backed persistence is planned
+  behind a Cargo feature

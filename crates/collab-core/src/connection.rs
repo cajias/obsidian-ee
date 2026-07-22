@@ -18,6 +18,10 @@
 //! Connected --(on_disconnected)--> Reconnecting | Failed
 //! Reconnecting --(on_retry_tick)--> Connecting
 //! ```
+//!
+//! The retry budget is refilled only via [`ConnectionStateMachine::on_stable_connection`]
+//! (once a connection proves stable), never on `on_connected` alone — otherwise
+//! an accept-then-immediately-drop server would reconnect forever.
 
 use std::time::Duration;
 
@@ -299,13 +303,30 @@ impl ConnectionStateMachine {
         }
     }
 
-    /// Unconditionally transitions to Connected and resets retry counter.
+    /// Transitions to Connected.
+    ///
+    /// Does **not** reset the retry counter: a successful TCP/WebSocket accept
+    /// is not proof the connection is useful. If it were reset here, an
+    /// accept-then-immediately-drop server (shutdown, takeover, resource
+    /// eviction) would reconnect forever at a fixed cadence because the budget
+    /// never accumulates toward `max_retries`. Call
+    /// [`on_stable_connection`](Self::on_stable_connection) once the connection
+    /// has proven stable to refill the budget.
     pub fn on_connected(&mut self) {
         debug_assert!(
             !matches!(self.state, ConnectionState::Failed { .. }),
             "on_connected called on Failed state machine"
         );
         self.state = ConnectionState::Connected;
+    }
+
+    /// Reset the retry budget after a connection has proven stable.
+    ///
+    /// The caller decides what "stable" means (typically staying connected for
+    /// at least a minimum duration). Once called, a subsequent drop gets the
+    /// full retry budget again, while transient accept-then-drop cycles that
+    /// never reach stability keep accumulating toward `GiveUp`.
+    pub const fn on_stable_connection(&mut self) {
         self.retry_count = 0;
     }
 
@@ -483,15 +504,27 @@ mod tests {
     }
 
     #[test]
-    fn on_connected_resets_retry_count() {
+    fn on_connected_alone_does_not_reset_retry_count() {
         let mut sm = ConnectionStateMachine::new(default_config(true));
         // Simulate some retries first
         sm.on_error("timeout");
         sm.on_retry_tick();
         sm.on_connected();
         assert_eq!(*sm.state(), ConnectionState::Connected);
-        // Disconnect again; retry_count should have been reset so
-        // this starts at attempt 1 again.
+        // Disconnect again WITHOUT signalling stability: the earlier failed
+        // attempt must still count, so this is attempt 2 (not reset to 1).
+        sm.on_disconnected();
+        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 2 });
+    }
+
+    #[test]
+    fn on_stable_connection_resets_retry_count() {
+        let mut sm = ConnectionStateMachine::new(default_config(true));
+        sm.on_error("timeout");
+        sm.on_retry_tick();
+        sm.on_connected();
+        // Connection proved stable -> budget refilled.
+        sm.on_stable_connection();
         sm.on_disconnected();
         assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
     }
@@ -683,34 +716,74 @@ mod tests {
         sm.on_connected();
         sm.on_disconnected();
         assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
-        // Second disconnect after reconnect
+        // Second disconnect after reconnect. Without a stability signal the
+        // budget is NOT reset, so this second unstable drop exhausts
+        // max_retries=1 and transitions to Failed.
         sm.on_retry_tick();
         sm.on_connected();
         sm.on_disconnected();
-        // retry_count was reset by on_connected, so this is attempt 1 again
-        assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+        assert!(
+            matches!(sm.state(), ConnectionState::Failed { .. }),
+            "expected Failed after exhausting budget, got {:?}",
+            sm.state()
+        );
     }
 
     #[test]
-    fn multi_cycle_retry_count_resets() {
+    fn multi_cycle_stable_connection_resets_retry_count() {
         let mut sm = ConnectionStateMachine::new(default_config(true));
 
-        // Cycle 1: connect -> disconnect -> reconnect -> connect
+        // Cycle 1: connect -> stable -> disconnect -> reconnect
         sm.on_connected();
+        sm.on_stable_connection();
         sm.on_disconnected();
         assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
         sm.on_retry_tick();
         sm.on_connected();
+        sm.on_stable_connection();
 
-        // Cycle 2: should start from attempt 1 again
+        // Cycle 2: budget was refilled by stability -> attempt 1 again
         sm.on_disconnected();
         assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
         sm.on_retry_tick();
         sm.on_connected();
+        sm.on_stable_connection();
 
         // Cycle 3: still resets
         sm.on_disconnected();
         assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
+    }
+
+    /// Regression: an accept-then-immediately-drop server (connects but the
+    /// session never proves stable) must accumulate retries and eventually
+    /// `GiveUp` instead of reconnecting forever at a fixed cadence.
+    #[test]
+    fn accept_then_drop_without_stability_reaches_give_up() {
+        let config =
+            ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
+                RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+            );
+        let mut sm = ConnectionStateMachine::new(config);
+
+        // Simulate connect -> drop cycles where the connection never stays up
+        // long enough to be deemed stable (so on_stable_connection is NOT
+        // called). With max_retries=3 the budget is exhausted on the 4th drop.
+        // If the reset regression returned, retry_count would keep resetting
+        // and the final assert (Failed) would catch it — the fixed loop count
+        // means it can never hang.
+        for _ in 0..4 {
+            sm.on_connected(); // TCP accept succeeds
+            sm.on_disconnected(); // ...but the session drops immediately
+            sm.on_retry_tick(); // no-op once Failed, so safe to call
+        }
+
+        // Budget (max_retries=3) is now exhausted -> Failed / GiveUp reachable.
+        assert!(
+            matches!(sm.state(), ConnectionState::Failed { .. }),
+            "expected Failed after repeated accept-then-drop, got {:?}",
+            sm.state()
+        );
+        assert!(matches!(sm.next_action(), ConnectionAction::GiveUp { .. }));
     }
 
     // -- Jitter tests --------------------------------------------------------

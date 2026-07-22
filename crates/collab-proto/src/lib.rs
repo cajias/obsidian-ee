@@ -135,12 +135,21 @@ pub enum ErrorCode {
 }
 
 /// Invite for joining a collaborative document.
+///
+/// Carries the full MLS material needed to reconstruct the group: the `welcome`
+/// for the joining member and the `commit` that existing members must process,
+/// tagged with the `epoch` at which the invite was created (for stale-invite
+/// detection).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Invite {
     /// Document identifier.
     pub doc_id: DocumentId,
-    /// MLS key package for joining the group.
-    pub key_package: Vec<u8>,
+    /// MLS welcome message for the joining member.
+    pub welcome: Vec<u8>,
+    /// MLS commit message existing group members must process to stay in sync.
+    pub commit: Vec<u8>,
+    /// MLS epoch at which this invite was created.
+    pub epoch: u64,
     /// Relay server URL.
     pub relay_url: String,
 }
