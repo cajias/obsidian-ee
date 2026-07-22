@@ -309,6 +309,13 @@ fn handle_server_message(server_msg: collab_proto::ServerMessage) {
     }
 }
 
+/// Minimum time a connection must stay up before it counts as stable enough to
+/// refill the retry budget. Sessions shorter than this are treated as failed
+/// attempts (accept-then-drop storms) so the retry count keeps accumulating
+/// toward `GiveUp` instead of reconnecting forever at a fixed cadence.
+// ponytail: fixed stability threshold; make adaptive if reconnect tuning ever matters.
+const MIN_STABLE_CONNECTION: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run the WebSocket session: identify, subscribe, and process messages.
 ///
 /// Returns `Ok(())` only on a genuine graceful shutdown — a server-side
@@ -443,7 +450,17 @@ async fn handle_connect_action(
         return Ok(ControlFlow::Continue(()));
     };
 
-    match run_ws_session(ws, &uid, &did).await {
+    // Only a session that stays up past MIN_STABLE_CONNECTION proves the
+    // connection was genuinely useful and earns a fresh retry budget. A quick
+    // accept-then-drop must NOT reset the budget, or the retry loop never
+    // escalates toward GiveUp.
+    let started = tokio::time::Instant::now();
+    let result = run_ws_session(ws, &uid, &did).await;
+    if started.elapsed() >= MIN_STABLE_CONNECTION {
+        sm.on_stable_connection();
+    }
+
+    match result {
         Ok(()) => {
             println!("Disconnected cleanly.");
             Ok(ControlFlow::Break(()))
