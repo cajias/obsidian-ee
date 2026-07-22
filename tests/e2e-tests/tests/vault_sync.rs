@@ -33,6 +33,25 @@ use tokio::time::sleep;
 const SETTLE: Duration = Duration::from_millis(300);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Drain creation events from `rx` (until timeout/close) into `mgr`.
+async fn drain_created_events(
+    rx: &mut tokio::sync::mpsc::Receiver<collab_watcher::VaultEvent>,
+    mgr: &mut VaultSyncManager,
+) {
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+        if event.kind != VaultEventKind::Created {
+            break;
+        }
+        mgr.handle_created(&event.path.display().to_string()).unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Manifest correctness (no watcher required)
 // ---------------------------------------------------------------------------
@@ -94,7 +113,7 @@ fn test_file_created_on_alice_appears_on_bob() {
 
     // Bob should now have the document open.
     assert_eq!(new_for_bob, vec!["notes/ideas.md".to_string()]);
-    assert!(bob.registry().get("notes/ideas").is_some(), "doc should be registered");
+    assert!(bob.registry().get("notes/ideas.md").is_some(), "doc should be registered");
     assert!(bob.manifest().contains("notes/ideas.md"), "manifest should track the file");
 }
 
@@ -108,10 +127,8 @@ fn test_file_created_on_both_sides_converges() {
     bob.handle_created("bob.md").unwrap();
 
     // Exchange manifests.
-    let new_for_bob =
-        bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
-    let new_for_alice =
-        alice.apply_remote_manifest(&bob.manifest().encode_full_state()).unwrap();
+    let new_for_bob = bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
+    let new_for_alice = alice.apply_remote_manifest(&bob.manifest().encode_full_state()).unwrap();
 
     // Both should now know about both files.
     assert!(new_for_bob.contains(&"alice.md".to_string()));
@@ -133,17 +150,16 @@ fn test_file_deleted_on_alice_closes_on_bob() {
     // Alice creates a file and Bob syncs it.
     alice.handle_created("temp.md").unwrap();
     bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
-    assert!(bob.registry().get("temp").is_some(), "Bob should have temp.md");
+    assert!(bob.registry().get("temp.md").is_some(), "Bob should have temp.md");
 
     // Alice deletes it.
     alice.handle_deleted("temp.md");
 
     // Bob receives the updated manifest.
-    let new_for_bob =
-        bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
+    let new_for_bob = bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
 
     assert!(new_for_bob.is_empty(), "no new files expected");
-    assert!(bob.registry().get("temp").is_none(), "Bob should close temp.md after delete");
+    assert!(bob.registry().get("temp.md").is_none(), "Bob should close temp.md after delete");
     assert!(bob.manifest().is_deleted("temp.md"), "tombstone should be in Bob's manifest");
 }
 
@@ -155,18 +171,17 @@ fn test_file_renamed_on_alice_updates_bob() {
     // Alice creates and Bob syncs.
     alice.handle_created("draft.md").unwrap();
     bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
-    assert!(bob.registry().get("draft").is_some());
+    assert!(bob.registry().get("draft.md").is_some());
 
     // Alice renames.
     alice.handle_renamed("draft.md", "published.md").unwrap();
 
     // Bob receives the manifest.
-    let new_for_bob =
-        bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
+    let new_for_bob = bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
 
     assert_eq!(new_for_bob, vec!["published.md".to_string()]);
-    assert!(bob.registry().get("draft").is_none(), "old name should be closed");
-    assert!(bob.registry().get("published").is_some(), "new name should be open");
+    assert!(bob.registry().get("draft.md").is_none(), "old name should be closed");
+    assert!(bob.registry().get("published.md").is_some(), "new name should be open");
 }
 
 // ---------------------------------------------------------------------------
@@ -175,8 +190,7 @@ fn test_file_renamed_on_alice_updates_bob() {
 
 #[test]
 fn test_config_folder_allowlist_restricts_sync() {
-    let mut cfg = VaultSyncConfig::default();
-    cfg.sync_folders = vec!["work".to_string()];
+    let cfg = VaultSyncConfig { sync_folders: vec!["work".to_string()], ..Default::default() };
     let mut mgr = VaultSyncManager::new(cfg);
 
     let work = mgr.handle_created("work/project.md").unwrap();
@@ -184,14 +198,14 @@ fn test_config_folder_allowlist_restricts_sync() {
 
     assert_eq!(work.kind, SyncActionKind::FileCreated);
     assert_eq!(personal.kind, SyncActionKind::Ignored);
-    assert!(mgr.registry().get("work/project").is_some());
-    assert!(mgr.registry().get("personal/diary").is_none());
+    assert!(mgr.registry().get("work/project.md").is_some());
+    assert!(mgr.registry().get("personal/diary.md").is_none());
 }
 
 #[test]
 fn test_config_exclude_patterns_prevent_sync() {
-    let mut cfg = VaultSyncConfig::default();
-    cfg.exclude_patterns = vec![".obsidian/*".to_string()];
+    let cfg =
+        VaultSyncConfig { exclude_patterns: vec![".obsidian/*".to_string()], ..Default::default() };
     let mut mgr = VaultSyncManager::new(cfg);
 
     let system = mgr.handle_created(".obsidian/config.md").unwrap();
@@ -203,29 +217,27 @@ fn test_config_exclude_patterns_prevent_sync() {
 
 #[test]
 fn test_config_disable_sync_deletions() {
-    let mut cfg = VaultSyncConfig::default();
-    cfg.sync_deletions = false;
+    let cfg = VaultSyncConfig { sync_deletions: false, ..Default::default() };
     let mut mgr = VaultSyncManager::new(cfg);
 
     mgr.handle_created("keep.md").unwrap();
     let del = mgr.handle_deleted("keep.md");
 
     assert_eq!(del.kind, SyncActionKind::Ignored, "deletion should be ignored");
-    assert!(mgr.registry().get("keep").is_some(), "doc should still be open");
+    assert!(mgr.registry().get("keep.md").is_some(), "doc should still be open");
 }
 
 #[test]
 fn test_config_disable_sync_renames() {
-    let mut cfg = VaultSyncConfig::default();
-    cfg.sync_renames = false;
+    let cfg = VaultSyncConfig { sync_renames: false, ..Default::default() };
     let mut mgr = VaultSyncManager::new(cfg);
 
     mgr.handle_created("old.md").unwrap();
     let rename = mgr.handle_renamed("old.md", "new.md").unwrap();
 
     assert_eq!(rename.kind, SyncActionKind::Ignored, "rename should be ignored");
-    assert!(mgr.registry().get("old").is_some(), "old doc should still exist");
-    assert!(mgr.registry().get("new").is_none(), "new doc should not exist");
+    assert!(mgr.registry().get("old.md").is_some(), "old doc should still exist");
+    assert!(mgr.registry().get("new.md").is_none(), "new doc should not exist");
 }
 
 #[test]
@@ -268,8 +280,10 @@ fn test_same_filename_created_on_both_sides_converges() {
         "Alice and Bob must agree on shared.md after conflict resolution"
     );
     // The file should be alive (both tried to create it, neither deleted it).
-    assert!(alice.manifest().contains("shared.md") || alice.manifest().is_deleted("shared.md"),
-        "shared.md must be in a defined state");
+    assert!(
+        alice.manifest().contains("shared.md") || alice.manifest().is_deleted("shared.md"),
+        "shared.md must be in a defined state"
+    );
 }
 
 #[test]
@@ -296,8 +310,7 @@ fn test_manifest_convergence_is_idempotent() {
 #[tokio::test]
 async fn test_vault_watcher_creation_drives_sync_manager() {
     let vault = TempDir::new().unwrap();
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE).await;
 
     let mut mgr = VaultSyncManager::new(VaultSyncConfig::default());
@@ -318,7 +331,7 @@ async fn test_vault_watcher_creation_drives_sync_manager() {
     let action = mgr.handle_created(&path_str).unwrap();
 
     assert_eq!(action.kind, SyncActionKind::FileCreated);
-    assert!(mgr.registry().get("meeting").is_some());
+    assert!(mgr.registry().get("meeting.md").is_some());
     assert!(mgr.manifest().contains("meeting.md"));
 
     watcher.stop();
@@ -329,8 +342,7 @@ async fn test_vault_watcher_deletion_drives_sync_manager() {
     let vault = TempDir::new().unwrap();
     std::fs::write(vault.path().join("temp.md"), "temporary").unwrap();
 
-    let (watcher, mut rx) =
-        VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
+    let (watcher, mut rx) = VaultWatcher::new(vault.path(), WatcherConfig::default()).unwrap();
     sleep(SETTLE).await;
 
     let mut mgr = VaultSyncManager::new(VaultSyncConfig::default());
@@ -349,7 +361,7 @@ async fn test_vault_watcher_deletion_drives_sync_manager() {
     let action = mgr.handle_deleted(&path_str);
 
     assert_eq!(action.kind, SyncActionKind::FileDeleted);
-    assert!(mgr.registry().get("temp").is_none());
+    assert!(mgr.registry().get("temp.md").is_none());
     assert!(mgr.manifest().is_deleted("temp.md"));
 
     watcher.stop();
@@ -368,27 +380,12 @@ async fn test_full_vault_sync_two_peers_via_watcher() {
 
     // Alice creates three notes.
     for name in &["project.md", "ideas.md", "todo.md"] {
-        tokio::fs::write(alice_vault.path().join(name), format!("# {name}"))
-            .await
-            .unwrap();
+        tokio::fs::write(alice_vault.path().join(name), format!("# {name}")).await.unwrap();
         sleep(Duration::from_millis(60)).await; // space out events
     }
 
     // Drain all creation events.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, alice_rx.recv()).await {
-            Ok(Some(event)) if event.kind == VaultEventKind::Created => {
-                let path_str = event.path.display().to_string();
-                alice_mgr.handle_created(&path_str).unwrap();
-            }
-            _ => break,
-        }
-    }
+    drain_created_events(&mut alice_rx, &mut alice_mgr).await;
 
     // Bob receives Alice's manifest.
     let manifest_update = alice_mgr.manifest().encode_full_state();
@@ -396,8 +393,8 @@ async fn test_full_vault_sync_two_peers_via_watcher() {
 
     // Bob should now have all three documents.
     assert_eq!(new_for_bob.len(), 3, "Bob should register 3 new documents");
-    for name in &["project", "ideas", "todo"] {
-        assert!(bob_mgr.registry().get(*name).is_some(), "Bob should have {name}");
+    for name in ["project.md", "ideas.md", "todo.md"] {
+        assert!(bob_mgr.registry().get(name).is_some(), "Bob should have {name}");
     }
 
     alice_watcher.stop();

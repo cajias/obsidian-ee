@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::registry::{DocumentRegistry, RegistryError};
-use crate::vault_manifest::{VaultManifest, MANIFEST_DOC_ID};
+use crate::vault_manifest::VaultManifest;
 use crate::DocumentId;
 
 /// Settings that control vault-wide synchronization.
@@ -72,18 +72,13 @@ impl Default for VaultSyncConfig {
 }
 
 impl VaultSyncConfig {
-    /// Create a new config with default values.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Return `true` if `path` (vault-relative) should be included in sync.
     ///
     /// A path is included when:
     /// 1. Its extension matches [`extensions`](Self::extensions).
-    /// 2. If `sync_folders` is non-empty, the path starts with at least one
-    ///    of the listed folder prefixes.
+    /// 2. If `sync_folders` is non-empty, the path is a child of one of the
+    ///    listed folders (`"<folder>/..."`) or exactly equals a listed entry
+    ///    (single-file allowlisting).
     /// 3. None of the `exclude_patterns` match the path as a prefix.
     #[must_use]
     pub fn should_sync(&self, path: &str) -> bool {
@@ -93,39 +88,36 @@ impl VaultSyncConfig {
             return false;
         }
 
-        // 2. Folder allowlist (empty = allow all).
-        if !self.sync_folders.is_empty() {
-            let in_allowed = self.sync_folders.iter().any(|folder| {
-                path.starts_with(folder.as_str())
-                    || path.starts_with(&format!("{folder}/"))
-            });
-            if !in_allowed {
-                return false;
-            }
+        // 2. Folder allowlist (empty = allow all). Match children via a `/`
+        // separator so `"work"` does not also match `"work-notes/..."`.
+        let folder_allowed = self.sync_folders.is_empty()
+            || self
+                .sync_folders
+                .iter()
+                .any(|folder| path == folder || path.starts_with(&format!("{folder}/")));
+        if !folder_allowed {
+            return false;
         }
 
-        // 3. Exclusion patterns (prefix match for now).
-        for pattern in &self.exclude_patterns {
-            // Strip trailing '/*' for simple directory exclusions.
-            let prefix = pattern.trim_end_matches("/*");
-            if path.starts_with(prefix) {
-                return false;
-            }
-        }
-
-        true
+        // 3. Exclusion patterns (prefix match for now). A trailing `/*` is
+        // stripped for simple directory exclusions.
+        let excluded = self
+            .exclude_patterns
+            .iter()
+            .any(|pattern| path.starts_with(pattern.trim_end_matches("/*")));
+        !excluded
     }
 
     /// Derive a `DocumentId` from a vault-relative file path.
     ///
-    /// The document ID is the path with the file extension stripped.
-    /// For example `"notes/meeting.md"` becomes `"notes/meeting"`.
+    /// The document ID *is* the full relative path (extension included), so it
+    /// is injective: distinct files never collide on a `DocumentId`. This lets
+    /// the deletion path match tombstoned manifest entries directly, with no
+    /// extension guessing. For example `"notes/meeting.md"` maps to
+    /// `"notes/meeting.md"`.
     #[must_use]
     pub fn doc_id_for_path(path: &str) -> DocumentId {
-        Path::new(path)
-            .with_extension("")
-            .display()
-            .to_string()
+        path.to_string()
     }
 }
 
@@ -182,33 +174,24 @@ impl VaultSyncManager {
     /// Create a new sync manager with the given configuration.
     #[must_use]
     pub fn new(config: VaultSyncConfig) -> Self {
-        Self {
-            manifest: VaultManifest::new(),
-            registry: DocumentRegistry::new(),
-            config,
-        }
+        Self { manifest: VaultManifest::new(), registry: DocumentRegistry::new(), config }
     }
 
     /// Return a reference to the vault manifest.
     #[must_use]
-    pub fn manifest(&self) -> &VaultManifest {
+    pub const fn manifest(&self) -> &VaultManifest {
         &self.manifest
     }
 
     /// Return a reference to the document registry.
     #[must_use]
-    pub fn registry(&self) -> &DocumentRegistry {
+    pub const fn registry(&self) -> &DocumentRegistry {
         &self.registry
-    }
-
-    /// Return a mutable reference to the document registry.
-    pub fn registry_mut(&mut self) -> &mut DocumentRegistry {
-        &mut self.registry
     }
 
     /// Return a reference to the sync configuration.
     #[must_use]
-    pub fn config(&self) -> &VaultSyncConfig {
+    pub const fn config(&self) -> &VaultSyncConfig {
         &self.config
     }
 
@@ -320,40 +303,38 @@ impl VaultSyncManager {
     /// # Errors
     ///
     /// Returns [`RegistryError`] if the update bytes are malformed.
-    pub fn apply_remote_manifest(
-        &mut self,
-        update: &[u8],
-    ) -> Result<Vec<String>, RegistryError> {
+    pub fn apply_remote_manifest(&mut self, update: &[u8]) -> Result<Vec<String>, RegistryError> {
         self.manifest
             .apply_update(update)
             .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
 
-        let mut newly_registered = Vec::new();
+        // Open documents for alive, in-scope files not yet in the registry.
+        // The doc_id *is* the path, so an unknown doc_id means an unopened file.
+        let to_open: Vec<String> = self
+            .manifest
+            .list_files()
+            .into_iter()
+            .filter(|path| self.config.should_sync(path))
+            .filter(|path| {
+                self.registry.get(path).is_none() && self.registry.get_encrypted(path).is_none()
+            })
+            .collect();
 
-        // Open documents for alive files not yet in registry.
-        for path in self.manifest.list_files() {
-            if !self.config.should_sync(&path) {
-                continue;
-            }
-            let doc_id = VaultSyncConfig::doc_id_for_path(&path);
-            if self.registry.get(&doc_id).is_none() && self.registry.get_encrypted(&doc_id).is_none() {
-                self.registry.create(&doc_id)?;
-                newly_registered.push(path);
-            }
+        let mut newly_registered = Vec::with_capacity(to_open.len());
+        for path in to_open {
+            self.registry.create(&path)?;
+            newly_registered.push(path);
         }
 
         // Close documents whose files were deleted remotely.
-        // Collect all doc_ids that should be removed, then close them.
+        // The doc_id *is* the vault-relative path, so it matches the tombstone
+        // key directly — no extension guessing required.
         let to_remove: Vec<String> = self
             .registry
             .list()
             .into_iter()
-            .filter(|doc_id| {
-                // Convert doc_id back to a path by appending the primary extension.
-                let path_guess = format!("{doc_id}.md");
-                self.manifest.is_deleted(&path_guess)
-            })
-            .map(|s| s.to_string())
+            .filter(|doc_id| self.manifest.is_deleted(doc_id))
+            .cloned()
             .collect();
 
         for doc_id in to_remove {
@@ -361,12 +342,6 @@ impl VaultSyncManager {
         }
 
         Ok(newly_registered)
-    }
-
-    /// The well-known document ID for the manifest itself.
-    #[must_use]
-    pub fn manifest_doc_id() -> &'static str {
-        MANIFEST_DOC_ID
     }
 }
 
@@ -394,19 +369,24 @@ mod tests {
 
     #[test]
     fn test_sync_folders_filter() {
-        let mut cfg = VaultSyncConfig::default();
-        cfg.sync_folders = vec!["work".to_string()];
+        let cfg = VaultSyncConfig { sync_folders: vec!["work".to_string()], ..Default::default() };
 
         assert!(cfg.should_sync("work/project.md"));
         assert!(cfg.should_sync("work/meeting.md"));
         assert!(!cfg.should_sync("personal/diary.md"));
         assert!(!cfg.should_sync("README.md"));
+        // A sibling folder that merely shares the prefix must NOT match:
+        // "work" must not swallow "work-notes/..." or "workspace/...".
+        assert!(!cfg.should_sync("work-notes/secret.md"));
+        assert!(!cfg.should_sync("workspace/private.md"));
     }
 
     #[test]
     fn test_exclude_patterns_filter() {
-        let mut cfg = VaultSyncConfig::default();
-        cfg.exclude_patterns = vec![".obsidian/*".to_string(), "templates/*".to_string()];
+        let cfg = VaultSyncConfig {
+            exclude_patterns: vec![".obsidian/*".to_string(), "templates/*".to_string()],
+            ..Default::default()
+        };
 
         assert!(!cfg.should_sync(".obsidian/config.md"));
         assert!(!cfg.should_sync("templates/daily.md"));
@@ -424,10 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn test_doc_id_for_path_strips_extension() {
-        assert_eq!(VaultSyncConfig::doc_id_for_path("notes/hello.md"), "notes/hello");
-        assert_eq!(VaultSyncConfig::doc_id_for_path("README.md"), "README");
-        assert_eq!(VaultSyncConfig::doc_id_for_path("a/b/c.md"), "a/b/c");
+    fn test_doc_id_for_path_is_full_path() {
+        assert_eq!(VaultSyncConfig::doc_id_for_path("notes/hello.md"), "notes/hello.md");
+        assert_eq!(VaultSyncConfig::doc_id_for_path("README.md"), "README.md");
+        assert_eq!(VaultSyncConfig::doc_id_for_path("a/b/c.md"), "a/b/c.md");
+    }
+
+    #[test]
+    fn test_doc_id_is_injective_across_extensions() {
+        // Two files sharing a stem but differing by extension must map to
+        // distinct doc_ids so they never share a CRDT document.
+        let md = VaultSyncConfig::doc_id_for_path("notes/a.md");
+        let canvas = VaultSyncConfig::doc_id_for_path("notes/a.canvas");
+        assert_ne!(md, canvas);
     }
 
     // ── VaultSyncManager lifecycle ───────────────────────────────
@@ -440,7 +429,7 @@ mod tests {
         assert_eq!(action.kind, SyncActionKind::FileCreated);
         assert!(!action.manifest_update.is_empty());
         assert!(mgr.manifest().contains("notes/hello.md"));
-        assert!(mgr.registry().get("notes/hello").is_some());
+        assert!(mgr.registry().get("notes/hello.md").is_some());
     }
 
     #[test]
@@ -462,20 +451,19 @@ mod tests {
         assert_eq!(action.kind, SyncActionKind::FileDeleted);
         assert!(!action.manifest_update.is_empty());
         assert!(mgr.manifest().is_deleted("notes/hello.md"));
-        assert!(mgr.registry().get("notes/hello").is_none());
+        assert!(mgr.registry().get("notes/hello.md").is_none());
     }
 
     #[test]
     fn test_handle_deleted_ignores_when_sync_deletions_disabled() {
-        let mut cfg = VaultSyncConfig::default();
-        cfg.sync_deletions = false;
+        let cfg = VaultSyncConfig { sync_deletions: false, ..Default::default() };
         let mut mgr = VaultSyncManager::new(cfg);
         mgr.handle_created("notes/hello.md").unwrap();
         let action = mgr.handle_deleted("notes/hello.md");
 
         assert_eq!(action.kind, SyncActionKind::Ignored);
         // Document should still be open.
-        assert!(mgr.registry().get("notes/hello").is_some());
+        assert!(mgr.registry().get("notes/hello.md").is_some());
     }
 
     #[test]
@@ -485,14 +473,11 @@ mod tests {
 
         let action = mgr.handle_renamed("old.md", "new.md").unwrap();
 
-        assert_eq!(
-            action.kind,
-            SyncActionKind::FileRenamed { new_path: "new.md".to_string() }
-        );
+        assert_eq!(action.kind, SyncActionKind::FileRenamed { new_path: "new.md".to_string() });
         assert!(mgr.manifest().is_deleted("old.md"));
         assert!(mgr.manifest().contains("new.md"));
-        assert!(mgr.registry().get("old").is_none());
-        assert!(mgr.registry().get("new").is_some());
+        assert!(mgr.registry().get("old.md").is_none());
+        assert!(mgr.registry().get("new.md").is_some());
     }
 
     #[test]
@@ -509,8 +494,8 @@ mod tests {
 
         // Bob should now have both documents open.
         assert_eq!(newly_registered.len(), 2);
-        assert!(bob.registry().get("shared").is_some());
-        assert!(bob.registry().get("alice-only").is_some());
+        assert!(bob.registry().get("shared.md").is_some());
+        assert!(bob.registry().get("alice-only.md").is_some());
     }
 
     #[test]
@@ -523,7 +508,7 @@ mod tests {
         let mut bob = VaultSyncManager::new(VaultSyncConfig::default());
         let initial_bytes = alice.manifest().encode_full_state();
         bob.apply_remote_manifest(&initial_bytes).unwrap();
-        assert!(bob.registry().get("shared").is_some(), "Bob should have shared after init");
+        assert!(bob.registry().get("shared.md").is_some(), "Bob should have shared after init");
 
         // Alice now deletes "shared.md" and sends the updated manifest.
         alice.handle_deleted("shared.md");
@@ -534,11 +519,52 @@ mod tests {
         // No new registrations expected.
         assert!(newly_registered.is_empty());
         // Bob should no longer have the document — Alice's later deletion wins.
-        assert!(bob.registry().get("shared").is_none(), "Bob should close shared after remote delete");
+        assert!(
+            bob.registry().get("shared.md").is_none(),
+            "Bob should close shared after remote delete"
+        );
     }
 
     #[test]
-    fn test_manifest_doc_id_constant() {
-        assert_eq!(VaultSyncManager::manifest_doc_id(), "__vault_manifest__");
+    fn test_custom_extension_no_collision_with_md_stem() {
+        // Two files sharing a stem but differing by synced extension must each
+        // get their own document — the second create must NOT be skipped.
+        let mut cfg = VaultSyncConfig::default();
+        cfg.extensions.insert("canvas".to_string());
+        let mut mgr = VaultSyncManager::new(cfg);
+
+        let md = mgr.handle_created("notes/a.md").unwrap();
+        let canvas = mgr.handle_created("notes/a.canvas").unwrap();
+
+        assert_eq!(md.kind, SyncActionKind::FileCreated);
+        assert_eq!(canvas.kind, SyncActionKind::FileCreated);
+        assert!(mgr.registry().get("notes/a.md").is_some());
+        assert!(mgr.registry().get("notes/a.canvas").is_some());
+
+        // Deleting one must not close the other.
+        mgr.handle_deleted("notes/a.md");
+        assert!(mgr.registry().get("notes/a.md").is_none());
+        assert!(mgr.registry().get("notes/a.canvas").is_some());
+    }
+
+    #[test]
+    fn test_apply_remote_manifest_closes_non_md_extension() {
+        // Regression: remote deletion of a non-md file must close the local
+        // document. The old `.md`-guessing reconstruction never matched here.
+        let mut cfg = VaultSyncConfig::default();
+        cfg.extensions.insert("canvas".to_string());
+        let mut alice = VaultSyncManager::new(cfg.clone());
+        alice.handle_created("board.canvas").unwrap();
+
+        let mut bob = VaultSyncManager::new(cfg);
+        bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
+        assert!(bob.registry().get("board.canvas").is_some(), "Bob should open the canvas");
+
+        alice.handle_deleted("board.canvas");
+        bob.apply_remote_manifest(&alice.manifest().encode_full_state()).unwrap();
+        assert!(
+            bob.registry().get("board.canvas").is_none(),
+            "Bob should close the canvas on remote delete"
+        );
     }
 }

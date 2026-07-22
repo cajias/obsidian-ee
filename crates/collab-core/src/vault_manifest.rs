@@ -85,13 +85,7 @@ impl VaultManifest {
         let txn = self.doc.transact();
         self.map
             .iter(&txn)
-            .filter_map(|(key, value)| {
-                if is_alive(&value) {
-                    Some(key.to_string())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(key, value)| if is_alive(&value) { Some(key.to_string()) } else { None })
             .collect()
     }
 
@@ -132,8 +126,7 @@ impl VaultManifest {
         let sv = if state_vector.is_empty() {
             yrs::StateVector::default()
         } else {
-            yrs::StateVector::decode_v1(state_vector)
-                .map_err(|e| Error::Yrs(e.to_string()))?
+            yrs::StateVector::decode_v1(state_vector).map_err(|e| Error::Yrs(e.to_string()))?
         };
         Ok(txn.encode_state_as_update_v1(&sv))
     }
@@ -155,23 +148,6 @@ impl VaultManifest {
         txn.apply_update(Update::decode_v1(update).map_err(|e| Error::Yrs(e.to_string()))?)
             .map_err(|e| Error::Yrs(e.to_string()))
     }
-
-    /// Return the paths that are present in `other_state_vector` but *absent*
-    /// (or deleted) in this manifest — i.e. the files this manifest knows about
-    /// that the remote peer does not yet have.
-    ///
-    /// This is useful when bootstrapping a new peer: compare their state vector
-    /// against ours to discover which files they are missing.
-    #[must_use]
-    pub fn files_unknown_to(&self, other_state_vector: &[u8]) -> Vec<String> {
-        // A full diff would require walking the Yrs update, which is complex.
-        // The simpler and sufficient approach for bootstrapping is: the remote
-        // peer applies our full update via `apply_update`, so both converge.
-        // This method provides a *hint* by listing all alive files — the caller
-        // can filter against whatever the remote has already registered.
-        let _ = other_state_vector; // reserved for future incremental optimisation
-        self.list_files()
-    }
 }
 
 impl Default for VaultManifest {
@@ -181,7 +157,7 @@ impl Default for VaultManifest {
 }
 
 /// Returns `true` for an `Out` value that represents a live file (`bool == true`).
-fn is_alive(value: &Out) -> bool {
+const fn is_alive(value: &Out) -> bool {
     matches!(value, Out::Any(yrs::Any::Bool(true)))
 }
 
@@ -333,8 +309,11 @@ mod tests {
         bob.apply_update(&alice.encode_full_state()).unwrap();
 
         // Convergence check: both agree on the same value for "shared.md".
-        assert_eq!(alice.contains("shared.md"), bob.contains("shared.md"),
-            "Alice and Bob must converge to the same state for 'shared.md'");
+        assert_eq!(
+            alice.contains("shared.md"),
+            bob.contains("shared.md"),
+            "Alice and Bob must converge to the same state for 'shared.md'"
+        );
     }
 
     #[test]
@@ -368,17 +347,5 @@ mod tests {
     #[test]
     fn test_manifest_doc_id_constant() {
         assert_eq!(MANIFEST_DOC_ID, "__vault_manifest__");
-    }
-
-    #[test]
-    fn test_files_unknown_to_returns_all_alive_files() {
-        let m = VaultManifest::new();
-        m.add_file("a.md");
-        m.add_file("b.md");
-        m.delete_file("a.md");
-
-        let unknown = m.files_unknown_to(&[]);
-        // Only "b.md" is alive, so only it appears.
-        assert_eq!(unknown, vec!["b.md".to_string()]);
     }
 }
