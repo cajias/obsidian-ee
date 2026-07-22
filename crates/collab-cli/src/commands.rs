@@ -311,12 +311,16 @@ fn handle_server_message(server_msg: collab_proto::ServerMessage) {
 
 /// Run the WebSocket session: identify, subscribe, and process messages.
 ///
-/// Returns `Ok(())` when the server closes the connection or the message
-/// stream ends.
+/// Returns `Ok(())` only on a genuine graceful shutdown — a server-side
+/// `Close` frame.
 ///
 /// # Errors
 ///
-/// Returns an error on WebSocket send failures during the handshake phase.
+/// Returns an error on WebSocket send failures during the handshake phase, on
+/// a read-loop transport error, or when the stream ends without a `Close`
+/// frame. These are surfaced (rather than collapsed into `Ok(())`) so the
+/// caller can distinguish a dropped connection from a clean shutdown and
+/// reconnect accordingly.
 async fn run_ws_session(
     ws: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -348,11 +352,10 @@ async fn run_ws_session(
             }
             Ok(Message::Close(_)) => {
                 println!("Connection closed by server");
-                break;
+                return Ok(());
             }
             Err(e) => {
-                eprintln!("WebSocket error: {e}");
-                break;
+                return Err(anyhow::anyhow!("WebSocket transport error: {e}"));
             }
             _ => {
                 // Ping/Pong handled by tungstenite at protocol level
@@ -360,7 +363,9 @@ async fn run_ws_session(
         }
     }
 
-    Ok(())
+    // Stream ended without a Close frame: the socket dropped mid-session.
+    // Report it as an error so the caller reconnects instead of exiting clean.
+    Err(anyhow::anyhow!("connection dropped: stream ended without a close frame"))
 }
 
 /// Connect to a relay server and listen for updates.
@@ -505,6 +510,53 @@ mod tests {
         let result = init("test-doc", "alice", None).unwrap();
         assert_eq!(result.doc_id, "test-doc");
         assert_eq!(result.user_id, "alice");
+    }
+
+    /// Bind an ephemeral loopback listener and return it with its `ws://` URL.
+    async fn bind_ws() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, format!("ws://{addr}"))
+    }
+
+    /// Accept one connection, drain the client's Identify + Subscribe
+    /// handshake, then either send a clean `Close` frame (`clean_close`) or
+    /// drop the socket abruptly with no close frame.
+    async fn serve_then_end(listener: tokio::net::TcpListener, clean_close: bool) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _ = ws.next().await;
+        let _ = ws.next().await;
+        if clean_close {
+            ws.send(Message::Close(None)).await.unwrap();
+            let _ = ws.next().await; // await the client's close ack
+        }
+        drop(ws);
+    }
+
+    /// A genuine server-side `Close` frame is the only path that yields
+    /// `Ok(())` — `handle_connect_action` maps that to a clean exit (`Break`).
+    #[tokio::test]
+    async fn run_ws_session_returns_ok_on_clean_close() {
+        let (listener, url) = bind_ws().await;
+        tokio::spawn(serve_then_end(listener, true));
+
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let result = run_ws_session(ws, "user", "doc").await;
+        assert!(result.is_ok(), "clean close must return Ok, got {result:?}");
+    }
+
+    /// A mid-session transport drop (no `Close` frame) must return `Err` so
+    /// `handle_connect_action` retries (`Continue`) instead of reporting a
+    /// clean disconnect. This is the exact regression the fix guards against.
+    #[tokio::test]
+    async fn run_ws_session_returns_err_on_transport_drop() {
+        let (listener, url) = bind_ws().await;
+        tokio::spawn(serve_then_end(listener, false));
+
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let result = run_ws_session(ws, "user", "doc").await;
+        assert!(result.is_err(), "transport drop must return Err, got {result:?}");
     }
 
     #[test]
