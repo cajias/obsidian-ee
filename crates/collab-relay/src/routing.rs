@@ -57,17 +57,39 @@ impl MessageRouter {
 
     /// Register a client for message routing.
     ///
-    /// If a different connection is already registered for this user, that older
-    /// session is explicitly evicted (a best-effort [`ServerMessage::Error`] with
+    /// If a different connection is already registered for this user and
+    /// `allow_takeover` is true, that older session is explicitly evicted (a
+    /// best-effort [`ServerMessage::Error`] with
     /// [`collab_proto::ErrorCode::SessionReplaced`] is sent, then its connection
-    /// is signalled to close). The newer connection always wins, which — combined
+    /// is signalled to close). The newer connection then wins, which — combined
     /// with the connection-id check in [`Self::unregister_client`] — makes the
     /// reconnect path deterministic and free of the stale-cleanup race.
-    pub async fn register_client(&self, handle: ClientHandle) {
+    ///
+    /// If `allow_takeover` is false and a different live connection holds this
+    /// user id, the existing session is left untouched and this returns `false`
+    /// without registering. Under the shared-token model an unauthenticated peer
+    /// must not be able to force-evict an arbitrary user.
+    ///
+    /// Returns `true` if `handle` is now the registered session.
+    pub async fn register_client(&self, handle: ClientHandle, allow_takeover: bool) -> bool {
         let mut clients = self.clients.write().await;
-        let stale =
-            clients.get(&handle.user_id).filter(|previous| previous.conn_id() != handle.conn_id());
-        if let Some(previous) = stale {
+        let has_stale_session = clients
+            .get(&handle.user_id)
+            .is_some_and(|previous| previous.conn_id() != handle.conn_id());
+
+        // ponytail: shared-token model — per-identity binding deferred until multi-tenant auth exists
+        if has_stale_session && !allow_takeover {
+            tracing::warn!(
+                user = %handle.user_id,
+                "Refusing takeover of live session by unauthenticated Identify"
+            );
+            return false;
+        }
+
+        // A stale session reaching here means takeover is permitted: evict it.
+        if let Some(previous) =
+            clients.get(&handle.user_id).filter(|p| p.conn_id() != handle.conn_id())
+        {
             tracing::debug!(
                 user = %handle.user_id,
                 old_conn = previous.conn_id(),
@@ -81,6 +103,7 @@ impl MessageRouter {
             previous.signal_close();
         }
         clients.insert(handle.user_id.clone(), handle);
+        true
     }
 
     /// Unregister a client's live handle on disconnect.
@@ -173,11 +196,33 @@ impl MessageRouter {
             self.disconnect_slow(&slow).await;
         }
 
-        for subscriber_id in offline.iter().chain(slow.iter()) {
-            self.offline.enqueue(subscriber_id, message.clone()).await;
+        // Enqueue for offline/slow subscribers. The offline queue may evict the
+        // least-recently-seen user when full; that user's subscriptions must be
+        // dropped too, otherwise a never-reconnecting user pins subscription
+        // slots forever (the per-doc / global caps would fill with dead members).
+        let mut evicted: Vec<UserId> = Vec::new();
+        for subscriber_id in offline.iter().chain(slow.iter().map(|(id, _)| id)) {
+            let user = self.offline.enqueue(subscriber_id, message.clone()).await;
+            evicted.extend(user);
+        }
+        if !evicted.is_empty() {
+            self.drop_subscriptions(&evicted).await;
         }
 
         sent_count
+    }
+
+    /// Remove `users` from every subscription set, pruning any document whose
+    /// set becomes empty. Called when the offline queue evicts a user, since a
+    /// user's subscription lifetime is tied to offline-queue retention.
+    // ponytail: O(documents) scan per eviction; eviction is rare (only at
+    // capacity), so a reverse user->docs index isn't worth the extra state.
+    async fn drop_subscriptions(&self, users: &[UserId]) {
+        let mut subs = self.subscriptions.write().await;
+        subs.retain(|_doc, set| {
+            set.retain(|member| !users.contains(member));
+            !set.is_empty()
+        });
     }
 
     /// Snapshot of the subscribers of `doc_id`, excluding the sender. Returns
@@ -191,20 +236,22 @@ impl MessageRouter {
     }
 
     /// Attempt to deliver `message` to each subscriber, classifying them into
-    /// `(sent_count, offline, slow)`.
+    /// `(sent_count, offline, slow)`. Slow subscribers carry the `conn_id` of the
+    /// session that was slow, so [`Self::disconnect_slow`] can compare-and-remove
+    /// and never evict a newer session that reconnected in the race window.
     async fn fan_out(
         &self,
         subscribers: &[String],
         message: &ServerMessage,
-    ) -> (usize, Vec<String>, Vec<String>) {
+    ) -> (usize, Vec<String>, Vec<(String, u64)>) {
         let clients = self.clients.read().await;
         let mut sent_count = 0;
         let mut offline: Vec<String> = Vec::new();
-        let mut slow: Vec<String> = Vec::new();
+        let mut slow: Vec<(String, u64)> = Vec::new();
         for subscriber_id in subscribers {
             match clients.get(subscriber_id) {
                 Some(client) if client.send(message.clone()).is_ok() => sent_count += 1,
-                Some(_) => slow.push(subscriber_id.clone()),
+                Some(client) => slow.push((subscriber_id.clone(), client.conn_id())),
                 None => offline.push(subscriber_id.clone()),
             }
         }
@@ -212,15 +259,22 @@ impl MessageRouter {
     }
 
     /// Remove and signal-close a set of too-slow consumers.
+    ///
+    /// Compare-and-remove by `conn_id` (like [`Self::unregister_client`]): a
+    /// handle is only evicted if the stored session still matches the connection
+    /// that was classified as slow, so a newer session that reconnected in the
+    /// race window is never dropped.
     #[allow(clippy::excessive_nesting, clippy::significant_drop_tightening)]
-    async fn disconnect_slow(&self, slow: &[String]) {
+    async fn disconnect_slow(&self, slow: &[(String, u64)]) {
         let mut clients = self.clients.write().await;
-        for subscriber_id in slow {
-            let Some(handle) = clients.remove(subscriber_id) else {
-                continue;
-            };
-            tracing::warn!(subscriber = %subscriber_id, "Disconnecting slow consumer");
-            handle.signal_close();
+        for (subscriber_id, conn_id) in slow {
+            if clients.get(subscriber_id).is_some_and(|h| h.conn_id() == *conn_id) {
+                let handle = clients.remove(subscriber_id);
+                tracing::warn!(subscriber = %subscriber_id, "Disconnecting slow consumer");
+                if let Some(handle) = handle {
+                    handle.signal_close();
+                }
+            }
         }
     }
 
@@ -284,8 +338,8 @@ mod tests {
         let (alice_handle, _alice_rx) = create_test_client("alice", 1);
         let (bob_handle, mut bob_rx) = create_test_client("bob", 2);
 
-        router.register_client(alice_handle).await;
-        router.register_client(bob_handle).await;
+        router.register_client(alice_handle, true).await;
+        router.register_client(bob_handle, true).await;
 
         assert!(router.subscribe("alice", "doc1").await);
         assert!(router.subscribe("bob", "doc1").await);
@@ -318,9 +372,9 @@ mod tests {
         let (bob_handle, mut bob_rx) = create_test_client("bob", 2);
         let (eve_handle, mut eve_rx) = create_test_client("eve", 3);
 
-        router.register_client(alice_handle).await;
-        router.register_client(bob_handle).await;
-        router.register_client(eve_handle).await;
+        router.register_client(alice_handle, true).await;
+        router.register_client(bob_handle, true).await;
+        router.register_client(eve_handle, true).await;
 
         assert!(router.subscribe("alice", "doc1").await);
         assert!(router.subscribe("bob", "doc1").await);
@@ -344,7 +398,7 @@ mod tests {
         let router = MessageRouter::new();
 
         let (alice_handle, mut alice_rx) = create_test_client("alice", 1);
-        router.register_client(alice_handle).await;
+        router.register_client(alice_handle, true).await;
         assert!(router.subscribe("alice", "doc1").await);
 
         let message = ServerMessage::YrsUpdate {
@@ -366,8 +420,8 @@ mod tests {
         let (alice_handle, _alice_rx) = create_test_client("alice", 1);
         let (bob_handle, mut bob_rx) = create_test_client("bob", 2);
 
-        router.register_client(alice_handle).await;
-        router.register_client(bob_handle).await;
+        router.register_client(alice_handle, true).await;
+        router.register_client(bob_handle, true).await;
 
         assert!(router.subscribe("alice", "doc1").await);
         assert!(router.subscribe("bob", "doc1").await);
@@ -390,7 +444,7 @@ mod tests {
     async fn test_unsubscribe_prunes_empty_set() {
         let router = MessageRouter::new();
         let (alice_handle, _rx) = create_test_client("alice", 1);
-        router.register_client(alice_handle).await;
+        router.register_client(alice_handle, true).await;
 
         assert!(router.subscribe("alice", "doc1").await);
         assert!(!router.get_subscribers("doc1").await.is_empty());
@@ -409,9 +463,9 @@ mod tests {
         let (bob_handle, mut bob_rx) = create_test_client("bob", 2);
         let (charlie_handle, mut charlie_rx) = create_test_client("charlie", 3);
 
-        router.register_client(alice_handle).await;
-        router.register_client(bob_handle).await;
-        router.register_client(charlie_handle).await;
+        router.register_client(alice_handle, true).await;
+        router.register_client(bob_handle, true).await;
+        router.register_client(charlie_handle, true).await;
 
         assert!(router.subscribe("alice", "doc1").await);
         assert!(router.subscribe("bob", "doc1").await);
@@ -447,8 +501,8 @@ mod tests {
 
         let (alice_handle, _alice_rx) = create_test_client("alice", 1);
         let (bob_handle, _bob_rx) = create_test_client("bob", 2);
-        router.register_client(alice_handle).await;
-        router.register_client(bob_handle).await;
+        router.register_client(alice_handle, true).await;
+        router.register_client(bob_handle, true).await;
 
         assert!(router.subscribe("alice", "doc1").await);
         assert!(router.subscribe("bob", "doc1").await);
@@ -481,8 +535,8 @@ mod tests {
         // New connection (conn 2) takes over from an older one (conn 1).
         let (old_handle, _old_rx) = create_test_client("alice", 1);
         let (new_handle, _new_rx) = create_test_client("alice", 2);
-        router.register_client(old_handle).await;
-        router.register_client(new_handle).await;
+        router.register_client(old_handle, true).await;
+        router.register_client(new_handle, true).await;
         assert_eq!(router.client_count().await, 1);
 
         // The stale connection's teardown must NOT evict the newer session.
@@ -511,6 +565,70 @@ mod tests {
         assert!(!router.subscribe("c", "doc1").await);
         // Re-subscribing an existing member is still fine.
         assert!(router.subscribe("a", "doc1").await);
+    }
+
+    #[tokio::test]
+    async fn test_offline_eviction_prunes_subscriptions() {
+        // Offline queue tracks at most one user; the second enqueue evicts the
+        // first, whose subscriptions must then be dropped.
+        let router = MessageRouter {
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            offline: OfflineQueue::with_limits(10, 1),
+            max_documents: 100,
+            max_subscribers_per_doc: 100,
+        };
+
+        // Two offline subscribers (no live handles registered).
+        assert!(router.subscribe("u1", "doc1").await);
+        assert!(router.subscribe("u2", "doc1").await);
+
+        // A sender routes an update; both offline subscribers get enqueued.
+        // The offline queue (cap 1) evicts whichever was enqueued first.
+        let msg = ServerMessage::YrsUpdate {
+            doc_id: "doc1".into(),
+            from: "sender".into(),
+            encrypted: vec![1],
+            epoch: 1,
+        };
+        router.route_message("doc1", "sender", msg).await;
+
+        // Exactly one subscriber survives, and it is the one still tracked by the
+        // offline queue. The evicted user is pruned from both. (Fan-out iterates a
+        // HashSet, so which of u1/u2 is evicted is not fixed — assert the
+        // invariant, not a specific identity.)
+        let u1_sub = router.is_subscribed("u1", "doc1").await;
+        let u2_sub = router.is_subscribed("u2", "doc1").await;
+        assert_ne!(u1_sub, u2_sub, "exactly one subscription must survive eviction");
+        assert_eq!(
+            router.is_subscribed("u1", "doc1").await,
+            router.has_offline_messages("u1").await,
+            "u1's subscription must track its offline-queue retention"
+        );
+        assert_eq!(
+            router.is_subscribed("u2", "doc1").await,
+            router.has_offline_messages("u2").await,
+            "u2's subscription must track its offline-queue retention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_slow_is_conn_id_scoped() {
+        let router = MessageRouter::new();
+
+        // A newer session (conn 2) holds the user id.
+        let (new_handle, _new_rx) = create_test_client("alice", 2);
+        router.register_client(new_handle, true).await;
+        assert_eq!(router.client_count().await, 1);
+
+        // A stale slow-classification (conn 1) must NOT evict the newer session.
+        router.disconnect_slow(&[("alice".to_string(), 1)]).await;
+        assert_eq!(router.client_count().await, 1);
+        assert_eq!(router.get_client("alice").await.map(|h| h.conn_id()), Some(2));
+
+        // A matching slow-classification (conn 2) does evict it.
+        router.disconnect_slow(&[("alice".to_string(), 2)]).await;
+        assert_eq!(router.client_count().await, 0);
     }
 
     #[tokio::test]

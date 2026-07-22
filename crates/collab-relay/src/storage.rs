@@ -32,16 +32,18 @@ struct Inner {
 }
 
 /// Evict the least-recently-inserted user's queue while at or above capacity.
-fn evict_if_full(inner: &mut Inner, max_users: usize) {
+///
+/// Returns the evicted user id, if any, so the caller can prune that user's
+/// subscriptions — offline-queue retention is what keeps a subscription alive.
+fn evict_if_full(inner: &mut Inner, max_users: usize) -> Option<UserId> {
     while inner.queues.len() >= max_users {
-        let Some(oldest) = inner.order.pop_front() else {
-            break;
-        };
+        let oldest = inner.order.pop_front()?;
         if inner.queues.remove(&oldest).is_some() {
             tracing::warn!(evicted = %oldest, "Offline queue at capacity; evicted oldest user");
-            break;
+            return Some(oldest);
         }
     }
+    None
 }
 
 /// Stores messages for offline clients.
@@ -70,16 +72,6 @@ impl OfflineQueue {
         }
     }
 
-    /// Create a new offline queue with a custom max messages per user.
-    #[must_use]
-    pub fn with_max_per_user(max_per_user: usize) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Inner::default())),
-            max_per_user,
-            max_users: Self::DEFAULT_MAX_USERS,
-        }
-    }
-
     /// Create a new offline queue with custom per-user and user-count caps.
     #[must_use]
     pub fn with_limits(max_per_user: usize, max_users: usize) -> Self {
@@ -91,13 +83,20 @@ impl OfflineQueue {
     /// If the user's queue exceeds `max_per_user`, the oldest message is
     /// dropped. If tracking this user would exceed `max_users`, the
     /// least-recently-inserted user's entire queue is evicted first.
-    pub async fn enqueue(&self, user_id: &str, message: ServerMessage) {
+    ///
+    /// Returns the evicted user id (if any). The router uses this to also prune
+    /// that user's subscriptions, so a never-reconnecting user cannot pin
+    /// subscription slots forever.
+    pub async fn enqueue(&self, user_id: &str, message: ServerMessage) -> Option<UserId> {
         let mut inner = self.inner.write().await;
 
-        if !inner.queues.contains_key(user_id) {
-            evict_if_full(&mut inner, self.max_users);
+        let evicted = if inner.queues.contains_key(user_id) {
+            None
+        } else {
+            let evicted = evict_if_full(&mut inner, self.max_users);
             inner.order.push_back(user_id.to_string());
-        }
+            evicted
+        };
 
         let queue = inner.queues.entry(user_id.to_string()).or_default();
         queue.push_back(message);
@@ -105,6 +104,7 @@ impl OfflineQueue {
             queue.pop_front();
         }
         drop(inner);
+        evicted
     }
 
     /// Retrieve and clear all queued messages for a user.
@@ -200,7 +200,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::excessive_nesting)]
     async fn test_max_messages_limit() {
-        let queue = OfflineQueue::with_max_per_user(3);
+        let queue = OfflineQueue::with_limits(3, OfflineQueue::DEFAULT_MAX_USERS);
 
         // Queue 5 messages for bob (exceeds limit of 3)
         for i in 1..=5 {

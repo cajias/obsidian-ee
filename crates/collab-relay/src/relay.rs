@@ -359,8 +359,26 @@ impl RelayServer {
         tracing::debug!(conn_id, "User identified: {}", uid);
 
         let handle = ClientHandle::new(uid.clone(), conn_id, tx.clone());
-        *session_close = Some(handle.close_signal());
-        self.router.register_client(handle).await;
+        let close_signal = handle.close_signal();
+        // A session takeover evicts whoever currently holds this user id, so it
+        // is only safe for an *authenticated* Identify. Having passed the
+        // `unauthorized` gate above, `auth_token.is_some()` means auth is enabled
+        // and the presented token matched. With auth disabled, any peer could
+        // claim any user id, so a duplicate Identify must be rejected instead.
+        let allow_takeover = self.auth_token.is_some();
+        if !self.router.register_client(handle, allow_takeover).await {
+            tracing::warn!(user = %uid, "Rejected Identify: user already has an active session");
+            send_msg(
+                tx,
+                ServerMessage::Error {
+                    code: ErrorCode::Unauthorized,
+                    message: "user_id already has an active session".to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+        *session_close = Some(close_signal);
         *user_id = Some(uid.clone());
 
         send_msg(tx, ServerMessage::Identified { user_id: uid.clone() }).await;
@@ -766,16 +784,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duplicate_identify_takes_over_and_closes_old() {
-        let server = TestServer::start().await;
+    async fn test_authenticated_duplicate_identify_takes_over_and_closes_old() {
+        // Takeover is only permitted for authenticated Identify.
+        let server =
+            TestServer::start_with(RelayServer::new().with_auth_token(Some("s3cret".into()))).await;
 
         let mut first = TestClient::connect(&server).await;
-        first.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
+        first
+            .send(ClientMessage::Identify { user_id: "alice".into(), token: Some("s3cret".into()) })
+            .await;
         assert!(matches!(first.recv().await, ServerMessage::Identified { .. }));
 
-        // A second connection identifying as the same user takes over.
+        // A second authenticated connection identifying as the same user takes over.
         let mut second = TestClient::connect(&server).await;
-        second.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
+        second
+            .send(ClientMessage::Identify { user_id: "alice".into(), token: Some("s3cret".into()) })
+            .await;
         assert!(matches!(second.recv().await, ServerMessage::Identified { .. }));
 
         // The first connection is told it was replaced.
@@ -784,6 +808,26 @@ mod tests {
             ServerMessage::Error { code: ErrorCode::SessionReplaced, .. }
         ));
         // (Session-count invariants are covered by the router unit tests.)
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_duplicate_identify_is_rejected() {
+        // With auth disabled, any peer could claim any user id. A duplicate
+        // Identify for a live user must be rejected, not allowed to force-evict
+        // the existing session.
+        let server = TestServer::start().await;
+
+        let mut first = TestClient::connect(&server).await;
+        first.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
+        assert!(matches!(first.recv().await, ServerMessage::Identified { .. }));
+
+        let mut second = TestClient::connect(&server).await;
+        second.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
+        // The impostor is rejected; the original session keeps its slot.
+        assert!(matches!(
+            second.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
     }
 
     #[tokio::test]
