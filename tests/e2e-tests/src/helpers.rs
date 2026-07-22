@@ -94,7 +94,7 @@ impl TestClient {
     pub async fn connect_as(url: &str, user_id: &str) -> anyhow::Result<Self> {
         let mut client = Self::connect(url).await?;
         client.user_id = user_id.to_string();
-        let msg = ClientMessage::Identify { user_id: user_id.to_string() };
+        let msg = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
         client.send(&msg).await?;
         let response = client.recv().await?;
         if !matches!(response, ServerMessage::Identified { .. }) {

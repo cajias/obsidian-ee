@@ -15,7 +15,18 @@ pub type UserId = String;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Identify the user to the server.
-    Identify { user_id: UserId },
+    ///
+    /// `token` is an optional bearer token. When the relay is configured with an
+    /// authentication token (e.g. via `RELAY_AUTH_TOKEN`), a matching `token`
+    /// must be supplied or the relay rejects the connection with
+    /// [`ErrorCode::Unauthorized`]. When the relay has no token configured the
+    /// field is ignored, so existing clients that omit it keep working.
+    Identify {
+        user_id: UserId,
+        /// Optional bearer token authenticating the client to the relay.
+        #[serde(default)]
+        token: Option<String>,
+    },
 
     /// Subscribe to document updates.
     Subscribe { doc_id: DocumentId },
@@ -98,6 +109,13 @@ pub enum ErrorCode {
     InvalidMessage,
     /// Internal server error.
     InternalError,
+    /// Authentication failed (missing or invalid token).
+    Unauthorized,
+    /// A resource limit was exceeded (subscriptions, document id length, etc.).
+    LimitExceeded,
+    /// The session was replaced by a newer connection identifying as the same
+    /// user, or the connection was closed to enforce a resource limit.
+    SessionReplaced,
 }
 
 /// Invite for joining a collaborative document.
