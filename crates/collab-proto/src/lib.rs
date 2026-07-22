@@ -1,6 +1,22 @@
 //! Protocol message types for collaborative editing.
 //!
 //! This crate defines the message types exchanged between clients and the relay server.
+//!
+//! ## Vault-wide synchronization
+//!
+//! Full vault sync is built on top of the existing [`ClientMessage::YrsUpdate`] /
+//! [`ServerMessage::YrsUpdate`] mechanism. A special document (whose `doc_id`
+//! equals `collab_core::MANIFEST_DOC_ID`) carries a Yrs Map that tracks every
+//! file path and its alive/deleted state.
+//!
+//! Client/relay integration is still pending: today the manifest document is
+//! standalone core infrastructure exercised by tests, and no client subscribes
+//! to it on connect yet. When wired up, clients will subscribe to the manifest
+//! document and react to updates by opening or closing documents in their local
+//! registry.
+//!
+//! No new relay-level message types are required: the manifest is just another
+//! Yrs document forwarded opaquely by the relay.
 
 use serde::{Deserialize, Serialize};
 
