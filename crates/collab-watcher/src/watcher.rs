@@ -183,10 +183,7 @@ async fn process_single_event(
 
     // Determine event kind based on file existence and whether we knew about the file before.
     let kind = if path.exists() {
-        let mut known = known_files.lock().unwrap_or_else(|e| {
-            tracing::warn!("known_files mutex was poisoned (recovering): {e}");
-            e.into_inner()
-        });
+        let mut known = lock_known(known_files);
         if known.contains(path) {
             VaultEventKind::Modified
         } else {
@@ -194,13 +191,7 @@ async fn process_single_event(
             VaultEventKind::Created
         }
     } else {
-        known_files
-            .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("known_files mutex was poisoned (recovering): {e}");
-                e.into_inner()
-            })
-            .remove(path);
+        lock_known(known_files).remove(path);
         VaultEventKind::Deleted
     };
 
@@ -213,6 +204,14 @@ async fn process_single_event(
     }
 
     true
+}
+
+/// Lock the known-files set, recovering the guard if the mutex was poisoned.
+fn lock_known(m: &Mutex<HashSet<PathBuf>>) -> std::sync::MutexGuard<'_, HashSet<PathBuf>> {
+    m.lock().unwrap_or_else(|e| {
+        tracing::warn!("known_files mutex was poisoned (recovering): {e}");
+        e.into_inner()
+    })
 }
 
 /// Strip the vault root prefix from a path, returning the relative path.

@@ -61,7 +61,7 @@ enum Commands {
         #[arg(short, long)]
         state: Option<PathBuf>,
     },
-    /// Connect to a relay and collaborate (not yet implemented).
+    /// Connect to a relay and collaborate over WebSocket.
     Connect {
         /// Relay server URL.
         relay_url: String,

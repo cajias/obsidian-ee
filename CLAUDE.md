@@ -72,3 +72,34 @@ docker compose -f docker/docker-compose.yml down
   briefly-offline subscribers
 - **Offline queue**: In-memory today; DynamoDB-backed persistence is planned
   behind a Cargo feature
+
+## Engineering rules (from audit RCA)
+
+These encode failure classes found in past audits that automated linters do not catch.
+
+### Filesystem-watcher tests
+`notify_debouncer_mini` does NOT deliver a 1:1 filesystem-action→event mapping — a
+create can be followed by a content `Modified` in a later debounce window. Tests that
+observe watcher events MUST drain until the stream goes quiet and assert the expected
+kind is *present* (`.any(|e| e.kind == X)`), never `recv()` exactly one event per action.
+The crate's `drain_events`/`collect_events` helpers exist for this.
+
+### Reconnect & connection lifecycle
+- Every connect attempt MUST settle its promise/future exactly once — including a retry
+  attempt whose socket fails *before* opening. A never-settled connect deadlocks the
+  reconnect loop (a dedup guard then returns the stale pending promise forever).
+- Session start/stop (and any resource-owning lifecycle command) MUST be idempotent:
+  guard against a second start that would orphan the prior client/handle.
+- The TS client's reconnect behavior must have state-machine tests mirroring the Rust
+  CLI's — reconnect logic is duplicated across the two and has regressed on both sides.
+
+### Resource bounds
+Any collection fed by untrusted or network-sourced input MUST be bounded by BYTES, not
+just by element count — a per-item count cap with MiB-scale items still permits OOM.
+Charge/credit the byte counter on every add/remove path and keep it O(1).
+
+### Dead code / YAGNI
+Keep internal-crate APIs `pub(crate)` (not `pub`) so `rustc`'s `dead_code` lint flags
+unused items — `pub` items in a workspace-internal crate are never reported as dead.
+Do not add speculative public surface "for later"; a test that exists only to exercise
+otherwise-unused code is a signal to delete the code, not keep it.

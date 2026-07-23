@@ -13,7 +13,6 @@
 //! - Application-layer errors after Identify triggering retry
 //! - Disconnect before handshake completion triggering retry
 //! - Race conditions: concurrent errors and duplicate retry ticks
-//! - Jitter ranges during exponential backoff with delay cap
 //! - WebSocket close frame handling (Normal / Going Away / Abnormal)
 //!
 //! All tests spin up an in-process relay via [`TestServer::start`] (no Docker
@@ -55,13 +54,8 @@ fn manual_config(relay_url: &str) -> ConnectionConfig {
 
 /// Build a [`ConnectionConfig`] with a custom retry policy.
 fn config_with_retries(relay_url: &str, max_retries: u32) -> ConnectionConfig {
-    let policy = RetryPolicy::new(
-        max_retries,
-        Duration::from_millis(10),
-        Duration::from_millis(100),
-        2.0,
-        0.0,
-    );
+    let policy =
+        RetryPolicy::new(max_retries, Duration::from_millis(10), Duration::from_millis(100), 2.0);
     ConnectionConfig::new(relay_url, "user-1", DOC_ID).with_retry_policy(policy)
 }
 
@@ -673,116 +667,6 @@ async fn test_concurrent_error_handling() {
         matches!(sm.state(), ConnectionState::Failed { .. }),
         "Should transition to Failed after exhausting all retries post-race-conditions, got {:?}",
         sm.state()
-    );
-}
-
-/// Test that jitter ranges are correctly computed alongside the state machine's
-/// retry lifecycle in an e2e context.
-///
-/// The `ConnectionStateMachine` emits deterministic base delays in `WaitAndRetry`
-/// actions. Callers are expected to use `RetryPolicy::delay_range_for_attempt()`
-/// to obtain a jittered range and pick a random value within it. This test
-/// verifies:
-///
-/// 1. The state machine emits the correct base delay for each retry attempt
-/// 2. `delay_range_for_attempt()` produces a narrower range (min < base)
-/// 3. Jitter ranges grow with exponential backoff but stay within bounds
-/// 4. The jittered range always contains the base delay as its upper bound
-///
-/// This is exercised against a real relay server to confirm end-to-end behavior.
-#[tokio::test]
-#[allow(clippy::too_many_lines, clippy::excessive_nesting)]
-async fn test_jitter_ranges_during_retry_lifecycle() {
-    let server = TestServer::start().await;
-    let url = server.url().to_owned();
-
-    // Policy: 50ms initial, 2x backoff, 500ms cap, 25% jitter, 5 retries
-    // 5 retries ensures attempt 4 (50ms * 2^4 = 800ms) gets capped to 500ms
-    let policy =
-        RetryPolicy::new(5, Duration::from_millis(50), Duration::from_millis(500), 2.0, 0.25);
-    let config =
-        ConnectionConfig::new(&url, "jitter-user", DOC_ID).with_retry_policy(policy.clone());
-
-    let mut sm = ConnectionStateMachine::new(config);
-
-    // Connect successfully first, then disconnect to trigger retries
-    drive_to_connected(&mut sm, &url).await;
-    assert!(sm.is_connected());
-
-    // Simulate disconnect to enter retry cycle
-    sm.on_disconnected();
-    assert_eq!(*sm.state(), ConnectionState::Reconnecting { attempt: 1 });
-
-    // Verify retry attempts with jitter ranges
-    let expected_base_delays = [
-        Duration::from_millis(50),  // attempt 0: 50ms * 2^0
-        Duration::from_millis(100), // attempt 1: 50ms * 2^1
-        Duration::from_millis(200), // attempt 2: 50ms * 2^2
-        Duration::from_millis(400), // attempt 3: 50ms * 2^3
-        Duration::from_millis(500), // attempt 4: 50ms * 2^4 = 800ms → capped to 500ms
-    ];
-
-    for (i, expected_base) in expected_base_delays.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)]
-        let attempt = (i + 1) as u32; // max 5 retries, no truncation possible
-
-        // State machine should be in Reconnecting
-        assert_eq!(
-            *sm.state(),
-            ConnectionState::Reconnecting { attempt },
-            "Expected Reconnecting at attempt {attempt}"
-        );
-
-        // Verify the WaitAndRetry action has the deterministic base delay
-        let action = sm.next_action();
-        let ConnectionAction::WaitAndRetry { delay, attempt: a } = &action else {
-            panic!("Expected WaitAndRetry at attempt {attempt}, got {action:?}");
-        };
-        assert_eq!(delay, expected_base, "Base delay mismatch at attempt {a}");
-        assert_eq!(*a, attempt);
-
-        // Verify jitter range from the policy (attempt is 1-based, index is 0-based)
-        let (jitter_min, jitter_max) = policy
-            .delay_range_for_attempt(attempt - 1)
-            .expect("Should have delay for this attempt");
-
-        // Jitter max should equal the base delay
-        assert_eq!(
-            jitter_max, *expected_base,
-            "Jitter max should equal base delay at attempt {attempt}"
-        );
-
-        // Jitter min should be base - 25% = 75% of base
-        let expected_min = expected_base.mul_f64(0.75);
-        assert_eq!(
-            jitter_min, expected_min,
-            "Jitter min should be 75% of base at attempt {attempt}"
-        );
-
-        // The jitter range must be non-empty
-        assert!(jitter_min <= jitter_max, "Jitter range must be non-empty");
-
-        // Advance to next attempt (unless this is the last one)
-        let is_last = i == expected_base_delays.len() - 1;
-        if !is_last {
-            sm.on_retry_tick();
-            sm.on_error("simulated failure for jitter test");
-        }
-    }
-
-    // After exhausting all 5 retries, the next error should transition to Failed
-    sm.on_retry_tick();
-    sm.on_error("final failure");
-    assert!(
-        matches!(sm.state(), ConnectionState::Failed { .. }),
-        "Should be Failed after exhausting retries, got {:?}",
-        sm.state()
-    );
-
-    // Verify policy returns None for out-of-range attempts
-    assert!(
-        policy.delay_range_for_attempt(5).is_none(),
-        "Should return None for attempt beyond max_retries"
     );
 }
 

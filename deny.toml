@@ -16,6 +16,8 @@ ignore = [
     "RUSTSEC-2026-0173",
     #   instant, pulled in transitively; upstream is unmaintained.
     "RUSTSEC-2024-0384",
+    #   smallstr via yrs (our CRDT); unmaintained, no semver-compatible fix.
+    "RUSTSEC-2026-0215",
     # libcrux (openmls's crypto backend, pinned at 0.0.x by openmls_rust_crypto
     # 0.4.x) advisories with no semver-compatible fix available yet:
     "RUSTSEC-2026-0207", # incremental portable SHAKE incorrect output

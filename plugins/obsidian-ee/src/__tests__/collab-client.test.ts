@@ -366,6 +366,88 @@ describe('CollabClient', () => {
             // The reconnection logic is tested implicitly through the handleReconnect method
             // which uses exponential backoff
         });
+
+        it('should keep retrying (not deadlock) when reconnect sockets fail before opening', async () => {
+            // Regression test for the reconnect deadlock: after the first successful
+            // connect, a dropped connection triggers handleReconnect -> connect(). If
+            // that retry socket fails to open, its promise must still settle so the
+            // dedup guard is unblocked and the backoff loop can keep going until
+            // max_retries_exceeded fires. Before the fix, the promise never settled,
+            // the dedup guard returned it forever, and no further sockets were created.
+            const OriginalWebSocket = global.WebSocket;
+
+            let constructions = 0;
+            (global as any).WebSocket = class FlakyWebSocket {
+                static OPEN = 1;
+                static CONNECTING = 0;
+                static CLOSING = 2;
+                static CLOSED = 3;
+                readyState = 0;
+                onopen: (() => void) | null = null;
+                onclose: (() => void) | null = null;
+                onerror: ((error: any) => void) | null = null;
+                onmessage: ((event: { data: string }) => void) | null = null;
+                sentMessages: string[] = [];
+
+                constructor() {
+                    constructions++;
+                    const isFirst = constructions === 1;
+                    setTimeout(() => {
+                        if (isFirst) {
+                            // First socket opens successfully.
+                            this.readyState = 1;
+                            this.onopen?.();
+                        } else {
+                            // Every reconnect socket fails before opening:
+                            // onerror THEN onclose (the normal browser failure order).
+                            this.onerror?.(new Error('connect failed'));
+                            this.readyState = 3;
+                            this.onclose?.();
+                        }
+                    }, 0);
+                }
+                send(data: string) {
+                    this.sentMessages.push(data);
+                }
+                close() {
+                    this.readyState = 3;
+                }
+            };
+
+            const testClient = new CollabClient(mockCore, config);
+            const disconnectCallback = jest.fn();
+            testClient.onDisconnect(disconnectCallback);
+
+            try {
+                // Initial connect succeeds.
+                const connectPromise = testClient.connect();
+                jest.runAllTimers();
+                await connectPromise;
+
+                // Drop the live connection to kick off the reconnect/backoff loop.
+                (testClient as any).ws?.onclose?.();
+
+                // Pump the backoff loop step-wise: run only the currently-pending timers,
+                // then flush microtasks. This mirrors real timers, where the microtask
+                // queue (including connect()'s .finally that clears connectPromise) drains
+                // between macrotasks. runAllTimers would batch every timer without that
+                // flush, leaving connectPromise stale and masking the fix under test.
+                for (let i = 0; i < 20; i++) {
+                    jest.runOnlyPendingTimers();
+                    await Promise.resolve();
+                    await Promise.resolve();
+                }
+
+                // The loop ran to exhaustion instead of deadlocking on the first retry:
+                // each failed attempt settled its promise, so new sockets kept being made.
+                expect(constructions).toBeGreaterThan(2);
+                expect(disconnectCallback).toHaveBeenCalledWith('max_retries_exceeded');
+                expect(testClient.getConnectionState()).toBe('disconnected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
     });
 });
 
@@ -677,25 +759,32 @@ describe('CollabClient error handling', () => {
                 close() {}
             };
 
-            // Trigger reconnect by simulating websocket close
-            (client as any).ws?.onclose?.();
+            try {
+                // Trigger reconnect by simulating websocket close
+                (client as any).ws?.onclose?.();
 
-            // Advance timers to trigger reconnect attempt
-            jest.runAllTimers();
+                // Advance timers to trigger reconnect attempt (creates the failing socket
+                // and fires its onerror, which rejects the reconnect connect() promise).
+                jest.runAllTimers();
 
-            // Wait for async operations
-            await Promise.resolve();
-            jest.runAllTimers();
+                // The reconnect failure now surfaces to onErrorCallback through
+                // handleReconnect()'s .catch on the rejected connect() promise. That path
+                // is two microtask hops deep (.finally then .catch), so flush the queue.
+                for (let i = 0; i < 5; i++) {
+                    await Promise.resolve();
+                }
 
-            expect(errorCallback).toHaveBeenCalledWith(
-                expect.objectContaining({
-                    type: 'connection',
-                    message: expect.any(String),
-                })
-            );
-
-            // Restore original WebSocket
-            (global as any).WebSocket = OriginalMockWebSocket;
+                expect(errorCallback).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        type: 'connection',
+                        message: expect.any(String),
+                    })
+                );
+            } finally {
+                // Restore original WebSocket even if the assertion throws, so a failure
+                // here can't leak the failing mock into later tests.
+                (global as any).WebSocket = OriginalMockWebSocket;
+            }
         });
     });
 
@@ -894,7 +983,6 @@ describe('CollabClient initialization verification', () => {
         it('should fail connect() if sendIdentify returns false', async () => {
             // Create a MockWebSocket that has readyState CLOSED when send is called
             const OriginalMockWebSocket = (global as any).WebSocket;
-            let _wsInstance: any;
             (global as any).WebSocket = class FailingSendWebSocket {
                 static OPEN = 1;
                 static CONNECTING = 0;
@@ -906,7 +994,6 @@ describe('CollabClient initialization verification', () => {
                 onerror: ((error: any) => void) | null = null;
                 onclose: (() => void) | null = null;
                 constructor() {
-                    _wsInstance = this;
                     setTimeout(() => this.onopen?.(), 0);
                 }
                 send() {}

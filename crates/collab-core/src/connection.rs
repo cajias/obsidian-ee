@@ -60,11 +60,6 @@ pub struct RetryPolicy {
     max_delay: Duration,
     /// Multiplier applied to the delay after each attempt.
     backoff_multiplier: f64,
-    /// Maximum jitter factor (0.0 = no jitter, 1.0 = full jitter).
-    ///
-    /// When non-zero, the actual delay should be chosen uniformly at random
-    /// from the range returned by [`delay_range_for_attempt`](Self::delay_range_for_attempt).
-    jitter_factor: f64,
 }
 
 /// Actions the caller should perform based on the current state.
@@ -134,26 +129,18 @@ impl RetryPolicy {
         initial_delay: Duration,
         max_delay: Duration,
         backoff_multiplier: f64,
-        jitter_factor: f64,
     ) -> Self {
         debug_assert!(backoff_multiplier > 0.0, "backoff_multiplier must be positive");
         debug_assert!(initial_delay <= max_delay, "initial_delay must not exceed max_delay");
-        debug_assert!(
-            (0.0..=1.0).contains(&jitter_factor),
-            "jitter_factor must be between 0.0 and 1.0"
-        );
-        Self { max_retries, initial_delay, max_delay, backoff_multiplier, jitter_factor }
+        Self { max_retries, initial_delay, max_delay, backoff_multiplier }
     }
 
     /// Compute the deterministic base delay for a given attempt (0-based).
     ///
     /// Returns `None` if `attempt >= max_retries`.
     ///
-    /// This returns the base delay without jitter applied. For the jittered
-    /// range, use [`delay_range_for_attempt`](Self::delay_range_for_attempt).
-    /// The [`ConnectionStateMachine::next_action`] method uses this base delay
-    /// in [`ConnectionAction::WaitAndRetry`]; callers that want jitter should
-    /// use `delay_range_for_attempt` and pick a random value in the range.
+    /// The [`ConnectionStateMachine::next_action`] method uses this delay in
+    /// [`ConnectionAction::WaitAndRetry`].
     #[must_use]
     pub fn delay_for_attempt(&self, attempt: u32) -> Option<Duration> {
         if attempt >= self.max_retries {
@@ -165,19 +152,6 @@ impl RetryPolicy {
 
         Some(delay.min(self.max_delay))
     }
-
-    /// Compute the jittered delay range for a given attempt (0-based).
-    ///
-    /// Returns `None` if `attempt >= max_retries`.
-    /// The returned range is `(min_delay, max_delay)` where the caller
-    /// should pick a random value uniformly in this range.
-    #[must_use]
-    pub fn delay_range_for_attempt(&self, attempt: u32) -> Option<(Duration, Duration)> {
-        let base = self.delay_for_attempt(attempt)?;
-        let jitter_amount = base.mul_f64(self.jitter_factor);
-        let min = base.saturating_sub(jitter_amount);
-        Some((min, base))
-    }
 }
 
 impl Default for RetryPolicy {
@@ -187,7 +161,6 @@ impl Default for RetryPolicy {
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(30),
             backoff_multiplier: 2.0,
-            jitter_factor: 0.25,
         }
     }
 }
@@ -363,12 +336,6 @@ impl ConnectionStateMachine {
         self.state == ConnectionState::Connected
     }
 
-    /// Returns the `auto_connect` setting from the config.
-    #[must_use]
-    pub const fn is_auto_connect(&self) -> bool {
-        self.config.auto_connect
-    }
-
     // -- private helpers -----------------------------------------------------
 
     /// Shared retry logic for `on_disconnected` and `on_error`.
@@ -408,7 +375,6 @@ mod tests {
         assert_eq!(policy.initial_delay, Duration::from_secs(1));
         assert_eq!(policy.max_delay, Duration::from_secs(30));
         assert!((policy.backoff_multiplier - 2.0).abs() < f64::EPSILON);
-        assert!((policy.jitter_factor - 0.25).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -428,14 +394,14 @@ mod tests {
 
     #[test]
     fn retry_policy_caps_at_max_delay() {
-        let policy = RetryPolicy::new(10, Duration::from_secs(1), Duration::from_secs(5), 2.0, 0.0);
+        let policy = RetryPolicy::new(10, Duration::from_secs(1), Duration::from_secs(5), 2.0);
         // attempt 3 would be 8s without cap, but max_delay is 5s
         assert_eq!(policy.delay_for_attempt(3), Some(Duration::from_secs(5)));
     }
 
     #[test]
     fn retry_policy_returns_none_when_max_retries_exceeded() {
-        let policy = RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0);
+        let policy = RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0);
         assert!(policy.delay_for_attempt(3).is_none());
         assert!(policy.delay_for_attempt(4).is_none());
     }
@@ -551,7 +517,7 @@ mod tests {
     fn on_error_transitions_to_failed_when_max_retries_exceeded() {
         let config =
             ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
-                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(30), 2.0),
             );
         let mut sm = ConnectionStateMachine::new(config);
 
@@ -690,7 +656,7 @@ mod tests {
     fn next_action_when_failed_returns_give_up_with_reason() {
         let config =
             ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
-                RetryPolicy::new(1, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+                RetryPolicy::new(1, Duration::from_secs(1), Duration::from_secs(30), 2.0),
             );
         let mut sm = ConnectionStateMachine::new(config);
         sm.on_error("first");
@@ -701,7 +667,7 @@ mod tests {
 
     #[test]
     fn retry_policy_zero_max_retries_fails_immediately() {
-        let policy = RetryPolicy::new(0, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0);
+        let policy = RetryPolicy::new(0, Duration::from_secs(1), Duration::from_secs(30), 2.0);
         assert!(policy.delay_for_attempt(0).is_none());
     }
 
@@ -709,7 +675,7 @@ mod tests {
     fn on_disconnected_transitions_to_failed_when_retries_exhausted() {
         let config =
             ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
-                RetryPolicy::new(1, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+                RetryPolicy::new(1, Duration::from_secs(1), Duration::from_secs(30), 2.0),
             );
         let mut sm = ConnectionStateMachine::new(config);
         // First disconnect
@@ -761,7 +727,7 @@ mod tests {
     fn accept_then_drop_without_stability_reaches_give_up() {
         let config =
             ConnectionConfig::new("ws://localhost:8080", "user-1", "doc-1").with_retry_policy(
-                RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0, 0.0),
+                RetryPolicy::new(3, Duration::from_secs(1), Duration::from_secs(30), 2.0),
             );
         let mut sm = ConnectionStateMachine::new(config);
 
@@ -784,32 +750,5 @@ mod tests {
             sm.state()
         );
         assert!(matches!(sm.next_action(), ConnectionAction::GiveUp { .. }));
-    }
-
-    // -- Jitter tests --------------------------------------------------------
-
-    #[test]
-    fn retry_policy_jitter_range() {
-        let policy =
-            RetryPolicy::new(5, Duration::from_secs(10), Duration::from_secs(60), 2.0, 0.5);
-        let range = policy.delay_range_for_attempt(0).unwrap();
-        // base = 10s, jitter = 50%, so range is 5s to 10s
-        assert_eq!(range, (Duration::from_secs(5), Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn retry_policy_no_jitter() {
-        let policy =
-            RetryPolicy::new(5, Duration::from_secs(10), Duration::from_secs(60), 2.0, 0.0);
-        let range = policy.delay_range_for_attempt(0).unwrap();
-        assert_eq!(range, (Duration::from_secs(10), Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn retry_policy_full_jitter() {
-        let policy =
-            RetryPolicy::new(5, Duration::from_secs(10), Duration::from_secs(60), 2.0, 1.0);
-        let range = policy.delay_range_for_attempt(0).unwrap();
-        assert_eq!(range, (Duration::ZERO, Duration::from_secs(10)));
     }
 }
