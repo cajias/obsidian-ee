@@ -210,4 +210,4 @@ DocumentRegistry
         └── DocumentMetadata { created_at, last_modified, custom: HashMap }
 ```
 
-The registry manages `CollabDocument` instances with metadata tracking (creation time, last-modified time, custom key-value pairs). It supports create, get, close, and open (restore from serialized state) operations. Encrypted document support via `EncryptedDocument` integration is planned.
+The registry manages `CollabDocument` instances with metadata tracking (creation time, last-modified time, custom key-value pairs). It supports create, get, close, and open (restore from serialized state) operations. It also supports encrypted documents via `EncryptedDocument` integration: `create_encrypted`, `join_encrypted`, `get_encrypted` / `get_encrypted_mut`, and `create_invite` (which returns an `Invite` for a pending member's key package).

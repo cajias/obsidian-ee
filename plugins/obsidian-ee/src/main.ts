@@ -69,7 +69,14 @@ export default class CollabPlugin extends Plugin {
     }
 
     async initWasm(): Promise<void> {
-        if (this.wasmInitialized) return;
+        if (this.wasmInitialized) {
+            // WASM module is already loaded; recreate the core cheaply if a prior
+            // stopSession() freed it (F16 lazy re-init). No need to reload the module.
+            if (!this.collabCore) {
+                this.collabCore = new CollabCore();
+            }
+            return;
+        }
 
         // Load WASM from plugin directory (import.meta.url doesn't work in Obsidian)
         const pluginDir = this.manifest.dir;
@@ -107,6 +114,27 @@ export default class CollabPlugin extends Plugin {
     }
 
     async startSession(): Promise<void> {
+        // F15: Guard against double-start. Starting a second session without stopping
+        // the first would orphan the first CollabClient (its WebSocket stays open) and
+        // EditorSync, and overwrite editorChangeHandler so stopSession() could no longer
+        // unregister the first handler.
+        if (this.collabClient || this.editorSync) {
+            new Notice('Collaboration session already active');
+            return;
+        }
+
+        // F16: stopSession() frees and nulls collabCore; re-initialize it lazily here
+        // so we don't hold a live WASM core between sessions.
+        if (!this.collabCore) {
+            try {
+                await this.initWasm();
+            } catch (error) {
+                console.error('[CollabPlugin] Failed to initialize WASM:', error);
+                new Notice('Failed to initialize collaboration plugin');
+                return;
+            }
+        }
+
         if (!this.collabCore) {
             new Notice('Plugin not initialized');
             return;
@@ -196,27 +224,16 @@ export default class CollabPlugin extends Plugin {
             this.collabClient = null;
         }
 
-        // Free and recreate CollabCore to prevent memory leak
+        // F16: Free CollabCore to release WASM memory and null the reference.
+        // startSession() re-creates it lazily via initWasm(), so we don't hold a
+        // live core between sessions (and onunload() won't allocate one just to free it).
         if (this.collabCore) {
             try {
                 this.collabCore.free();
             } catch (error) {
                 console.error('[CollabPlugin] Error freeing WASM resources:', error);
             }
-            // Always null out the reference before recreating to prevent
-            // use-after-free if CollabCore constructor throws
             this.collabCore = null;
-            try {
-                this.collabCore = new CollabCore();
-            } catch (error) {
-                console.error('[CollabPlugin] Error recreating CollabCore:', error);
-                // collabCore remains null and wasmInitialized reset - plugin will need reinitialization
-                this.wasmInitialized = false;
-                new Notice(
-                    'Warning: Plugin needs to be reloaded before starting another session',
-                    10000
-                );
-            }
         }
 
         new Notice('Collaboration session stopped');

@@ -6,6 +6,145 @@ each finding adversarially verified by an independent skeptic, then
 deduplicated and synthesized). 28 confirmed findings → 25 distinct after dedup:
 **4 high, 4 medium, ~17 low.**
 
+## Second audit round (2026-07-22)
+
+The original ledger below claimed the codebase was fully audited and clean.
+That was stale. A fresh fan-out audit — 6 discovery lenses (TS-plugin
+correctness, relay resource safety, dead code / over-engineering, e2e test
+determinism, security/threat-model, and docs-vs-code drift), each finding
+adversarially verified by an independent skeptic, then a re-audit pass over
+the survivors — surfaced **17 confirmed issues beyond the original 25. All 17
+are now resolved.** These ledgers are living documents: this records the
+findings resolved *this round*, not a permanent certificate of cleanliness.
+
+### Correctness (3)
+
+- **TS plugin reconnect deadlock** (`plugins/obsidian-ee/src/collab-client.ts`):
+  after a failed retry attempt the `connect()` promise never settled, so the
+  dedup guard kept returning a stale pending promise forever and exponential
+  backoff silently died during the exact transient outage it exists for;
+  `onDisconnect('max_retries_exceeded')` never fired. Fixed with a per-attempt
+  `hasOpened` flag so every attempt settles exactly once. Regression test added.
+- **TS plugin double-start session leak** (`plugins/obsidian-ee/src/main.ts`,
+  `startSession`): running "Start Collaboration Session" twice orphaned the
+  first `CollabClient` (WebSocket left open) and `EditorSync`, and clobbered
+  `editorChangeHandler` so `stopSession` could no longer deregister it. Fixed
+  with an already-active guard.
+- **3 flaky/failing e2e watcher tests** (`tests/e2e-tests/tests/file_watcher.rs`
+  lifecycle test; `tests/e2e-tests/tests/vault_sync.rs` two-peer + deletion
+  tests): all assumed a 1:1 filesystem-action→event mapping, but
+  `notify_debouncer_mini` legitimately interleaves a trailing `Modified` event
+  (the two-peer test was a deterministic failure, not merely flaky). Fixed by
+  draining events until quiet and asserting the expected kind is present.
+
+### Security / DoS (1)
+
+- **Relay offline-queue memory-exhaustion DoS**
+  (`crates/collab-relay/src/storage.rs`): the queue was count-bounded (1000
+  msgs/user, 10000 users) but **not** byte-bounded, allowing a ~1 TiB resident
+  ceiling via 1 MiB frames × offline-but-subscribed users. Fixed with a 128 MiB
+  global byte budget (`total_bytes` counter, refuse-newest policy, O(1)
+  accounting credited on drain/trim/eviction). 2 new tests.
+
+### Dead code / over-engineering / simplification (7)
+
+- **`DocumentMetadata` subsystem** (`crates/collab-core/src/registry.rs`):
+  timestamps + a custom KV map instantiated on every `create()` but read only
+  by its own tests — no production consumer (vault sync uses CRDT LWW, not
+  timestamps). Deleted subsystem + dedicated tests (~254 LoC).
+- **`RetryPolicy` jitter** (`crates/collab-core/src/connection.rs`):
+  `jitter_factor` + `delay_range_for_attempt()` were computed but never applied
+  (the sole consumer used the un-jittered delay). Deleted the dead jitter
+  surface and its tests.
+- **`is_auto_connect()`** (`crates/collab-core/src/connection.rs`): zero
+  callers — deleted.
+- **4 unreachable variant-mismatch error arms**
+  (`crates/collab-core/src/registry.rs`) in `create`/`open`/`create_encrypted`/
+  `join_encrypted` — replaced with `unreachable!()` since the entry is inserted
+  with a known variant one line above.
+- **Duplicated mutex poison-recovery closure**
+  (`crates/collab-watcher/src/watcher.rs`): extracted to a `lock_known()` helper.
+- **Dead `reconnectTimer` clear block**
+  (`plugins/obsidian-ee/src/collab-client.ts`) in `handleReconnect`'s `else`
+  branch — unreachable, deleted.
+- **`stopSession` eager `CollabCore` recreate**
+  (`plugins/obsidian-ee/src/main.ts`): freed then immediately recreated even on
+  unload; changed to free+null with lazy re-init in `startSession`.
+
+### Docs drift (6)
+
+- `docs/protocol.md` `Invite` structs had wrong fields (stale `key_package`;
+  missing `welcome`/`commit`/`epoch`) — corrected to match the wire type.
+- `connect` was documented as "not implemented" in `README.md` and
+  `crates/collab-cli/src/main.rs` though it is fully implemented.
+- `docs/architecture.md` said encrypted-registry support was "planned" though it
+  exists.
+- `docs/development.md` CI-audit stage description was wrong (trigger, scope, and
+  blocking behaviour) — corrected.
+- `docs/protocol.md` error-code table was missing `unauthorized`,
+  `limit_exceeded`, and `session_replaced`.
+- `docs/protocol.md` `identify` example omitted the optional `token` field.
+
+### Rejected and deferred
+
+- **6 findings adversarially rejected** as false-positives — e.g. the
+  non-constant-time token compare (out of the documented threat model) and
+  `disconnect()`-disables-reconnect (unreachable in production).
+- **1 finding unchanged**: per-document `Subscribe` MLS-membership
+  authorization remains the **same deliberate deferral**, now tracked in the
+  *Deliberate deferrals (still open)* section below — no new debt was added this
+  round.
+
+### Final gate
+
+`cargo fmt` clean; `cargo clippy --workspace --all-targets -D warnings` clean;
+**245 Rust tests + 137 TS tests passing**; the Rust suite stayed green across
+repeated stress runs.
+
+---
+
+## Deliberate deferrals (still open)
+
+Two shortcuts are deliberately deferred, each with a `ponytail:` marker in the
+code naming its ceiling and upgrade path. This section is the canonical record
+for both.
+
+### Deferred: session liveness detection
+
+**Ceiling:** `collab-relay` has no ping/pong, idle-read timeout, or SO_KEEPALIVE
+(`collab-relay/src/routing.rs`, takeover gate), so a session dropped uncleanly
+(wifi/sleep/NAT half-open socket) lingers in `clients` until TCP reaps it (minutes
+to hours). No-auth self-takeover on reconnect papers over this for the reconnecting
+user; a returning user is unaffected but the dead slot still holds memory until TCP
+cleanup.
+
+**Why deferred:** promptly reaping dead sessions matters only once multiple
+distinct tenants share the relay; the work is bundled with shared-token binding
+and gated on multi-tenant auth existing.
+
+**Upgrade path:** add ping/pong or an idle-read timeout to reap dead sessions
+promptly.
+
+### Deferred: fine-grained per-document `Subscribe` authorization
+
+**Ceiling:** the relay authorizes `Subscribe` only by *authenticated identity*
+(the optional `RELAY_AUTH_TOKEN` gate) plus resource caps — it does **not**
+verify that the subscriber is a member of the document's MLS group. Any
+authenticated client can therefore subscribe to any `doc_id`'s ciphertext
+stream and observe metadata (epochs, sender ids, sizes, timing).
+
+**Why deferred:** a zero-knowledge relay cannot see MLS group membership by
+design. Real enforcement needs a relay-checkable, signed subscription capability
+scoped to `doc_id`+epoch (a small capability-token scheme), which is a feature,
+not a cleanup. MLS already prevents non-members from decrypting content, and the
+residual metadata exposure is explicitly out of scope per `docs/security.md`.
+
+**Upgrade path:** issue members a signed subscription capability (e.g. HMAC or
+signature over `doc_id`+epoch from a group-derived key the relay can verify), and
+reject `Subscribe` messages that lack a valid capability.
+
+---
+
 ## Resolution status
 
 **All 25 findings below have been addressed on branch
@@ -27,7 +166,8 @@ deduplicated and synthesized). 28 confirmed findings → 25 distinct after dedup
   (all operations require an authenticated identity behind the optional relay
   token, and subscriptions are capped), but fine-grained per-document MLS
   membership enforcement at a zero-knowledge relay requires a signed
-  subscription-capability scheme and is tracked in `PONYTAIL-DEBT.md`. Note
+  subscription-capability scheme and is tracked in the *Deliberate deferrals
+  (still open)* section above. Note
   that MLS already prevents non-members from decrypting anything, so the residual
   exposure is limited to metadata (which is explicitly out of scope, see
   `docs/security.md`) plus frame injection (bounded by the size/rate caps).
@@ -41,8 +181,8 @@ deduplicated and synthesized). 28 confirmed findings → 25 distinct after dedup
   healthcheck + resource limits added, `version:` key dropped; and the
   nonexistent `infra/` CDK references were removed from the docs.
 
-The original discovery ledger follows. (The separate `PONYTAIL-DEBT.md` ledger
-tracks the one residual above; the replay-protection work is done.)
+The original discovery ledger follows. (The deliberate deferrals are recorded in
+the section above; the replay-protection work is done.)
 
 **Overview:** The dominant risk cluster is the `collab-relay` server's session
 and resource handling. Because `Identify` is completely unauthenticated, an

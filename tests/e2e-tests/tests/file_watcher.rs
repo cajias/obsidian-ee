@@ -205,28 +205,39 @@ async fn test_full_lifecycle_create_modify_delete() {
     sleep(SETTLE_TIME).await;
 
     let file = vault.path().join("lifecycle.md");
+    let expected = PathBuf::from("lifecycle.md");
+
+    // The debouncer does not guarantee a 1:1 filesystem-action-to-event
+    // mapping: a create can emit a trailing content Modified in a later
+    // debounce window. So each phase drains events over a settle window and
+    // asserts the expected kind is present, rather than assuming it is the
+    // sole/next event. The window is comfortably larger than the default
+    // 200ms debounce to keep the assertions deterministic.
+    let window = Duration::from_millis(600);
 
     // Create
     tokio::fs::write(&file, "born").await.unwrap();
-    let event = recv_event(&mut rx).await;
-    assert_eq!(event.kind, VaultEventKind::Created);
-    assert_eq!(event.path, PathBuf::from("lifecycle.md"));
-
-    sleep(SETTLE_TIME).await;
+    let events = drain_events(&mut rx, window).await;
+    assert!(
+        events.iter().any(|e| e.kind == VaultEventKind::Created && e.path == expected),
+        "expected Created for lifecycle.md, got: {events:?}"
+    );
 
     // Modify
     tokio::fs::write(&file, "lived").await.unwrap();
-    let event = recv_event(&mut rx).await;
-    assert_eq!(event.kind, VaultEventKind::Modified);
-    assert_eq!(event.path, PathBuf::from("lifecycle.md"));
-
-    sleep(SETTLE_TIME).await;
+    let events = drain_events(&mut rx, window).await;
+    assert!(
+        events.iter().any(|e| e.kind == VaultEventKind::Modified && e.path == expected),
+        "expected Modified for lifecycle.md, got: {events:?}"
+    );
 
     // Delete
     tokio::fs::remove_file(&file).await.unwrap();
-    let event = recv_event(&mut rx).await;
-    assert_eq!(event.kind, VaultEventKind::Deleted);
-    assert_eq!(event.path, PathBuf::from("lifecycle.md"));
+    let events = drain_events(&mut rx, window).await;
+    assert!(
+        events.iter().any(|e| e.kind == VaultEventKind::Deleted && e.path == expected),
+        "expected Deleted for lifecycle.md, got: {events:?}"
+    );
 
     watcher.stop();
 }

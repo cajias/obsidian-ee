@@ -221,7 +221,7 @@ GitHub Actions workflow (`.github/workflows/ci.yml`):
 
 ```
 Push/PR → Check & Lint → Test → E2E Tests
-Push only → Security Audit (non-blocking)
+Push/PR → Security Audit (blocking)
 ```
 
 | Stage | Trigger | What It Does |
@@ -229,7 +229,7 @@ Push only → Security Audit (non-blocking)
 | Check & Lint | Push, PR | `cargo fmt --check`, `cargo lint`, `cargo build --release` |
 | Test | Push, PR | `cargo test --workspace` |
 | E2E Tests | Push, PR | Docker Compose up, build release, run E2E tests |
-| Security Audit | Push, Schedule | `cargo deny check advisories` (non-blocking, `continue-on-error`) |
+| Security Audit | Push, PR | `cargo deny check` (all sections; blocking, no `continue-on-error`) |
 
 ## Security Scanning
 

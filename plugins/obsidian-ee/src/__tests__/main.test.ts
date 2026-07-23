@@ -194,7 +194,6 @@ describe('CollabPlugin', () => {
             await plugin.onload();
 
             // Mock stopSession to throw
-            const _originalStopSession = plugin.stopSession.bind(plugin);
             plugin.stopSession = jest.fn().mockImplementation(() => {
                 throw new Error('stopSession error');
             });
@@ -342,6 +341,41 @@ describe('CollabPlugin', () => {
             expect(editorSync.setErrorCallback).toHaveBeenCalledWith(expect.any(Function));
         });
 
+        it('should not start a second session while one is already active', async () => {
+            const plugin = createMockPlugin();
+            const onMock = jest.fn().mockReturnValue({ unload: jest.fn() });
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: onMock,
+                offref: jest.fn(),
+            };
+            (plugin as any).registerEvent = jest.fn();
+
+            await plugin.onload();
+            await plugin.startSession();
+
+            const firstClient = (plugin as any).collabClient;
+            const firstSync = (plugin as any).editorSync;
+            const firstHandler = (plugin as any).editorChangeHandler;
+
+            // F15: second start must be a no-op that warns, not orphan the first session.
+            await plugin.startSession();
+
+            expect(Notice).toHaveBeenCalledWith('Collaboration session already active');
+            // First session's objects and handler are untouched.
+            expect((plugin as any).collabClient).toBe(firstClient);
+            expect((plugin as any).editorSync).toBe(firstSync);
+            expect((plugin as any).editorChangeHandler).toBe(firstHandler);
+        });
+
         it('should store editor change handler reference', async () => {
             const plugin = createMockPlugin();
             const mockHandler = { unload: jest.fn() };
@@ -395,7 +429,7 @@ describe('CollabPlugin', () => {
             expect((plugin as any).editorChangeHandler).toBeNull();
         });
 
-        it('should free and recreate CollabCore to prevent memory leak', async () => {
+        it('should free and null CollabCore to prevent memory leak', async () => {
             const plugin = createMockPlugin();
             const offrefMock = jest.fn();
             (plugin as any).app.workspace = {
@@ -421,10 +455,38 @@ describe('CollabPlugin', () => {
             plugin.stopSession();
 
             expect(freeSpy).toHaveBeenCalled();
-            // CollabCore should be recreated (not null)
+            // F16: CollabCore is nulled on stop; startSession re-creates it lazily.
+            expect((plugin as any).collabCore).toBeNull();
+        });
+
+        it('should re-initialize CollabCore lazily on startSession after stop', async () => {
+            const plugin = createMockPlugin();
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: jest.fn(),
+            };
+            (plugin as any).registerEvent = jest.fn();
+
+            await plugin.onload();
+            await plugin.startSession();
+            plugin.stopSession();
+
+            // Core was freed and nulled by stopSession.
+            expect((plugin as any).collabCore).toBeNull();
+
+            // A fresh startSession must lazily re-create the core and succeed.
+            await plugin.startSession();
             expect((plugin as any).collabCore).not.toBeNull();
-            // Should be a new instance
-            expect((plugin as any).collabCore).not.toBe(originalCollabCore);
+            expect((plugin as any).collabClient).not.toBeNull();
         });
 
         it('should handle errors when freeing CollabCore during stopSession', async () => {
@@ -463,8 +525,8 @@ describe('CollabPlugin', () => {
                 expect.any(Error)
             );
 
-            // CollabCore should still be recreated
-            expect((plugin as any).collabCore).not.toBeNull();
+            // F16: CollabCore is nulled even when free() throws.
+            expect((plugin as any).collabCore).toBeNull();
         });
 
         it('should call stopSession when disconnect callback is invoked', async () => {

@@ -291,33 +291,6 @@ fn test_registry_encryption_metadata_tracking() {
     assert_eq!(bob_registry.get_encrypted("doc1").unwrap().epoch(), 2);
 }
 
-/// Test that regular document metadata works for encrypted documents.
-#[test]
-fn test_registry_encrypted_has_document_metadata() {
-    let mut registry = DocumentRegistry::new();
-
-    let before = std::time::SystemTime::now();
-    registry.create_encrypted("doc1", "alice").unwrap();
-    let after = std::time::SystemTime::now();
-
-    // Verify document metadata exists
-    let meta = registry.get_metadata("doc1").unwrap();
-    assert!(meta.created_at() >= before);
-    assert!(meta.created_at() <= after);
-
-    // Can set custom metadata
-    registry.set_custom_metadata("doc1", "purpose", "collaboration").unwrap();
-    let meta = registry.get_metadata("doc1").unwrap();
-    assert_eq!(meta.custom().get("purpose"), Some(&"collaboration".to_string()));
-
-    // Can touch to update last_modified
-    let old_last_modified = meta.last_modified();
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    registry.touch("doc1").unwrap();
-    let new_meta = registry.get_metadata("doc1").unwrap();
-    assert!(new_meta.last_modified() > old_last_modified);
-}
-
 // =============================================================================
 // CONCURRENT OPERATIONS
 // =============================================================================

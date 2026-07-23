@@ -33,23 +33,37 @@ use tokio::time::sleep;
 const SETTLE: Duration = Duration::from_millis(300);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Drain creation events from `rx` (until timeout/close) into `mgr`.
+/// Drain creation events from `rx` (until the watcher goes quiet or the
+/// channel closes) into `mgr`. The debouncer does not deliver creations as a
+/// contiguous run — a create can be followed by a content Modified for the
+/// same file — so non-Created events are skipped rather than treated as a
+/// stop signal.
 async fn drain_created_events(
     rx: &mut tokio::sync::mpsc::Receiver<collab_watcher::VaultEvent>,
     mgr: &mut VaultSyncManager,
 ) {
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+    // Loop until the quiet window elapses or the channel closes.
+    while let Ok(Some(event)) = tokio::time::timeout(SETTLE, rx.recv()).await {
+        if event.kind == VaultEventKind::Created {
+            mgr.handle_created(&event.path.display().to_string()).unwrap();
         }
-        let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
-        if event.kind != VaultEventKind::Created {
-            break;
-        }
-        mgr.handle_created(&event.path.display().to_string()).unwrap();
     }
+}
+
+/// Receive events from `rx` until one of `kind` arrives, returning it.
+///
+/// Filesystem event ordering is not guaranteed (e.g. a stray Modified can
+/// precede a Deleted), so intervening events of other kinds are skipped.
+async fn recv_until(
+    rx: &mut tokio::sync::mpsc::Receiver<collab_watcher::VaultEvent>,
+    kind: VaultEventKind,
+) -> collab_watcher::VaultEvent {
+    while let Ok(Some(event)) = tokio::time::timeout(EVENT_TIMEOUT, rx.recv()).await {
+        if event.kind == kind {
+            return event;
+        }
+    }
+    panic!("timed out or channel closed before receiving {kind:?} event");
 }
 
 // ---------------------------------------------------------------------------
@@ -351,11 +365,10 @@ async fn test_vault_watcher_deletion_drives_sync_manager() {
     // Delete the file.
     tokio::fs::remove_file(vault.path().join("temp.md")).await.unwrap();
 
-    let event = tokio::time::timeout(EVENT_TIMEOUT, rx.recv())
-        .await
-        .expect("timed out")
-        .expect("channel closed");
-    assert_eq!(event.kind, VaultEventKind::Deleted);
+    // Filesystem event ordering is not guaranteed — the debouncer can emit a
+    // stray Modified before the Deleted — so read events until the Deleted
+    // arrives. Nothing follows a delete here, since the file is not recreated.
+    let event = recv_until(&mut rx, VaultEventKind::Deleted).await;
 
     let path_str = event.path.display().to_string();
     let action = mgr.handle_deleted(&path_str);

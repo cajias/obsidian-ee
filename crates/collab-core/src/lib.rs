@@ -24,8 +24,7 @@ pub use document::CollabDocument;
 pub use encryption::{EncryptedDocument, EncryptedOp, Invite};
 pub use mls::{MlsDocumentGroup, PendingMember};
 pub use registry::{
-    DocumentEntry, DocumentMetadata, DocumentRegistry, DocumentVariant, EncryptionMetadata,
-    RegistryError,
+    DocumentEntry, DocumentRegistry, DocumentVariant, EncryptionMetadata, RegistryError,
 };
 pub use vault_manifest::{VaultManifest, MANIFEST_DOC_ID};
 pub use vault_sync::{SyncAction, SyncActionKind, VaultSyncConfig, VaultSyncManager};

@@ -5,7 +5,6 @@ use crate::encryption::EncryptedDocument;
 use crate::{DocumentId, Invite, PendingMember};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
 /// Error types for registry operations.
@@ -88,60 +87,16 @@ impl EncryptionMetadata {
     }
 }
 
-/// Metadata associated with a document.
-#[derive(Debug, Clone)]
-pub struct DocumentMetadata {
-    created_at: SystemTime,
-    last_modified: SystemTime,
-    custom: HashMap<String, String>,
-}
-
-impl DocumentMetadata {
-    /// Create new metadata with current timestamps.
-    fn new() -> Self {
-        let now = SystemTime::now();
-        Self { created_at: now, last_modified: now, custom: HashMap::new() }
-    }
-
-    /// When the document was created.
-    #[must_use]
-    pub const fn created_at(&self) -> SystemTime {
-        self.created_at
-    }
-
-    /// When the document was last modified.
-    #[must_use]
-    pub const fn last_modified(&self) -> SystemTime {
-        self.last_modified
-    }
-
-    /// Custom key-value metadata.
-    #[must_use]
-    pub const fn custom(&self) -> &HashMap<String, String> {
-        &self.custom
-    }
-
-    /// Update `last_modified` to current time.
-    fn touch(&mut self) {
-        self.last_modified = SystemTime::now();
-    }
-}
-
 /// An entry in the document registry containing both the document and its metadata.
 pub struct DocumentEntry {
     variant: DocumentVariant,
-    metadata: DocumentMetadata,
     encryption_metadata: Option<EncryptionMetadata>,
 }
 
 impl DocumentEntry {
     /// Create a new entry with a plain document.
-    fn new_plain(doc: CollabDocument) -> Self {
-        Self {
-            variant: DocumentVariant::Plain(doc),
-            metadata: DocumentMetadata::new(),
-            encryption_metadata: None,
-        }
+    const fn new_plain(doc: CollabDocument) -> Self {
+        Self { variant: DocumentVariant::Plain(doc), encryption_metadata: None }
     }
 
     /// Create a new entry with an encrypted document.
@@ -156,7 +111,6 @@ impl DocumentEntry {
     ) -> Result<Self, RegistryError> {
         Ok(Self {
             variant: DocumentVariant::Encrypted(Box::new(doc)),
-            metadata: DocumentMetadata::new(),
             encryption_metadata: Some(EncryptionMetadata::new(user_id, is_owner)?),
         })
     }
@@ -175,12 +129,6 @@ impl DocumentEntry {
             DocumentVariant::Plain(doc) => Some(doc),
             DocumentVariant::Encrypted(_) => None,
         }
-    }
-
-    /// Get a reference to the document metadata.
-    #[must_use]
-    pub const fn metadata(&self) -> &DocumentMetadata {
-        &self.metadata
     }
 
     /// Get a reference to the encryption metadata (only for encrypted documents).
@@ -233,12 +181,7 @@ impl DocumentRegistry {
         let entry = self.documents.get_mut(&id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Plain(doc) => Ok(doc),
-            DocumentVariant::Encrypted(_) => {
-                error!(document_id = %id, "Internal error: variant mismatch after plain document operation");
-                Err(RegistryError::InternalError(format!(
-                    "Document '{id}' has wrong variant after creation"
-                )))
-            }
+            DocumentVariant::Encrypted(_) => unreachable!("just inserted a Plain entry"),
         }
     }
 
@@ -364,60 +307,8 @@ impl DocumentRegistry {
         let entry = self.documents.get_mut(&id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Plain(doc) => Ok(doc),
-            DocumentVariant::Encrypted(_) => {
-                error!(document_id = %id, "Internal error: variant mismatch after plain document operation");
-                Err(RegistryError::InternalError(format!(
-                    "Document '{id}' has wrong variant after creation"
-                )))
-            }
+            DocumentVariant::Encrypted(_) => unreachable!("just inserted a Plain entry"),
         }
-    }
-
-    /// Get metadata for a document by ID.
-    #[must_use]
-    pub fn get_metadata(&self, id: &str) -> Option<&DocumentMetadata> {
-        self.documents.get(id).map(|entry| &entry.metadata)
-    }
-
-    /// Set custom metadata for a document.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RegistryError::NotFound` if the document does not exist.
-    pub fn set_custom_metadata(
-        &mut self,
-        id: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), RegistryError> {
-        debug!(document_id = %id, key = %key, "Setting custom metadata");
-
-        let entry = self.documents.get_mut(id).ok_or_else(|| {
-            warn!(document_id = %id, "Cannot set metadata: document not found");
-            RegistryError::NotFound(id.to_string())
-        })?;
-
-        entry.metadata.custom.insert(key.to_string(), value.to_string());
-        debug!(document_id = %id, key = %key, "Custom metadata set successfully");
-        Ok(())
-    }
-
-    /// Update the `last_modified` timestamp for a document.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RegistryError::NotFound` if the document does not exist.
-    pub fn touch(&mut self, id: &str) -> Result<(), RegistryError> {
-        debug!(document_id = %id, "Updating last_modified timestamp");
-
-        let entry = self.documents.get_mut(id).ok_or_else(|| {
-            warn!(document_id = %id, "Cannot touch: document not found");
-            RegistryError::NotFound(id.to_string())
-        })?;
-
-        entry.metadata.touch();
-        debug!(document_id = %id, "Timestamp updated successfully");
-        Ok(())
     }
 
     // ==================== Encrypted Document Methods ====================
@@ -462,12 +353,7 @@ impl DocumentRegistry {
         let entry = self.documents.get_mut(&id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => Ok(doc.as_mut()),
-            DocumentVariant::Plain(_) => {
-                error!("Internal error: variant mismatch after encrypted document operation");
-                Err(RegistryError::InternalError(
-                    "Document has wrong variant after encrypted operation".to_string(),
-                ))
-            }
+            DocumentVariant::Plain(_) => unreachable!("just inserted an Encrypted entry"),
         }
     }
 
@@ -536,12 +422,7 @@ impl DocumentRegistry {
         let entry = self.documents.get_mut(&doc_id).expect("just inserted");
         match &mut entry.variant {
             DocumentVariant::Encrypted(doc) => Ok(doc.as_mut()),
-            DocumentVariant::Plain(_) => {
-                error!("Internal error: variant mismatch after encrypted document operation");
-                Err(RegistryError::InternalError(
-                    "Document has wrong variant after encrypted operation".to_string(),
-                ))
-            }
+            DocumentVariant::Plain(_) => unreachable!("just inserted an Encrypted entry"),
         }
     }
 
@@ -783,93 +664,6 @@ mod tests {
         assert!(matches!(result, Err(RegistryError::AlreadyExists(_))));
     }
 
-    // Phase 3 Tests: Metadata Tracking
-
-    #[test]
-    fn test_metadata_has_created_at() {
-        use std::time::SystemTime;
-
-        let mut registry = DocumentRegistry::new();
-        let before = SystemTime::now();
-
-        registry.create("doc-1").unwrap();
-
-        let after = SystemTime::now();
-        let metadata = registry.get_metadata("doc-1").expect("should have metadata");
-
-        assert!(metadata.created_at() >= before);
-        assert!(metadata.created_at() <= after);
-    }
-
-    #[test]
-    fn test_metadata_has_last_modified() {
-        use std::time::SystemTime;
-
-        let mut registry = DocumentRegistry::new();
-        let before = SystemTime::now();
-
-        registry.create("doc-1").unwrap();
-
-        let after = SystemTime::now();
-        let metadata = registry.get_metadata("doc-1").expect("should have metadata");
-
-        assert!(metadata.last_modified() >= before);
-        assert!(metadata.last_modified() <= after);
-    }
-
-    #[test]
-    fn test_last_modified_updates_on_edit() {
-        use std::time::Duration;
-
-        let mut registry = DocumentRegistry::new();
-
-        registry.create("doc-1").unwrap();
-        let initial_modified = registry.get_metadata("doc-1").unwrap().last_modified();
-
-        // Small delay to ensure time difference
-        std::thread::sleep(Duration::from_millis(10));
-
-        // Touch the document to update last_modified
-        registry.touch("doc-1").unwrap();
-
-        let updated_modified = registry.get_metadata("doc-1").unwrap().last_modified();
-        assert!(updated_modified > initial_modified);
-    }
-
-    #[test]
-    fn test_custom_metadata() {
-        let mut registry = DocumentRegistry::new();
-
-        registry.create("doc-1").unwrap();
-
-        // Set custom metadata
-        registry
-            .set_custom_metadata("doc-1", "author", "Alice")
-            .expect("should set custom metadata");
-        registry
-            .set_custom_metadata("doc-1", "version", "1.0")
-            .expect("should set custom metadata");
-
-        let metadata = registry.get_metadata("doc-1").unwrap();
-        assert_eq!(metadata.custom().get("author"), Some(&"Alice".to_string()));
-        assert_eq!(metadata.custom().get("version"), Some(&"1.0".to_string()));
-    }
-
-    #[test]
-    fn test_set_custom_metadata_not_found() {
-        let mut registry = DocumentRegistry::new();
-
-        let result = registry.set_custom_metadata("nonexistent", "key", "value");
-        assert!(matches!(result, Err(RegistryError::NotFound(_))));
-    }
-
-    #[test]
-    fn test_get_metadata_not_found() {
-        let registry = DocumentRegistry::new();
-
-        assert!(registry.get_metadata("nonexistent").is_none());
-    }
-
     // Additional tests for edge cases and error paths
 
     #[test]
@@ -908,14 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn test_touch_nonexistent_returns_error() {
-        let mut registry = DocumentRegistry::new();
-
-        let result = registry.touch("nonexistent");
-        assert!(matches!(result, Err(RegistryError::NotFound(_))));
-    }
-
-    #[test]
     fn test_get_mut_allows_modification() {
         let mut registry = DocumentRegistry::new();
 
@@ -933,18 +719,6 @@ mod tests {
     fn test_default_creates_empty_registry() {
         let registry = DocumentRegistry::default();
         assert!(registry.list().is_empty());
-    }
-
-    #[test]
-    fn test_custom_metadata_overwrites_existing() {
-        let mut registry = DocumentRegistry::new();
-        registry.create("doc-1").unwrap();
-
-        registry.set_custom_metadata("doc-1", "key", "value1").unwrap();
-        registry.set_custom_metadata("doc-1", "key", "value2").unwrap();
-
-        let metadata = registry.get_metadata("doc-1").unwrap();
-        assert_eq!(metadata.custom().get("key"), Some(&"value2".to_string()));
     }
 
     // ==================== Phase 1: Error Types & DocumentVariant ====================

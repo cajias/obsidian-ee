@@ -139,11 +139,18 @@ export class CollabClient {
 
         this.connectionState = 'connecting';
         this.connectPromise = new Promise<void>((resolve, reject) => {
+            // Per-attempt flag: has THIS socket reached onopen yet? Every attempt
+            // (initial or reconnect) must settle its promise exactly once, so that
+            // .finally() clears connectPromise and the dedup guard above won't keep
+            // returning a stale, never-settling promise during a transient outage.
+            let hasOpened = false;
+
             try {
                 this.ws = new WebSocket(this.config.relayUrl);
 
                 this.ws.onopen = () => {
                     console.log('Connected to relay server');
+                    hasOpened = true;
                     this.connectionState = 'connected';
                     this.isInitialConnect = false;
                     // Note: Don't clear connectPromise here - the finally block handles that
@@ -173,27 +180,41 @@ export class CollabClient {
 
                 this.ws.onerror = (error) => {
                     console.error('WebSocket error:', error);
-                    if (this.isInitialConnect) {
+                    if (!hasOpened) {
+                        // Socket failed before opening. Reject this attempt's promise so
+                        // .finally() clears connectPromise (rejection is delegated to
+                        // onclose, which follows onerror, to drive the backoff loop).
                         reject(error);
-                    } else {
-                        // After initial connect, invoke error callback
-                        if (this.onErrorCallback) {
-                            const collabError: CollabError = {
-                                type: 'connection',
-                                message: error instanceof Error ? error.message : 'WebSocket error',
-                                docId: this.config.docId,
-                                originalError: error instanceof Error ? error : undefined,
-                            };
-                            this.onErrorCallback(collabError);
-                        }
+                    } else if (this.onErrorCallback) {
+                        // Post-open error on a live connection: surface via error callback.
+                        const collabError: CollabError = {
+                            type: 'connection',
+                            message: error instanceof Error ? error.message : 'WebSocket error',
+                            docId: this.config.docId,
+                            originalError: error instanceof Error ? error : undefined,
+                        };
+                        this.onErrorCallback(collabError);
                     }
                 };
 
                 this.ws.onclose = () => {
                     console.log('WebSocket closed');
-                    if (this.isInitialConnect) {
-                        // Connection closed during initial connect - reject the promise
-                        reject(new Error('WebSocket closed during initial connection'));
+                    if (!hasOpened) {
+                        // Attempt closed before opening (initial OR reconnect). Settle this
+                        // attempt's promise (no-op if onerror already rejected it) so the
+                        // dedup guard is unblocked, then delegate to the backoff scheduler.
+                        // Settling does NOT abort the retry chain — handleReconnect() runs
+                        // on its own timer independent of this promise.
+                        reject(
+                            new Error(
+                                this.isInitialConnect
+                                    ? 'WebSocket closed during initial connection'
+                                    : 'WebSocket closed during reconnection'
+                            )
+                        );
+                        if (!this.isInitialConnect) {
+                            this.handleReconnect();
+                        }
                     } else {
                         this.handleReconnect();
                     }
@@ -358,11 +379,8 @@ export class CollabClient {
             }, delay);
         } else {
             this.connectionState = 'disconnected';
-            // Clear any pending timer
-            if (this.reconnectTimer) {
-                clearTimeout(this.reconnectTimer);
-                this.reconnectTimer = null;
-            }
+            // reconnectTimer is already null here (cleared at entry, only reassigned
+            // in the branch above), so no timer cleanup is needed.
             if (this.onDisconnectCallback) {
                 this.onDisconnectCallback('max_retries_exceeded');
             }

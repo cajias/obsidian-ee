@@ -79,11 +79,11 @@ Commands:
   keygen   Generate a key package for joining a document
   invite   Create an invite for a new member (run by document owner)
   join     Join an existing collaborative document
-  connect  Connect to a relay and collaborate (not yet implemented)
+  connect  Connect to a relay and collaborate
   demo     Run a demo showing the full E2E encryption flow
 ```
 
-> Note: the `connect` subcommand (live relay collaboration) is scaffolded but **not yet implemented**.
+> Note: the `connect` subcommand is a basic live relay-collaboration client — it connects to the relay over WebSocket, identifies, subscribes to the document, and runs a session with automatic reconnect/retry.
 
 The terminal cast above is generated from [`docs/demo.tape`](docs/demo.tape) with [VHS](https://github.com/charmbracelet/vhs). To regenerate it after building the CLI:
 

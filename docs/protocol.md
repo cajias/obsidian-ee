@@ -19,9 +19,12 @@ Authenticate and associate a user ID with the connection. Must be sent before an
 ```json
 {
   "type": "identify",
-  "user_id": "alice"
+  "user_id": "alice",
+  "token": "s3cr3t"
 }
 ```
+
+`token` is optional. When the relay is configured with an authentication token (via `RELAY_AUTH_TOKEN`), a matching `token` must be supplied or the relay rejects the connection with an `unauthorized` error. When the relay has no token configured the field is ignored, so clients that omit it keep working.
 
 #### `subscribe`
 Join a document channel to receive updates. Requires prior identification.
@@ -161,6 +164,9 @@ Error response from the server.
 | `not_subscribed` | Update sent to unsubscribed document |
 | `invalid_message` | Malformed JSON or unrecognized message |
 | `internal_error` | Server-side failure |
+| `unauthorized` | Missing or invalid auth token (relay configured with `RELAY_AUTH_TOKEN`) |
+| `limit_exceeded` | A resource limit was exceeded (subscriptions, document id length, etc.) |
+| `session_replaced` | Session replaced by a newer connection for the same user, or closed to enforce a resource limit |
 
 ## Session Lifecycle
 
@@ -252,7 +258,9 @@ There are two `Invite` types in different crates:
 ```rust
 pub struct Invite {
     pub doc_id: DocumentId,
-    pub key_package: Vec<u8>,
+    pub welcome: Vec<u8>,
+    pub commit: Vec<u8>,
+    pub epoch: u64,
     pub relay_url: String,
 }
 ```
@@ -264,5 +272,6 @@ pub struct Invite {
     pub doc_id: DocumentId,
     pub welcome: Vec<u8>,
     pub commit: Vec<u8>,
+    pub epoch: u64,
 }
 ```
