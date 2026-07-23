@@ -7,7 +7,14 @@
  * - CRDT-style text synchronization
  */
 
+import { jest, describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/globals';
 import { WebSocket, WebSocketServer } from 'ws';
+import { CollabClient, type CollabClientConfig } from '../collab-client';
+import type { CollabCore as CollabCoreType } from '../wasm/collab_wasm';
+import { loadRealWasm } from './helpers/load-real-wasm';
+
+// Real compiled WASM CollabCore constructor, captured after init in beforeAll.
+let CollabCore!: typeof CollabCoreType;
 
 // Store original WebSocket if it exists
 const OriginalWebSocket = (global as any).WebSocket;
@@ -72,81 +79,6 @@ class NodeWebSocket {
 
 // Override global WebSocket with Node.js implementation
 (global as any).WebSocket = NodeWebSocket;
-
-/**
- * Mock CollabCore that simulates Yrs CRDT behavior with encryption
- * Each instance maintains its own document state
- */
-const createMockCollabCore = () => {
-    let text = '';
-    let encryptionKey: Uint8Array | null = null;
-
-    return {
-        set_encryption_key: jest.fn((key: Uint8Array) => {
-            encryptionKey = key;
-        }),
-        has_encryption_key: jest.fn(() => encryptionKey !== null && encryptionKey.length > 0),
-        get_text: jest.fn(() => text),
-        insert: jest.fn((idx: number, content: string) => {
-            text = text.slice(0, idx) + content + text.slice(idx);
-        }),
-        delete: jest.fn((idx: number, len: number) => {
-            text = text.slice(0, idx) + text.slice(idx + len);
-        }),
-        encode_state_encrypted: jest.fn(() => {
-            if (!encryptionKey || encryptionKey.length === 0) {
-                throw new Error('No encryption key set');
-            }
-            // Capture key after null check for TypeScript
-            const key = encryptionKey;
-            // Simulate encryption: marker bytes + XOR with key + text
-            const encodedText = new TextEncoder().encode(text);
-            const result = new Uint8Array(4 + encodedText.length);
-            // Use first 4 bytes of key as "marker" to verify decryption
-            result.set(key.slice(0, 4), 0);
-            // XOR text with key for simple "encryption"
-            encodedText.forEach((byte, idx) => {
-                const keyByte = key.at(idx % key.length) ?? 0;
-                result.set([byte ^ keyByte], 4 + idx);
-            });
-            return result;
-        }),
-        apply_update_encrypted: jest.fn((encrypted: Uint8Array) => {
-            if (!encryptionKey || encryptionKey.length === 0) {
-                throw new Error('No encryption key set');
-            }
-            // Capture key after null check for TypeScript
-            const key = encryptionKey;
-            // Verify marker bytes match
-            const marker = encrypted.slice(0, 4);
-            const expectedMarker = key.slice(0, 4);
-            const markerMatches = marker.every(
-                (byte, idx) => byte === (expectedMarker.at(idx) ?? -1)
-            );
-            if (!markerMatches) {
-                throw new Error('Decryption failed: key mismatch');
-            }
-            // XOR to decrypt
-            const encryptedText = encrypted.slice(4);
-            const decrypted = new Uint8Array(encryptedText.length);
-            encryptedText.forEach((byte, idx) => {
-                const keyByte = key.at(idx % key.length) ?? 0;
-                decrypted.set([byte ^ keyByte], idx);
-            });
-            text = new TextDecoder().decode(decrypted);
-        }),
-        free: jest.fn(),
-    };
-};
-
-// Mock the WASM module
-jest.mock('../wasm/collab_wasm', () => ({
-    __esModule: true,
-    CollabCore: jest.fn().mockImplementation(createMockCollabCore),
-}));
-
-import { CollabClient, CollabClientConfig } from '../collab-client';
-import { CollabCore } from '../wasm/collab_wasm';
 
 /**
  * Simple mock relay server for integration testing
@@ -262,6 +194,7 @@ describe('Two User Collaboration Integration', () => {
     const sharedEncryptionKey = new Uint8Array(32).fill(42);
 
     beforeAll(async () => {
+        ({ CollabCore } = await loadRealWasm());
         relay = new IntegrationMockRelay();
         await relay.start(RELAY_PORT);
     });
@@ -353,9 +286,9 @@ describe('Two User Collaboration Integration', () => {
         // Wait for message to propagate through relay
         await new Promise((r) => setTimeout(r, 200));
 
-        // User2 should have received the update
+        // User2 should have received the update (behavioral proof that the real
+        // core decrypted and applied client1's ciphertext).
         expect(user2ReceivedText).toBe('Hello');
-        expect(core2.apply_update_encrypted).toHaveBeenCalled();
 
         // Cleanup
         client1.disconnect();
@@ -445,7 +378,7 @@ describe('Two User Collaboration Integration', () => {
         const client2 = new CollabClient(core2, config2);
 
         // Track errors via console and callback
-        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
         const errorCallback = jest.fn();
         client2.onError(errorCallback);
 
@@ -463,14 +396,19 @@ describe('Two User Collaboration Integration', () => {
         client1.sendUpdate('Secret message');
         await new Promise((r) => setTimeout(r, 200));
 
-        // User2 should fail to decrypt (key mismatch)
-        expect(consoleErrorSpy).toHaveBeenCalledWith('Failed to apply update:', expect.any(Error));
+        // User2 should fail to decrypt (key mismatch). The real core throws a
+        // plain { type, message } object (not an Error); assert the wrapper type.
+        expect(consoleErrorSpy).toHaveBeenCalledWith(
+            'Failed to apply update:',
+            expect.objectContaining({ type: 'decryption' })
+        );
 
-        // Error callback should be invoked with decryption error
+        // Error callback should be invoked with a decryption error. handleYrsUpdate
+        // wraps the thrown AEAD failure as { type: 'decryption', ... }. Real AEAD
+        // gives no "key mismatch" text, so match only the wrapper type.
         expect(errorCallback).toHaveBeenCalledWith(
             expect.objectContaining({
                 type: 'decryption',
-                message: expect.stringContaining('key mismatch'),
             })
         );
 

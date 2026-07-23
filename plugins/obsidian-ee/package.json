@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
-    "test": "jest",
-    "test:watch": "jest --watch",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.esm.config.mjs",
+    "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.esm.config.mjs --watch",
     "e2e": "playwright test",
     "e2e:headed": "playwright test --headed",
     "lint": "eslint src/",

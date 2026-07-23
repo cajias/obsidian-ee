@@ -1,14 +1,13 @@
-import { EditorSync } from '../editor-sync';
-import { CollabClient } from '../collab-client';
+import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 
 // Mock CollabClient
-jest.mock('../collab-client', () => ({
+jest.unstable_mockModule('../collab-client', () => ({
     CollabClient: jest.fn().mockImplementation(() => {
         let updateCallback: ((text: string) => void) | null = null;
         return {
             getText: jest.fn().mockReturnValue(''),
             sendUpdate: jest.fn(),
-            onUpdate: jest.fn((cb) => {
+            onUpdate: jest.fn((cb: (text: string) => void) => {
                 updateCallback = cb;
             }),
             // Helper to trigger updates in tests
@@ -16,6 +15,10 @@ jest.mock('../collab-client', () => ({
         };
     }),
 }));
+
+const { EditorSync } = await import('../editor-sync');
+const { CollabClient } = await import('../collab-client');
+type EditorSync = InstanceType<typeof EditorSync>;
 
 // Mock Obsidian Editor
 const createMockEditor = (initialValue = '') => {
@@ -151,7 +154,7 @@ describe('EditorSync', () => {
             expect(errorCallback).toHaveBeenCalledTimes(1);
             const wrappedError = errorCallback.mock.calls[0][0];
             expect(wrappedError).toBeInstanceOf(Error);
-            expect(wrappedError.message).toBe('WASM error message');
+            expect((wrappedError as Error).message).toBe('WASM error message');
 
             consoleSpy.mockRestore();
         });
