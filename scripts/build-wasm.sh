@@ -35,6 +35,12 @@ if ! command -v wasm-pack &> /dev/null; then
     cargo install wasm-pack || error "Failed to install wasm-pack"
 fi
 
+# Ensure wasm32-unknown-unknown target is available
+if ! rustup target list --installed | grep -q wasm32-unknown-unknown; then
+    echo "Adding wasm32-unknown-unknown target..."
+    rustup target add wasm32-unknown-unknown || error "Failed to add wasm32-unknown-unknown target"
+fi
+
 # Verify collab-wasm crate exists
 WASM_CRATE="crates/collab-wasm"
 if [ ! -f "$WASM_CRATE/Cargo.toml" ]; then
@@ -59,3 +65,7 @@ if [ ! -f "$OUTPUT_DIR/collab_wasm.js" ]; then
 fi
 
 success "WASM build complete: $OUTPUT_DIR/"
+
+# wasm-pack re-emits a .gitignore (`*`) in the output dir; remove it so the
+# src/wasm/ directory stays visible to git during development (#24)
+rm -f "$OUTPUT_DIR/.gitignore"

@@ -1,14 +1,16 @@
-import { Notice } from 'obsidian';
+import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 
 // Mock WebAssembly.compile for WASM loading
 const mockWasmModule = {};
-const mockCompile = jest.fn().mockResolvedValue(mockWasmModule);
+const mockCompile = jest
+    .fn<(bytes: BufferSource) => Promise<WebAssembly.Module>>()
+    .mockResolvedValue(mockWasmModule as WebAssembly.Module);
 (global as unknown as { WebAssembly: typeof WebAssembly }).WebAssembly = {
     ...WebAssembly,
     compile: mockCompile,
 };
 
-jest.mock('obsidian', () => ({
+jest.unstable_mockModule('obsidian', () => ({
     Plugin: class {
         app: any;
         manifest: any;
@@ -48,7 +50,7 @@ jest.mock('obsidian', () => ({
     MarkdownView: class {},
 }));
 
-const mockWasmInit = jest.fn().mockResolvedValue(undefined);
+const mockWasmInit = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
 const mockCollabCore = jest.fn().mockImplementation(() => ({
     insert: jest.fn(),
     delete: jest.fn(),
@@ -60,15 +62,15 @@ const mockCollabCore = jest.fn().mockImplementation(() => ({
     free: jest.fn(),
 }));
 
-jest.mock('../wasm/collab_wasm', () => ({
+jest.unstable_mockModule('../wasm/collab_wasm', () => ({
     __esModule: true,
     default: mockWasmInit,
     CollabCore: mockCollabCore,
 }));
 
-jest.mock('../collab-client', () => ({
+jest.unstable_mockModule('../collab-client', () => ({
     CollabClient: jest.fn().mockImplementation(() => ({
-        connect: jest.fn().mockResolvedValue(undefined),
+        connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
         disconnect: jest.fn(),
         getText: jest.fn().mockReturnValue(''),
         sendUpdate: jest.fn(),
@@ -78,7 +80,7 @@ jest.mock('../collab-client', () => ({
     })),
 }));
 
-jest.mock('../editor-sync', () => ({
+jest.unstable_mockModule('../editor-sync', () => ({
     EditorSync: jest.fn().mockImplementation(() => ({
         bindToEditor: jest.fn(),
         unbind: jest.fn(),
@@ -88,14 +90,18 @@ jest.mock('../editor-sync', () => ({
     })),
 }));
 
-import CollabPlugin from '../main';
+const { Notice } = await import('obsidian');
+const { default: CollabPlugin } = await import('../main');
+type CollabPlugin = InstanceType<typeof CollabPlugin>;
 
 // Helper to create a properly mocked plugin instance
 function createMockPlugin(): CollabPlugin {
     const mockApp = {
         vault: {
             adapter: {
-                readBinary: jest.fn().mockResolvedValue(new ArrayBuffer(8)),
+                readBinary: jest
+                    .fn<() => Promise<ArrayBuffer>>()
+                    .mockResolvedValue(new ArrayBuffer(8)),
             },
         },
         workspace: {
@@ -114,15 +120,15 @@ function createMockPlugin(): CollabPlugin {
 }
 
 describe('CollabPlugin', () => {
-    let consoleSpy: jest.SpyInstance;
-    let consoleWarnSpy: jest.SpyInstance;
+    let consoleSpy: ReturnType<typeof jest.spyOn>;
+    let consoleWarnSpy: ReturnType<typeof jest.spyOn>;
 
     beforeEach(() => {
         consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
         consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
         jest.clearAllMocks();
         // Restore mocks after clearAllMocks
-        mockCompile.mockResolvedValue(mockWasmModule);
+        mockCompile.mockResolvedValue(mockWasmModule as WebAssembly.Module);
         mockWasmInit.mockResolvedValue(undefined);
         mockCollabCore.mockImplementation(() => ({
             insert: jest.fn(),
@@ -150,7 +156,9 @@ describe('CollabPlugin', () => {
         const mockApp = {
             vault: {
                 adapter: {
-                    readBinary: jest.fn().mockResolvedValue(new ArrayBuffer(8)),
+                    readBinary: jest
+                        .fn<() => Promise<ArrayBuffer>>()
+                        .mockResolvedValue(new ArrayBuffer(8)),
                 },
             },
             workspace: {
@@ -549,17 +557,19 @@ describe('CollabPlugin', () => {
             (plugin as any).registerEvent = jest.fn();
 
             // Capture the disconnect callback
-            const { CollabClient } = require('../collab-client');
-            CollabClient.mockImplementation(() => ({
-                connect: jest.fn().mockResolvedValue(undefined),
+            const { CollabClient } = await import('../collab-client');
+            (CollabClient as jest.Mock).mockImplementation(() => ({
+                connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
                 disconnect: jest.fn(),
                 getText: jest.fn().mockReturnValue(''),
                 sendUpdate: jest.fn(),
                 onUpdate: jest.fn(),
                 onError: jest.fn(),
-                onDisconnect: jest.fn().mockImplementation((cb: (reason: string) => void) => {
-                    disconnectCallback = cb;
-                }),
+                onDisconnect: jest
+                    .fn<(cb: (reason: string) => void) => void>()
+                    .mockImplementation((cb) => {
+                        disconnectCallback = cb;
+                    }),
             }));
 
             await plugin.onload();

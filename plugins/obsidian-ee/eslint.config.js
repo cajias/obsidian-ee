@@ -156,7 +156,7 @@ module.exports = [
 
     // Config files
     {
-        files: ['*.config.js', '*.config.mjs', 'jest.config.js'],
+        files: ['*.config.js', '*.config.mjs'],
         rules: {
             '@typescript-eslint/no-var-requires': 'off',
         },

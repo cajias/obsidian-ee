@@ -2,8 +2,17 @@
  * Integration tests for encrypted collaboration flow
  *
  * These tests verify that the CollabClient properly integrates with
- * the CollabCore encryption methods for end-to-end encrypted sync.
+ * the REAL compiled WASM CollabCore for end-to-end encrypted sync.
+ *
+ * The core is the REAL AES-256-GCM implementation (loaded from src/wasm),
+ * so incoming-update tests must feed REAL ciphertext produced by a second
+ * real core sharing the key — hand-crafted bytes are rejected by AEAD.
+ * A MockWebSocket remains as the controllable transport.
  */
+
+import { jest, describe, it, expect, beforeEach, beforeAll } from '@jest/globals';
+import type { CollabClientConfig } from '../collab-client';
+import { loadRealWasm } from './helpers/load-real-wasm';
 
 // Mock WebSocket - must be defined before import
 class MockWebSocket {
@@ -43,54 +52,15 @@ class MockWebSocket {
 // @ts-ignore - Override global WebSocket
 global.WebSocket = MockWebSocket;
 
-// Mock encryption key for testing
+// Valid 32-byte AES-256 key for testing
 const mockEncryptionKey = new Uint8Array(32).fill(1);
 
-// Real WASM mock that tracks encryption state
-jest.mock('../wasm/collab_wasm', () => ({
-    __esModule: true,
-    CollabCore: jest.fn().mockImplementation(() => {
-        let text = '';
-        let encryptionKey: Uint8Array | null = null;
+beforeAll(async () => {
+    await loadRealWasm();
+});
 
-        return {
-            set_encryption_key: jest.fn((key: Uint8Array) => {
-                encryptionKey = key;
-            }),
-            has_encryption_key: jest.fn(() => encryptionKey !== null && encryptionKey.length > 0),
-            get_text: jest.fn(() => text),
-            insert: jest.fn((idx: number, content: string) => {
-                text = text.slice(0, idx) + content + text.slice(idx);
-            }),
-            delete: jest.fn((idx: number, len: number) => {
-                text = text.slice(0, idx) + text.slice(idx + len);
-            }),
-            encode_state_encrypted: jest.fn(() => {
-                if (!encryptionKey || encryptionKey.length === 0) {
-                    throw new Error('No encryption key set');
-                }
-                // Simulate encrypted state: key prefix (4 bytes) + encoded text
-                const encodedText = new TextEncoder().encode(text);
-                const result = new Uint8Array(4 + encodedText.length);
-                result.set(encryptionKey.slice(0, 4), 0);
-                result.set(encodedText, 4);
-                return result;
-            }),
-            apply_update_encrypted: jest.fn((encrypted: Uint8Array) => {
-                if (!encryptionKey || encryptionKey.length === 0) {
-                    throw new Error('No encryption key set');
-                }
-                // Simulate decryption - extract text after key prefix
-                const decoded = new TextDecoder().decode(encrypted.slice(4));
-                text = decoded;
-            }),
-            free: jest.fn(),
-        };
-    }),
-}));
-
-import { CollabClient, CollabClientConfig } from '../collab-client';
-import { CollabCore } from '../wasm/collab_wasm';
+const { CollabClient } = await import('../collab-client');
+const { CollabCore } = await import('../wasm/collab_wasm');
 
 describe('Encrypted Collaboration Integration', () => {
     beforeEach(() => {
@@ -110,7 +80,8 @@ describe('Encrypted Collaboration Integration', () => {
 
             new CollabClient(core, config);
 
-            expect(core.set_encryption_key).toHaveBeenCalledWith(mockEncryptionKey);
+            // Behavioral: constructor forwards the key to the real core.
+            expect(core.has_encryption_key()).toBe(true);
         });
 
         it('should accept encryption key of correct length (32 bytes)', () => {
@@ -124,7 +95,7 @@ describe('Encrypted Collaboration Integration', () => {
             };
 
             expect(() => new CollabClient(core, config)).not.toThrow();
-            expect(core.set_encryption_key).toHaveBeenCalledWith(validKey);
+            expect(core.has_encryption_key()).toBe(true);
         });
     });
 
@@ -145,11 +116,8 @@ describe('Encrypted Collaboration Integration', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            // Simulate existing text to trigger update
-            (core.get_text as jest.Mock).mockReturnValue('');
+            // Real core starts empty, so 'Hello' is a genuine insert.
             client.sendUpdate('Hello');
-
-            expect(core.encode_state_encrypted).toHaveBeenCalled();
 
             const ws = MockWebSocket.instances[0];
             const updateMsg = ws.sentMessages.find((m) => m.type === 'yrs_update');
@@ -157,6 +125,17 @@ describe('Encrypted Collaboration Integration', () => {
             expect(updateMsg).toBeDefined();
             expect(updateMsg.encrypted).toBeDefined();
             expect(Array.isArray(updateMsg.encrypted)).toBe(true);
+            expect(updateMsg.encrypted.length).toBeGreaterThan(0);
+
+            // Bulletproof proof: a peer core with the SAME key round-trip
+            // decrypts the shipped payload back to the original text. A
+            // plaintext passthrough (encode_state) cannot survive
+            // apply_update_encrypted, so this pins real AES-256-GCM.
+            const peer = new CollabCore();
+            peer.set_encryption_key(mockEncryptionKey);
+            peer.apply_update_encrypted(new Uint8Array(updateMsg.encrypted));
+            expect(peer.get_text()).toBe('Hello');
+            peer.free();
 
             client.disconnect();
             jest.useRealTimers();
@@ -178,7 +157,6 @@ describe('Encrypted Collaboration Integration', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            (core.get_text as jest.Mock).mockReturnValue('');
             client.sendUpdate('Test message');
 
             const ws = MockWebSocket.instances[0];
@@ -191,6 +169,16 @@ describe('Encrypted Collaboration Integration', () => {
             });
             expect(updateMsg.encrypted).toBeDefined();
             expect(updateMsg.encrypted.length).toBeGreaterThan(0);
+
+            // Bulletproof proof: a peer core with the SAME key round-trip
+            // decrypts the shipped payload back to the original text. A
+            // plaintext passthrough (encode_state) cannot survive
+            // apply_update_encrypted, so this pins real AES-256-GCM.
+            const peer = new CollabCore();
+            peer.set_encryption_key(mockEncryptionKey);
+            peer.apply_update_encrypted(new Uint8Array(updateMsg.encrypted));
+            expect(peer.get_text()).toBe('Test message');
+            peer.free();
 
             client.disconnect();
             jest.useRealTimers();
@@ -214,21 +202,23 @@ describe('Encrypted Collaboration Integration', () => {
             jest.runAllTimers();
             await connectPromise;
 
+            // Produce REAL ciphertext from a second core sharing the key.
+            const sender = new CollabCore();
+            sender.set_encryption_key(mockEncryptionKey);
+            sender.insert(0, 'Hi');
+            const realCipher = [...sender.encode_state_encrypted()];
+
             const ws = MockWebSocket.instances[0];
-            // Simulate encrypted message from another user
-            // Key prefix (4 bytes) + "Hi" encoded
-            const encryptedData = [1, 1, 1, 1, 72, 105]; // [key prefix] + "Hi"
             ws.simulateMessage({
                 type: 'yrs_update',
                 doc_id: 'doc1',
                 from: 'user2',
-                encrypted: encryptedData,
+                encrypted: realCipher,
                 epoch: 0,
             });
 
-            expect(core.apply_update_encrypted).toHaveBeenCalled();
-            const callArg = (core.apply_update_encrypted as jest.Mock).mock.calls[0][0];
-            expect(callArg).toBeInstanceOf(Uint8Array);
+            // Behavioral: decryption + apply succeeded, real text landed.
+            expect(core.get_text()).toBe('Hi');
 
             client.disconnect();
             jest.useRealTimers();
@@ -253,19 +243,23 @@ describe('Encrypted Collaboration Integration', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            // Mock get_text to return decrypted content
-            (core.get_text as jest.Mock).mockReturnValue('Decrypted content');
+            // Real ciphertext for 'Hi' from a peer core with the shared key.
+            const sender = new CollabCore();
+            sender.set_encryption_key(mockEncryptionKey);
+            sender.insert(0, 'Hi');
+            const realCipher = [...sender.encode_state_encrypted()];
 
             const ws = MockWebSocket.instances[0];
             ws.simulateMessage({
                 type: 'yrs_update',
                 doc_id: 'doc1',
                 from: 'user2',
-                encrypted: [1, 1, 1, 1, 68, 101, 99], // Mock encrypted data
+                encrypted: realCipher,
                 epoch: 0,
             });
 
-            expect(updateCallback).toHaveBeenCalledWith('Decrypted content');
+            // Real core returns the actual decrypted text.
+            expect(updateCallback).toHaveBeenCalledWith('Hi');
 
             client.disconnect();
             jest.useRealTimers();
@@ -275,14 +269,9 @@ describe('Encrypted Collaboration Integration', () => {
     describe('encryption error handling', () => {
         it('should handle decryption errors gracefully', async () => {
             jest.useFakeTimers();
-            const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+            const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
             const core = new CollabCore();
-            // Make apply_update_encrypted throw an error
-            (core.apply_update_encrypted as jest.Mock).mockImplementation(() => {
-                throw new Error('Decryption failed');
-            });
-
             const config: CollabClientConfig = {
                 relayUrl: 'ws://localhost:8080',
                 userId: 'user1',
@@ -296,7 +285,7 @@ describe('Encrypted Collaboration Integration', () => {
             await connectPromise;
 
             const ws = MockWebSocket.instances[0];
-            // This should not throw
+            // Real short/foreign ciphertext: AEAD rejects it, the client catches.
             expect(() => {
                 ws.simulateMessage({
                     type: 'yrs_update',
@@ -307,9 +296,12 @@ describe('Encrypted Collaboration Integration', () => {
                 });
             }).not.toThrow();
 
+            // Real errors are PLAIN objects ({type,message}), not Error instances.
+            // [1,2,3,4] deterministically yields a 'Ciphertext too short'
+            // decryption error, so assert the exact wrapper shape.
             expect(consoleErrorSpy).toHaveBeenCalledWith(
                 'Failed to apply update:',
-                expect.any(Error)
+                expect.objectContaining({ type: 'decryption', message: 'Ciphertext too short' })
             );
 
             consoleErrorSpy.mockRestore();
@@ -337,7 +329,7 @@ describe('Encrypted Collaboration Integration', () => {
         it('should complete full encrypted sync cycle', async () => {
             jest.useFakeTimers();
 
-            // Simulate two clients
+            // Simulate two clients backed by real cores sharing the key.
             const core1 = new CollabCore();
             const core2 = new CollabCore();
 
@@ -358,9 +350,9 @@ describe('Encrypted Collaboration Integration', () => {
             const client1 = new CollabClient(core1, config1);
             const client2 = new CollabClient(core2, config2);
 
-            // Both clients set encryption key
-            expect(core1.set_encryption_key).toHaveBeenCalledWith(mockEncryptionKey);
-            expect(core2.set_encryption_key).toHaveBeenCalledWith(mockEncryptionKey);
+            // Both clients set the encryption key on their real cores.
+            expect(core1.has_encryption_key()).toBe(true);
+            expect(core2.has_encryption_key()).toBe(true);
 
             // Connect both clients
             const connect1 = client1.connect();
@@ -368,18 +360,15 @@ describe('Encrypted Collaboration Integration', () => {
             jest.runAllTimers();
             await Promise.all([connect1, connect2]);
 
-            // Client 1 sends an update
-            (core1.get_text as jest.Mock).mockReturnValue('');
+            // Client 1 sends an update (real core starts empty).
             client1.sendUpdate('Hello from user1');
 
-            expect(core1.encode_state_encrypted).toHaveBeenCalled();
-
-            // Get the encrypted message sent by client1
+            // Get the real encrypted message sent by client1
             const ws1 = MockWebSocket.instances[0];
             const sentUpdate = ws1.sentMessages.find((m) => m.type === 'yrs_update');
             expect(sentUpdate).toBeDefined();
 
-            // Simulate client2 receiving this encrypted update
+            // Client2 receives and decrypts client1's real ciphertext.
             const ws2 = MockWebSocket.instances[1];
             ws2.simulateMessage({
                 type: 'yrs_update',
@@ -389,7 +378,8 @@ describe('Encrypted Collaboration Integration', () => {
                 epoch: 0,
             });
 
-            expect(core2.apply_update_encrypted).toHaveBeenCalled();
+            // Behavioral proof the full E2E crypto cycle worked.
+            expect(core2.get_text()).toBe('Hello from user1');
 
             client1.disconnect();
             client2.disconnect();

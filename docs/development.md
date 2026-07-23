@@ -180,6 +180,26 @@ WASM tests run as native Rust tests (not in a browser):
 cargo test -p collab-wasm
 ```
 
+### Plugin WASM Prerequisites
+
+The Obsidian plugin depends on compiled WASM artifacts in `plugins/obsidian-ee/src/wasm/`.
+These are **not committed** to git — they must be built from source before running plugin tests:
+
+```bash
+# One-time: ensure the wasm32 target is installed
+rustup target add wasm32-unknown-unknown
+
+# Build the WASM artifacts (from repo root)
+./scripts/build-wasm.sh
+
+# Then run plugin tests
+cd plugins/obsidian-ee
+npm ci
+NODE_OPTIONS=--experimental-vm-modules npm test
+```
+
+After any change to `crates/collab-wasm`, re-run `./scripts/build-wasm.sh` and re-test.
+
 ## Obsidian Plugin Development
 
 The TypeScript plugin lives in `plugins/obsidian-ee/`.

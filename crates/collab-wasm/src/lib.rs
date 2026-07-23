@@ -189,9 +189,24 @@ impl CollabCore {
     }
 
     /// Delete text from the given position.
+    ///
+    /// Out-of-range `index`/`length` are clamped to the current text length
+    /// (a no-op if `index` is past the end), mirroring how `insert` tolerates
+    /// an out-of-range index. Without this guard, yrs `remove_range` panics
+    /// (index past end, or index+length overrunning content), which across the
+    /// wasm boundary surfaces as `RuntimeError: unreachable` and poisons the
+    /// instance.
     pub fn delete(&mut self, index: u32, length: u32) {
         let mut txn = self.doc.transact_mut();
-        self.text.remove_range(&mut txn, index, length);
+        let text_len = self.text.len(&txn);
+        if index >= text_len {
+            return; // nothing to delete
+        }
+        let clamped_len = length.min(text_len - index);
+        if clamped_len == 0 {
+            return;
+        }
+        self.text.remove_range(&mut txn, index, clamped_len);
     }
 
     /// Get the document state as an update blob.
@@ -267,6 +282,20 @@ mod tests {
         core.insert(0, "Hello, World!");
         core.delete(0, 7);
         assert_eq!(core.get_text(), "World!");
+    }
+
+    #[test]
+    fn test_delete_out_of_range_clamps() {
+        let mut core = CollabCore::new();
+        core.insert(0, "abc");
+        // length overruns content -> clamp to end, no panic
+        core.delete(2, 50);
+        assert_eq!(core.get_text(), "ab");
+        // index past end -> no-op, no panic, instance still usable
+        core.delete(10, 5);
+        assert_eq!(core.get_text(), "ab");
+        core.insert(2, "cd");
+        assert_eq!(core.get_text(), "abcd");
     }
 
     #[test]

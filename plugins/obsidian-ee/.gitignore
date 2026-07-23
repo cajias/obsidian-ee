@@ -11,7 +11,7 @@ src/wasm/
 
 # Keep config files
 !esbuild.config.mjs
-!jest.config.js
+!jest.esm.config.mjs
 
 # Coverage
 coverage/

@@ -1,4 +1,5 @@
-import { CollabClient, CollabClientConfig, ConfigValidationError } from '../collab-client';
+import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import type { CollabClientConfig } from '../collab-client';
 
 // Mock WebSocket
 class MockWebSocket {
@@ -42,7 +43,7 @@ class MockWebSocket {
 // @ts-ignore - Override global WebSocket
 global.WebSocket = MockWebSocket;
 
-jest.mock('../wasm/collab_wasm', () => ({
+jest.unstable_mockModule('../wasm/collab_wasm', () => ({
     __esModule: true,
     CollabCore: jest.fn().mockImplementation(() => ({
         set_encryption_key: jest.fn(),
@@ -55,7 +56,9 @@ jest.mock('../wasm/collab_wasm', () => ({
     })),
 }));
 
-import { CollabCore } from '../wasm/collab_wasm';
+const { CollabCore } = await import('../wasm/collab_wasm');
+const { CollabClient, ConfigValidationError } = await import('../collab-client');
+type CollabClient = InstanceType<typeof CollabClient>;
 
 describe('CollabClient', () => {
     let client: CollabClient;
@@ -473,7 +476,7 @@ describe('CollabClient message handling', () => {
     });
 
     it('should handle subscribed message', async () => {
-        const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
+        const consoleSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
 
         const connectPromise = client.connect();
         jest.runAllTimers();
@@ -483,7 +486,7 @@ describe('CollabClient message handling', () => {
     });
 
     it('should handle error message from server', async () => {
-        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
         const connectPromise = client.connect();
         jest.runAllTimers();
@@ -1228,7 +1231,9 @@ describe('CollabClient handleYrsUpdate validation', () => {
             })
         );
         // Ensure we don't produce "[object Object]"
-        expect(errorCallback.mock.calls[0][0].message).not.toContain('[object Object]');
+        expect((errorCallback.mock.calls[0][0] as { message: string }).message).not.toContain(
+            '[object Object]'
+        );
     });
 
     it('should handle standard Error objects in error messages', async () => {
