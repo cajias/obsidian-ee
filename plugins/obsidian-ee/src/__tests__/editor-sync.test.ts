@@ -548,15 +548,12 @@ describe('EditorSync', () => {
 
             sync.bindToEditor(view as any);
 
-            // Track if onLocalChange is called during remote update
-            let _localChangeCalledDuringRemote = false;
             const originalOnLocalChange = sync.onLocalChange.bind(sync);
 
             // Override setValue to call onLocalChange (simulating editor event)
             editor.setValue.mockImplementation((_v: string) => {
                 // Try to trigger local change during remote apply
                 originalOnLocalChange();
-                _localChangeCalledDuringRemote = true;
             });
 
             client._triggerUpdate('new');
