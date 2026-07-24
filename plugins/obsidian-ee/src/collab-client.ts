@@ -105,6 +105,14 @@ function validateConfig(config: CollabClientConfig): void {
             `encryptionKey must be exactly 32 bytes for AES-256, got ${config.encryptionKey.length} bytes`
         );
     }
+    // Fail closed on the all-zeros placeholder key: an all-zeros key is not a real
+    // secret, so accepting it would ship documents "encrypted" with a publicly-known
+    // key. This guard is the single choke point every caller routes through.
+    if (config.encryptionKey.every((b) => b === 0)) {
+        throw new ConfigValidationError(
+            'encryptionKey must not be all zeros (placeholder key is insecure)'
+        );
+    }
 }
 
 export class CollabClient {

@@ -1,5 +1,10 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 
+// A valid (non-placeholder) base64 32-byte key. startSession now fails closed on an
+// empty/all-zeros/malformed key, so the mocked settings must supply a real one for
+// the session-success tests to construct a CollabClient.
+const VALID_KEY_B64 = Buffer.from(new Uint8Array(32).fill(1)).toString('base64');
+
 // Mock WebAssembly.compile for WASM loading
 const mockWasmModule = {};
 const mockCompile = jest
@@ -22,7 +27,9 @@ jest.unstable_mockModule('obsidian', () => ({
         addSettingTab(_tab: any): void {}
         registerEvent(_event: any): void {}
         loadData(): Promise<any> {
-            return Promise.resolve({});
+            // Supply a valid key by default so startSession (which now fails closed on
+            // an empty/placeholder key) can construct a client in the success tests.
+            return Promise.resolve({ encryptionKey: VALID_KEY_B64 });
         }
         saveData(_data: any): Promise<void> {
             return Promise.resolve();
@@ -265,9 +272,10 @@ describe('CollabPlugin', () => {
     });
 
     describe('startSession', () => {
-        it('should warn about insecure placeholder encryption key', async () => {
+        it('should fail closed and not start a session when no encryption key is configured', async () => {
             const plugin = createMockPlugin();
-            // Add workspace mock while keeping vault adapter
+            // No key configured: loadData returns empty settings.
+            (plugin as any).loadData = jest.fn<() => Promise<any>>().mockResolvedValue({});
             (plugin as any).app.workspace = {
                 getActiveViewOfType: jest.fn().mockReturnValue({
                     file: { path: 'test.md' },
@@ -283,20 +291,93 @@ describe('CollabPlugin', () => {
             };
             (plugin as any).registerEvent = jest.fn();
 
+            const { CollabClient } = await import('../collab-client');
+
             await plugin.onload();
             await plugin.startSession();
 
-            // Should show console warning
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                '[CollabPlugin] SECURITY WARNING: Using placeholder encryption key. ' +
-                    'This is insecure and should only be used for development.'
-            );
-
-            // Should show Notice to user
+            // Should show a blocking Notice telling the user to set a key.
             expect(Notice).toHaveBeenCalledWith(
-                'Warning: Using insecure placeholder encryption key',
+                expect.stringContaining('Set a valid encryption key'),
                 expect.any(Number)
             );
+
+            // Fails closed: no CollabClient is constructed and no session is active.
+            expect(CollabClient).not.toHaveBeenCalled();
+            expect((plugin as any).collabClient).toBeNull();
+        });
+
+        it.each([
+            [
+                'a wrong-length (16-byte) key',
+                Buffer.from(new Uint8Array(16).fill(1)).toString('base64'),
+            ],
+            ['an all-zeros (placeholder) key', Buffer.from(new Uint8Array(32)).toString('base64')],
+            ['a malformed base64 key', '!!!not base64!!!'],
+        ])('should fail closed when the configured key is %s', async (_label, badKey) => {
+            const plugin = createMockPlugin();
+            (plugin as any).loadData = jest
+                .fn<() => Promise<any>>()
+                .mockResolvedValue({ encryptionKey: badKey });
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: jest.fn(),
+            };
+            (plugin as any).registerEvent = jest.fn();
+
+            const { CollabClient } = await import('../collab-client');
+
+            await plugin.onload();
+            await plugin.startSession();
+
+            expect(Notice).toHaveBeenCalledWith(
+                expect.stringContaining('Set a valid encryption key'),
+                expect.any(Number)
+            );
+            expect(CollabClient).not.toHaveBeenCalled();
+            expect((plugin as any).collabClient).toBeNull();
+        });
+
+        it('should start a session when a valid encryption key is configured', async () => {
+            const plugin = createMockPlugin(); // default loadData supplies VALID_KEY_B64
+            (plugin as any).app.workspace = {
+                getActiveViewOfType: jest.fn().mockReturnValue({
+                    file: { path: 'test.md' },
+                    editor: {
+                        getValue: jest.fn().mockReturnValue(''),
+                        setValue: jest.fn(),
+                        getCursor: jest.fn().mockReturnValue({ line: 0, ch: 0 }),
+                        setCursor: jest.fn(),
+                    },
+                }),
+                on: jest.fn().mockReturnValue({ unload: jest.fn() }),
+                offref: jest.fn(),
+            };
+            (plugin as any).registerEvent = jest.fn();
+
+            const { CollabClient } = await import('../collab-client');
+
+            await plugin.onload();
+            await plugin.startSession();
+
+            // A valid key constructs the client with a real 32-byte key (not all zeros).
+            expect(CollabClient).toHaveBeenCalled();
+            const passedConfig = (CollabClient as jest.Mock).mock.calls[0][1] as {
+                encryptionKey: Uint8Array;
+            };
+            expect(passedConfig.encryptionKey).toBeInstanceOf(Uint8Array);
+            expect(passedConfig.encryptionKey.length).toBe(32);
+            expect(passedConfig.encryptionKey.every((b) => b === 0)).toBe(false);
+            expect((plugin as any).collabClient).not.toBeNull();
         });
 
         it('should register onError and onDisconnect callbacks', async () => {

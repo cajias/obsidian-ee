@@ -5,13 +5,39 @@ import { EditorSync } from './editor-sync';
 
 interface CollabPluginSettings {
     relayUrl: string;
+    // Base64-encoded 32-byte AES-256 key shared out-of-band with collaborators.
+    // MVP: stored in plaintext in the vault's data.json. This is transitional PSK
+    // material — MLS-derived keys (#28) will replace manual key entry. Empty by
+    // default so sessions fail closed until the user sets a real key.
+    encryptionKey: string;
 }
 
 // SECURITY: Default uses ws:// for local development only.
 // Production deployments MUST use wss:// (TLS-encrypted WebSocket).
 const DEFAULT_SETTINGS: CollabPluginSettings = {
     relayUrl: 'ws://localhost:8080',
+    encryptionKey: '',
 };
+
+/**
+ * Decode a base64 string to bytes, returning null if it is empty or not valid
+ * base64. atob/btoa are native in both the Obsidian (Electron) renderer and Node.
+ */
+function decodeBase64Key(base64: string): Uint8Array | null {
+    if (!base64) {
+        return null;
+    }
+    try {
+        return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    } catch {
+        return null;
+    }
+}
+
+/** Encode bytes to a base64 string (inverse of decodeBase64Key). */
+function encodeBase64Key(key: Uint8Array): string {
+    return btoa(String.fromCharCode(...key));
+}
 
 export default class CollabPlugin extends Plugin {
     settings: CollabPluginSettings = DEFAULT_SETTINGS;
@@ -146,24 +172,27 @@ export default class CollabPlugin extends Plugin {
             return;
         }
 
+        // SECURITY: Fail closed if no real key is configured. An empty, malformed,
+        // wrong-length, or all-zeros key is not a usable secret — starting a session
+        // with one would "encrypt" documents with publicly-known bytes. The user must
+        // set a key in settings (Generate random key, then share it out-of-band).
+        const encryptionKey = decodeBase64Key(this.settings.encryptionKey);
+        if (!encryptionKey || encryptionKey.length !== 32 || encryptionKey.every((b) => b === 0)) {
+            new Notice(
+                'Set a valid encryption key in the E2E Collaboration settings before starting a session.',
+                8000
+            );
+            return;
+        }
+
         const config: CollabClientConfig = {
             relayUrl: this.settings.relayUrl,
             userId: `user-${Date.now()}`,
             docId: activeView.file?.path || 'unknown',
-            // SECURITY: This is a PLACEHOLDER key - all zeros, completely insecure!
-            // Production MUST use:
-            // 1. Cryptographically-secure random key generation (crypto.getRandomValues)
-            // 2. Secure key exchange mechanism (e.g., via MLS handshake)
-            // 3. Key stored securely, never hardcoded
-            encryptionKey: new Uint8Array(32),
+            // MVP: key comes from settings (plaintext in data.json), shared out-of-band.
+            // Transitional until MLS-derived keys land (#28).
+            encryptionKey,
         };
-
-        // SECURITY WARNING: Warn about insecure placeholder key
-        console.warn(
-            '[CollabPlugin] SECURITY WARNING: Using placeholder encryption key. ' +
-                'This is insecure and should only be used for development.'
-        );
-        new Notice('Warning: Using insecure placeholder encryption key', 5000);
 
         try {
             // Create client and editor sync
@@ -286,5 +315,32 @@ class CollabSettingTab extends PluginSettingTab {
                         await plugin.saveSettings();
                     })
             );
+
+        const keySetting = new Setting(containerEl)
+            .setName('Encryption Key (base64)')
+            .setDesc(
+                'Base64-encoded 32-byte AES-256 key. All collaborators on a document ' +
+                    'must use the same key; share it over a secure channel. Generate a ' +
+                    'random key below, or paste one you already share.'
+            )
+            .addText((text) =>
+                text
+                    .setPlaceholder('base64 32-byte key')
+                    .setValue(plugin.settings.encryptionKey)
+                    .onChange(async (value) => {
+                        plugin.settings.encryptionKey = value.trim();
+                        await plugin.saveSettings();
+                    })
+            );
+
+        keySetting.addButton((button) =>
+            button.setButtonText('Generate random key').onClick(async () => {
+                const key = crypto.getRandomValues(new Uint8Array(32));
+                plugin.settings.encryptionKey = encodeBase64Key(key);
+                await plugin.saveSettings();
+                // Re-render so the text field shows the freshly generated key.
+                this.display();
+            })
+        );
     }
 }

@@ -60,6 +60,10 @@ const { CollabCore } = await import('../wasm/collab_wasm');
 const { CollabClient, ConfigValidationError } = await import('../collab-client');
 type CollabClient = InstanceType<typeof CollabClient>;
 
+// A valid (non-placeholder) 32-byte key for tests that need a *valid* config.
+// All-zeros is rejected by validateConfig as an insecure placeholder.
+const VALID_KEY = new Uint8Array(32).fill(1);
+
 describe('CollabClient', () => {
     let client: CollabClient;
     let mockCore: any;
@@ -72,7 +76,7 @@ describe('CollabClient', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -137,6 +141,14 @@ describe('CollabClient', () => {
             expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
             expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
                 'encryptionKey must be exactly 32 bytes for AES-256, got 16 bytes'
+            );
+        });
+
+        it('should throw ConfigValidationError for all-zeros encryptionKey (placeholder)', () => {
+            const invalidConfig = { ...config, encryptionKey: new Uint8Array(32) };
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+                'encryptionKey must not be all zeros (placeholder key is insecure)'
             );
         });
     });
@@ -465,7 +477,7 @@ describe('CollabClient message handling', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -508,7 +520,7 @@ describe('CollabClient message queueing', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -625,7 +637,7 @@ describe('CollabClient disconnect notification', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -724,7 +736,7 @@ describe('CollabClient error handling', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -974,7 +986,7 @@ describe('CollabClient initialization verification', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
     });
 
@@ -1068,7 +1080,7 @@ describe('CollabClient handleReconnect timer cleanup', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -1108,7 +1120,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
@@ -1272,7 +1284,7 @@ describe('CollabClient applyTextDiff edge cases', () => {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: new Uint8Array(32),
+            encryptionKey: VALID_KEY,
         };
         client = new CollabClient(mockCore, config);
     });
