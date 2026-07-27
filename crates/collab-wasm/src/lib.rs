@@ -286,7 +286,11 @@ impl CollabCore {
     ///
     /// `doc_id` must be the caller's locally-trusted docId (never a value from the
     /// inbound frame); a ciphertext encrypted under a different docId fails to decrypt.
-    pub fn apply_update_encrypted(&mut self, doc_id: &str, encrypted: &[u8]) -> Result<(), JsValue> {
+    pub fn apply_update_encrypted(
+        &mut self,
+        doc_id: &str,
+        encrypted: &[u8],
+    ) -> Result<(), JsValue> {
         self.apply_update_encrypted_internal(encrypted, doc_id.as_bytes()).map_err(Into::into)
     }
 }
