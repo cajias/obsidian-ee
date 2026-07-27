@@ -40,7 +40,11 @@ export const meta = {
   ],
 }
 
-const REPO = '/local/home/cajias/Projects/obsidian-ee'
+// Finder/verify subagents inherit the session's working directory (the repo
+// root), so a relative reference is correct and portable across machines and
+// checkouts — no hardcoded absolute path. Pass an absolute path as the Workflow
+// `args` string to point the audit at a repo elsewhere.
+const REPO = (typeof args === 'string' && args.trim()) || 'the current repository (your working directory)'
 
 const FINDINGS_SCHEMA = {
   type: 'object',
