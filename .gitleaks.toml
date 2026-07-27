@@ -1,0 +1,20 @@
+# gitleaks configuration for obsidian-ee.
+#
+# Extends the bundled default ruleset (secret detection for API keys, private
+# keys, cloud credentials, etc.) and allowlists the project's legitimate TEST
+# key material so the secret-scan CI gate does not fire on fixtures. All-zeros
+# keys (`[0u8; 32]`) and the base64 test key in plugin tests are intentional
+# non-secrets used to exercise fail-closed guards. Verified: no real secret is
+# committed in non-test source (crates/*/src, plugins/*/src).
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and lockfiles — not real secrets"
+paths = [
+  '''.*__tests__/.*''',   # TS/plugin unit + integration tests
+  '''.*/tests/.*''',       # Rust integration + e2e test crates
+  '''.*\.test\.ts$''',     # co-located TS test files
+  '''Cargo\.lock''',       # pinned deps; Rust test keys are inline in #[cfg(test)]
+]

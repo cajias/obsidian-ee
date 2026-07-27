@@ -193,3 +193,21 @@ jobs:
       - name: Build plugin bundle
         working-directory: plugins/obsidian-ee
         run: npm run build
+
+  # Secret scan: fail the build if a credential is committed. Independent gate
+  # (no `needs:`) like `audit` and `plugin`, and no `continue-on-error` — it is
+  # a real gate. Config in .gitleaks.toml allowlists test-only key material.
+  # gitleaks-action v2 is free for public repos; if this repo is made private,
+  # an org GITLEAKS_LICENSE secret is required (pass it via env).
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so gitleaks scans past commits
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
