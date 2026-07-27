@@ -1206,7 +1206,65 @@ describe('CollabClient handleYrsUpdate validation', () => {
             data: JSON.stringify({ type: 'yrs_update', encrypted: [1, 2, 3] }),
         });
 
-        expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]));
+        expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(
+            'doc1',
+            new Uint8Array([1, 2, 3])
+        );
+        expect(updateCallback).toHaveBeenCalled();
+    });
+
+    it('should reject a yrs_update whose doc_id does not match config.docId', async () => {
+        // Defense in depth: a relay routing/replaying another document's frame to
+        // this client must be rejected BEFORE the crypto core is touched, so an
+        // attacker cannot even attempt cross-document splicing.
+        const errorCallback = jest.fn();
+        const updateCallback = jest.fn();
+        client.onError(errorCallback);
+        client.onUpdate(updateCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // config.docId is 'doc1'; this frame claims 'other-doc'.
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'yrs_update',
+                doc_id: 'other-doc',
+                encrypted: [1, 2, 3],
+            }),
+        });
+
+        expect(mockCore.apply_update_encrypted).not.toHaveBeenCalled();
+        expect(updateCallback).not.toHaveBeenCalled();
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'decryption',
+                message: expect.stringContaining('doc_id mismatch'),
+            })
+        );
+    });
+
+    it('should process a yrs_update whose doc_id matches config.docId', async () => {
+        const updateCallback = jest.fn();
+        client.onUpdate(updateCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'yrs_update',
+                doc_id: 'doc1',
+                encrypted: [1, 2, 3],
+            }),
+        });
+
+        expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(
+            'doc1',
+            new Uint8Array([1, 2, 3])
+        );
         expect(updateCallback).toHaveBeenCalled();
     });
 

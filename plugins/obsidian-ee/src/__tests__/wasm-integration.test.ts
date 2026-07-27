@@ -198,17 +198,30 @@ describe('CollabCore WASM — encryption round-trip + errors', () => {
         const core = await newCore();
         core.set_encryption_key(KEY_32(7));
         const pt = new TextEncoder().encode('secret payload');
-        const ct = core.encrypt(pt);
+        const aad = new TextEncoder().encode('doc1');
+        const ct = core.encrypt(pt, aad);
         expect(ct.length).toBe(12 + pt.length + 16);
         expect([...ct]).not.toEqual([...pt]);
-        const decrypted = core.decrypt(ct);
+        const decrypted = core.decrypt(ct, aad);
         expect([...decrypted]).toEqual([...pt]);
+        core.free();
+    });
+
+    it('given a ciphertext, when decrypting under a different aad, then it throws decryption', async () => {
+        // Cross-document replay defense: aad is the docId, so a ciphertext bound
+        // to doc "A" must not decrypt under doc "B" even with the same key.
+        const core = await newCore();
+        core.set_encryption_key(KEY_32(7));
+        const pt = new TextEncoder().encode('secret payload');
+        const ct = core.encrypt(pt, new TextEncoder().encode('docA'));
+        const err = catchThrown(() => core.decrypt(ct, new TextEncoder().encode('docB')));
+        expect(err).toMatchObject({ type: 'decryption' });
         core.free();
     });
 
     it('given no key, when encrypting, then it throws key_error "No encryption key set"', async () => {
         const core = await newCore();
-        const err = catchThrown(() => core.encrypt(new Uint8Array([1, 2, 3])));
+        const err = catchThrown(() => core.encrypt(new Uint8Array([1, 2, 3]), new Uint8Array(0)));
         expect(err).toMatchObject({ type: 'key_error', message: 'No encryption key set' });
         core.free();
     });
@@ -216,8 +229,9 @@ describe('CollabCore WASM — encryption round-trip + errors', () => {
     it('given a keyed core, when decrypting ciphertext shorter than 12 bytes, then it throws decryption "Ciphertext too short"', async () => {
         const core = await newCore();
         core.set_encryption_key(KEY_32(7));
-        const errEmpty = catchThrown(() => core.decrypt(new Uint8Array(0)));
-        const errShort = catchThrown(() => core.decrypt(new Uint8Array(8)));
+        const aad = new TextEncoder().encode('doc1');
+        const errEmpty = catchThrown(() => core.decrypt(new Uint8Array(0), aad));
+        const errShort = catchThrown(() => core.decrypt(new Uint8Array(8), aad));
         expect(errEmpty).toMatchObject({ type: 'decryption', message: 'Ciphertext too short' });
         expect(errShort).toMatchObject({ type: 'decryption', message: 'Ciphertext too short' });
         core.free();
@@ -226,9 +240,10 @@ describe('CollabCore WASM — encryption round-trip + errors', () => {
     it('given valid ciphertext, when a byte after the nonce is flipped, then decrypt throws decryption', async () => {
         const core = await newCore();
         core.set_encryption_key(KEY_32(7));
-        const ct = core.encrypt(new TextEncoder().encode('tamper me'));
+        const aad = new TextEncoder().encode('doc1');
+        const ct = core.encrypt(new TextEncoder().encode('tamper me'), aad);
         ct[12] ^= 0xff; // flip a ciphertext byte (past the 12-byte nonce)
-        const err = catchThrown(() => core.decrypt(ct));
+        const err = catchThrown(() => core.decrypt(ct, aad));
         expect(err).toMatchObject({ type: 'decryption' });
         core.free();
     });
@@ -239,7 +254,7 @@ describe('CollabCore WASM — encryption round-trip + errors', () => {
         docA.set_encryption_key(KEY_32(7));
         docB.set_encryption_key(KEY_32(7));
         docA.insert(0, 'Encrypted sync!');
-        docB.apply_update_encrypted(docA.encode_state_encrypted());
+        docB.apply_update_encrypted('doc1', docA.encode_state_encrypted('doc1'));
         expect(docB.get_text()).toBe('Encrypted sync!');
         docA.free();
         docB.free();
@@ -251,9 +266,32 @@ describe('CollabCore WASM — encryption round-trip + errors', () => {
         docA.set_encryption_key(KEY_32(1));
         docB.set_encryption_key(KEY_32(2));
         docA.insert(0, 'Secret message');
-        const err = catchThrown(() => docB.apply_update_encrypted(docA.encode_state_encrypted()));
+        const err = catchThrown(() =>
+            docB.apply_update_encrypted('doc1', docA.encode_state_encrypted('doc1'))
+        );
         expect(err).toMatchObject({ type: 'decryption' });
         expect(docB.get_text()).toBe('');
+        docA.free();
+        docB.free();
+    });
+
+    it('given two cores with the same key, when B applies A state under a mismatched docId, then it throws and B stays empty', async () => {
+        // Security property (mirrors the Rust test): a relay that replays doc A's
+        // ciphertext as a doc B frame is rejected by the AEAD docId binding, even
+        // though both cores share the plugin's single global key.
+        const docA = await newCore();
+        const docB = await newCore();
+        docA.set_encryption_key(KEY_32(7));
+        docB.set_encryption_key(KEY_32(7));
+        docA.insert(0, 'Content of A');
+        const err = catchThrown(() =>
+            docB.apply_update_encrypted('docB', docA.encode_state_encrypted('docA'))
+        );
+        expect(err).toMatchObject({ type: 'decryption' });
+        expect(docB.get_text()).toBe('');
+        // Applied under the correct docId, it succeeds.
+        docB.apply_update_encrypted('docA', docA.encode_state_encrypted('docA'));
+        expect(docB.get_text()).toBe('Content of A');
         docA.free();
         docB.free();
     });

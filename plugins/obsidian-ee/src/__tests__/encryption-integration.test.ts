@@ -133,7 +133,7 @@ describe('Encrypted Collaboration Integration', () => {
             // apply_update_encrypted, so this pins real AES-256-GCM.
             const peer = new CollabCore();
             peer.set_encryption_key(mockEncryptionKey);
-            peer.apply_update_encrypted(new Uint8Array(updateMsg.encrypted));
+            peer.apply_update_encrypted('doc1', new Uint8Array(updateMsg.encrypted));
             expect(peer.get_text()).toBe('Hello');
             peer.free();
 
@@ -176,7 +176,7 @@ describe('Encrypted Collaboration Integration', () => {
             // apply_update_encrypted, so this pins real AES-256-GCM.
             const peer = new CollabCore();
             peer.set_encryption_key(mockEncryptionKey);
-            peer.apply_update_encrypted(new Uint8Array(updateMsg.encrypted));
+            peer.apply_update_encrypted('doc1', new Uint8Array(updateMsg.encrypted));
             expect(peer.get_text()).toBe('Test message');
             peer.free();
 
@@ -206,7 +206,7 @@ describe('Encrypted Collaboration Integration', () => {
             const sender = new CollabCore();
             sender.set_encryption_key(mockEncryptionKey);
             sender.insert(0, 'Hi');
-            const realCipher = [...sender.encode_state_encrypted()];
+            const realCipher = [...sender.encode_state_encrypted('doc1')];
 
             const ws = MockWebSocket.instances[0];
             ws.simulateMessage({
@@ -247,7 +247,7 @@ describe('Encrypted Collaboration Integration', () => {
             const sender = new CollabCore();
             sender.set_encryption_key(mockEncryptionKey);
             sender.insert(0, 'Hi');
-            const realCipher = [...sender.encode_state_encrypted()];
+            const realCipher = [...sender.encode_state_encrypted('doc1')];
 
             const ws = MockWebSocket.instances[0];
             ws.simulateMessage({
