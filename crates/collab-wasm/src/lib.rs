@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use getrandom::getrandom;
@@ -98,7 +98,12 @@ impl CollabCore {
 
     /// Encrypt data with the current key.
     /// Returns nonce (12 bytes) prepended to ciphertext.
-    pub fn encrypt_internal(&self, plaintext: &[u8]) -> Result<Vec<u8>, CollabError> {
+    ///
+    /// `aad` (associated data) is authenticated but not encrypted. Callers pass
+    /// the locally-trusted docId here so a ciphertext is cryptographically bound
+    /// to its document: an untrusted relay that replays it under a different
+    /// docId fails the AEAD tag check on decrypt (prevents cross-document splicing).
+    pub fn encrypt_internal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CollabError> {
         let key = self
             .encryption_key
             .as_ref()
@@ -113,8 +118,9 @@ impl CollabCore {
         #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext =
-            cipher.encrypt(nonce, plaintext).map_err(|e| CollabError::encryption(e.to_string()))?;
+        let ciphertext = cipher
+            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .map_err(|e| CollabError::encryption(e.to_string()))?;
 
         // Prepend nonce to ciphertext
         let mut result = nonce_bytes.to_vec();
@@ -124,7 +130,11 @@ impl CollabCore {
 
     /// Decrypt data with the current key.
     /// Expects nonce (12 bytes) prepended to ciphertext.
-    pub fn decrypt_internal(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CollabError> {
+    ///
+    /// `aad` must match the value passed to `encrypt_internal`; GCM authenticates
+    /// it, so a docId mismatch (e.g. a relay replaying doc A's ciphertext as doc B)
+    /// fails the tag check and returns an error instead of decrypting.
+    pub fn decrypt_internal(&self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CollabError> {
         if ciphertext.len() < 12 {
             return Err(CollabError::decryption("Ciphertext too short"));
         }
@@ -141,7 +151,9 @@ impl CollabCore {
         #[allow(deprecated)] // aes-gcm 0.10 GenericArray::from_slice
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        cipher.decrypt(nonce, encrypted).map_err(|e| CollabError::decryption(e.to_string()))
+        cipher
+            .decrypt(nonce, Payload { msg: encrypted, aad })
+            .map_err(|e| CollabError::decryption(e.to_string()))
     }
 
     /// Apply an update from another document (internal).
@@ -154,14 +166,23 @@ impl CollabCore {
     }
 
     /// Encode state and encrypt it (internal).
-    pub fn encode_state_encrypted_internal(&self) -> Result<Vec<u8>, CollabError> {
+    ///
+    /// `aad` binds the ciphertext to the docId (see `encrypt_internal`).
+    pub fn encode_state_encrypted_internal(&self, aad: &[u8]) -> Result<Vec<u8>, CollabError> {
         let state = self.encode_state();
-        self.encrypt_internal(&state)
+        self.encrypt_internal(&state, aad)
     }
 
     /// Decrypt and apply an update (internal).
-    pub fn apply_update_encrypted_internal(&mut self, encrypted: &[u8]) -> Result<(), CollabError> {
-        let decrypted = self.decrypt_internal(encrypted)?;
+    ///
+    /// `aad` must match the docId the update was encrypted under (see
+    /// `decrypt_internal`); a mismatch fails authentication before any apply.
+    pub fn apply_update_encrypted_internal(
+        &mut self,
+        encrypted: &[u8],
+        aad: &[u8],
+    ) -> Result<(), CollabError> {
+        let decrypted = self.decrypt_internal(encrypted, aad)?;
         self.apply_update_internal(&decrypted)
     }
 }
@@ -238,24 +259,39 @@ impl CollabCore {
 
     /// Encrypt data with the current key.
     /// Returns nonce (12 bytes) prepended to ciphertext.
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, JsValue> {
-        self.encrypt_internal(plaintext).map_err(Into::into)
+    ///
+    /// `aad` is authenticated-but-unencrypted associated data; callers bind the
+    /// docId here to prevent cross-document ciphertext replay by an untrusted relay.
+    pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.encrypt_internal(plaintext, aad).map_err(Into::into)
     }
 
     /// Decrypt data with the current key.
     /// Expects nonce (12 bytes) prepended to ciphertext.
-    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, JsValue> {
-        self.decrypt_internal(ciphertext).map_err(Into::into)
+    ///
+    /// `aad` must match what `encrypt` was given; a mismatch fails the AEAD tag check.
+    pub fn decrypt(&self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.decrypt_internal(ciphertext, aad).map_err(Into::into)
     }
 
     /// Encode state and encrypt it.
-    pub fn encode_state_encrypted(&self) -> Result<Vec<u8>, JsValue> {
-        self.encode_state_encrypted_internal().map_err(Into::into)
+    ///
+    /// `doc_id` is bound into the AEAD as associated data so an untrusted relay
+    /// cannot replay this ciphertext under a different document.
+    pub fn encode_state_encrypted(&self, doc_id: &str) -> Result<Vec<u8>, JsValue> {
+        self.encode_state_encrypted_internal(doc_id.as_bytes()).map_err(Into::into)
     }
 
     /// Decrypt and apply an update.
-    pub fn apply_update_encrypted(&mut self, encrypted: &[u8]) -> Result<(), JsValue> {
-        self.apply_update_encrypted_internal(encrypted).map_err(Into::into)
+    ///
+    /// `doc_id` must be the caller's locally-trusted docId (never a value from the
+    /// inbound frame); a ciphertext encrypted under a different docId fails to decrypt.
+    pub fn apply_update_encrypted(
+        &mut self,
+        doc_id: &str,
+        encrypted: &[u8],
+    ) -> Result<(), JsValue> {
+        self.apply_update_encrypted_internal(encrypted, doc_id.as_bytes()).map_err(Into::into)
     }
 }
 
@@ -333,8 +369,8 @@ mod tests {
         core.set_encryption_key_internal(&key).unwrap();
 
         let plaintext = b"Hello, encrypted world!";
-        let encrypted = core.encrypt_internal(plaintext).unwrap();
-        let decrypted = core.decrypt_internal(&encrypted).unwrap();
+        let encrypted = core.encrypt_internal(plaintext, b"doc1").unwrap();
+        let decrypted = core.decrypt_internal(&encrypted, b"doc1").unwrap();
 
         assert_eq!(plaintext.to_vec(), decrypted);
     }
@@ -343,14 +379,14 @@ mod tests {
     fn test_encrypt_without_key() {
         let core = CollabCore::new();
         let plaintext = b"Hello";
-        assert!(core.encrypt_internal(plaintext).is_err());
+        assert!(core.encrypt_internal(plaintext, b"doc1").is_err());
     }
 
     #[test]
     fn test_decrypt_without_key() {
         let core = CollabCore::new();
         let ciphertext = [0u8; 32];
-        assert!(core.decrypt_internal(&ciphertext).is_err());
+        assert!(core.decrypt_internal(&ciphertext, b"doc1").is_err());
     }
 
     #[test]
@@ -360,7 +396,22 @@ mod tests {
         core.set_encryption_key_internal(&key).unwrap();
 
         let short_ciphertext = [0u8; 8]; // Less than 12 bytes
-        assert!(core.decrypt_internal(&short_ciphertext).is_err());
+        assert!(core.decrypt_internal(&short_ciphertext, b"doc1").is_err());
+    }
+
+    #[test]
+    fn test_encrypt_rejects_mismatched_aad() {
+        // Binding the docId as AAD means ciphertext for doc "A" must not decrypt
+        // under doc "B" — this is the cross-document replay defense.
+        let mut core = CollabCore::new();
+        let key = [0u8; 32];
+        core.set_encryption_key_internal(&key).unwrap();
+
+        let plaintext = b"secret";
+        let encrypted = core.encrypt_internal(plaintext, b"docA").unwrap();
+        assert!(core.decrypt_internal(&encrypted, b"docB").is_err());
+        // Sanity: the matching AAD still round-trips.
+        assert_eq!(core.decrypt_internal(&encrypted, b"docA").unwrap(), plaintext);
     }
 
     #[test]
@@ -372,10 +423,32 @@ mod tests {
         core2.set_encryption_key_internal(&key).unwrap();
 
         core1.insert(0, "Encrypted sync!");
-        let encrypted = core1.encode_state_encrypted_internal().unwrap();
+        let encrypted = core1.encode_state_encrypted_internal(b"doc1").unwrap();
 
-        core2.apply_update_encrypted_internal(&encrypted).unwrap();
+        core2.apply_update_encrypted_internal(&encrypted, b"doc1").unwrap();
         assert_eq!(core2.get_text(), "Encrypted sync!");
+    }
+
+    #[test]
+    fn test_encrypted_state_rejects_mismatched_aad() {
+        // Security property: a malicious relay cannot splice doc "A"'s ciphertext
+        // into a client subscribed to doc "B". Both cores share the key (as the
+        // plugin's single global key does), so only the AAD binding blocks it.
+        let mut core1 = CollabCore::new();
+        let mut core2 = CollabCore::new();
+        let key = [0u8; 32];
+        core1.set_encryption_key_internal(&key).unwrap();
+        core2.set_encryption_key_internal(&key).unwrap();
+
+        core1.insert(0, "Content of A");
+        let encrypted = core1.encode_state_encrypted_internal(b"A").unwrap();
+
+        // Replayed under doc "B": must be rejected, and core2 must stay empty.
+        assert!(core2.apply_update_encrypted_internal(&encrypted, b"B").is_err());
+        assert_eq!(core2.get_text(), "");
+        // Applied under the correct docId "A": succeeds.
+        core2.apply_update_encrypted_internal(&encrypted, b"A").unwrap();
+        assert_eq!(core2.get_text(), "Content of A");
     }
 
     #[test]
@@ -388,10 +461,10 @@ mod tests {
         core2.set_encryption_key_internal(&key2).unwrap();
 
         core1.insert(0, "Secret message");
-        let encrypted = core1.encode_state_encrypted_internal().unwrap();
+        let encrypted = core1.encode_state_encrypted_internal(b"doc1").unwrap();
 
         // Should fail to decrypt with wrong key
-        assert!(core2.apply_update_encrypted_internal(&encrypted).is_err());
+        assert!(core2.apply_update_encrypted_internal(&encrypted, b"doc1").is_err());
     }
 
     #[test]
@@ -407,7 +480,7 @@ mod tests {
 
         // Generate 100 encryptions and verify all nonces are unique
         for _ in 0..100 {
-            let encrypted = core.encrypt_internal(plaintext).unwrap();
+            let encrypted = core.encrypt_internal(plaintext, b"doc1").unwrap();
             // Nonce is the first 12 bytes
             let nonce: [u8; 12] = encrypted[..12].try_into().unwrap();
             assert!(

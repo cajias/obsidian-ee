@@ -335,8 +335,21 @@ export class CollabClient {
             if (!message.encrypted || !Array.isArray(message.encrypted)) {
                 throw new Error('Invalid yrs_update message: missing or invalid encrypted field');
             }
+            // Defense in depth: reject a frame routed for a different document
+            // before touching the crypto core. The relay is untrusted, so a
+            // mismatched doc_id means a misroute or a cross-document replay attempt.
+            // (The AEAD doc_id binding below is the load-bearing guarantee; this
+            // rejects the frame early with a clear error.)
+            if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
+                throw new Error(
+                    `yrs_update doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
+                );
+            }
             const encrypted = new Uint8Array(message.encrypted);
-            this.collabCore.apply_update_encrypted(encrypted);
+            // Bind the locally-trusted docId as AEAD associated data. A ciphertext
+            // encrypted for another document fails authentication here, so an
+            // untrusted relay cannot splice doc A's content into doc B.
+            this.collabCore.apply_update_encrypted(this.config.docId, encrypted);
 
             if (this.onUpdateCallback) {
                 this.onUpdateCallback(this.collabCore.get_text());
@@ -449,7 +462,9 @@ export class CollabClient {
                 this.applyTextDiff(currentText, text);
             }
 
-            const encrypted = this.collabCore.encode_state_encrypted();
+            // Bind the docId as AEAD associated data so the emitted ciphertext is
+            // cryptographically tied to this document (see handleYrsUpdate).
+            const encrypted = this.collabCore.encode_state_encrypted(this.config.docId);
             return this.send({
                 type: 'yrs_update',
                 doc_id: this.config.docId,

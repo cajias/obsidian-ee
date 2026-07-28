@@ -77,6 +77,33 @@ docker compose -f docker/docker-compose.yml down
 
 These encode failure classes found in past audits that automated linters do not catch.
 
+### Trust-boundary & crypto invariants
+Every trust boundary (inbound network message, decrypted payload, any peer- or
+relay-supplied field) MUST have a NEGATIVE-path test asserting the attacker case is
+REJECTED — not only a positive round-trip. A crypto test proving "same key/context
+decrypts" is insufficient alone; add the sibling proving "wrong context FAILS" (a
+ciphertext for doc A must be rejected under doc B, even with a shared key).
+
+E2E-encrypted payloads MUST be AEAD-bound to their context via associated data
+(document id today; document id + epoch once MLS lands). The relay is an untrusted
+zero-knowledge router: a ciphertext valid for one document MUST fail authentication when
+applied to another. Bind the LOCALLY-TRUSTED context (e.g. `config.docId`), NEVER a
+value taken from the inbound frame.
+
+Never ship a real encryption path that accepts a placeholder/all-zeros/hardcoded key.
+Keep the fail-closed guards (`validateConfig` / `startSession`) and cover them with a
+test asserting an all-zeros key is rejected.
+
+When a security audit CONFIRMS a trust-boundary finding, the fix MUST leave a
+negative-path regression test behind that is RED before the fix and GREEN after — the
+test is the durable artifact that proves the invariant and stops the class from
+regressing. An audit that fixes code without adding such a test is not done.
+
+AI security review runs LOCALLY only (`/security-review`, or `Workflow({name:
+'security-audit'})`) on the Claude subscription plan — never as a CI action keyed on an
+Anthropic API secret. CI gates stay deterministic (fmt, clippy, tests, cargo-deny,
+gitleaks); the AI passes are a developer-run step, not a billed pipeline job.
+
 ### Filesystem-watcher tests
 `notify_debouncer_mini` does NOT deliver a 1:1 filesystem-action→event mapping — a
 create can be followed by a content `Modified` in a later debounce window. Tests that
