@@ -191,9 +191,16 @@ async fn test_detects_file_deletion() {
 
     tokio::fs::remove_file(vault.path().join("doomed.md")).await.unwrap();
 
-    let event = recv_event(&mut rx).await;
-    assert_eq!(event.kind, VaultEventKind::Deleted);
-    assert_eq!(event.path, PathBuf::from("doomed.md"));
+    // The debouncer may emit a trailing content Modified before the Deleted
+    // event, so drain the settle window and assert the Deleted event is
+    // present rather than assuming it is the sole/next event.
+    let events = drain_events(&mut rx, Duration::from_millis(600)).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == VaultEventKind::Deleted && e.path == PathBuf::from("doomed.md")),
+        "expected a Deleted event for doomed.md, got: {events:?}"
+    );
 
     watcher.stop();
 }
@@ -455,8 +462,14 @@ async fn test_file_deletion_closes_document_in_registry() {
     // Delete the file.
     tokio::fs::remove_file(vault.path().join("temp.md")).await.unwrap();
 
-    let event = recv_event(&mut rx).await;
-    assert_eq!(event.kind, VaultEventKind::Deleted);
+    // The debouncer may emit a trailing content Modified before the Deleted
+    // event, so drain the settle window and pick the Deleted event rather
+    // than assuming it is the sole/next event.
+    let events = drain_events(&mut rx, Duration::from_millis(600)).await;
+    let event = events
+        .iter()
+        .find(|e| e.kind == VaultEventKind::Deleted)
+        .unwrap_or_else(|| panic!("expected a Deleted event, got: {events:?}"));
 
     // Process the deletion: close the document in the registry.
     let doc_id = event.path.with_extension("").display().to_string();
