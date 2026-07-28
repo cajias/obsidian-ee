@@ -424,34 +424,47 @@ async fn test_two_users_collaborate() {
     // Bob connects and identifies
     let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
 
-    // Both subscribe to the document
-    alice.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await.unwrap();
+    // Alice subscribes and drains her confirmation FIRST, so her subscription is
+    // registered on the relay before Bob publishes his KeyPackage. Otherwise the
+    // KeyPackage would fan out to an empty subscriber set and Alice would miss it.
+    alice.subscribe(&doc_id).await.unwrap();
+    bob.subscribe(&doc_id).await.unwrap();
 
-    bob.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await.unwrap();
-
-    // Wait for subscription confirmations
-    let alice_sub = alice.recv().await.unwrap();
-    assert!(
-        matches!(alice_sub, ServerMessage::Subscribed { .. }),
-        "Alice should receive subscription confirmation"
-    );
-
-    let bob_sub = bob.recv().await.unwrap();
-    assert!(
-        matches!(bob_sub, ServerMessage::Subscribed { .. }),
-        "Bob should receive subscription confirmation"
-    );
-
-    // Alice creates the encrypted document
+    // Alice owns the group. `create` starts at epoch 0; `create_invite` below
+    // merges her own add-commit and advances the group to epoch 1.
     let mut alice_doc = EncryptedDocument::create(&doc_id, "alice").unwrap();
 
-    // Bob generates key package
+    // Bob generates his KeyPackage.
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
 
-    // Alice creates invite for Bob using his key package
-    let invite = alice_doc.create_invite(bob_pending.key_package()).unwrap();
+    // === Step 1: Bob PUBLISHES his KeyPackage over the wire ===
+    // This send is the load-bearing wire transit. If it is removed, Alice's
+    // `recv` below blocks until the timeout and the test panics (RED).
+    bob.send(&ClientMessage::MlsHandshake {
+        doc_id: doc_id.clone(),
+        payload: bob_pending.key_package().to_vec(),
+        message_type: MlsMessageType::KeyPackage,
+    })
+    .await
+    .unwrap();
 
-    // Alice sends welcome message to Bob via the relay
+    // === Step 2: Alice receives the KeyPackage OFF THE WIRE ===
+    // Alice builds the invite from the WIRE bytes only — she holds no local handle
+    // to Bob's `PendingMember`, so a reverted (faked) handshake that never crosses
+    // the relay cannot slip through here.
+    let ServerMessage::MlsHandshake {
+        payload: bob_key_package,
+        message_type: MlsMessageType::KeyPackage,
+        ..
+    } = alice.recv().await.unwrap()
+    else {
+        panic!("Alice expected Bob's KeyPackage over the wire")
+    };
+    let invite = alice_doc.create_invite(&bob_key_package).unwrap();
+
+    // === Step 3: Welcome + Commit cross the wire ===
+    // Sending the commit too makes the full KeyPackage -> Welcome -> Commit
+    // handshake transit the relay.
     alice
         .send(&ClientMessage::MlsHandshake {
             doc_id: doc_id.clone(),
@@ -460,31 +473,25 @@ async fn test_two_users_collaborate() {
         })
         .await
         .unwrap();
+    alice
+        .send(&ClientMessage::MlsHandshake {
+            doc_id: doc_id.clone(),
+            payload: invite.commit.clone(),
+            message_type: MlsMessageType::Commit,
+        })
+        .await
+        .unwrap();
 
-    // Bob receives the welcome message
-    let ServerMessage::MlsHandshake {
-        payload: welcome_payload,
-        message_type: MlsMessageType::Welcome,
-        ..
-    } = bob.recv().await.unwrap()
-    else {
-        panic!("Expected MlsHandshake Welcome message")
-    };
-
-    // Bob joins using the welcome
-    let bob_invite = collab_core::Invite {
-        doc_id: doc_id.clone(),
-        welcome: welcome_payload,
-        commit: vec![],
-        epoch: 1,
-    };
-    let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
-
-    // Alice edits the document
+    // === Step 4: Alice edits and sends the encrypted update ===
+    // The YrsUpdate frame carries Alice's real MLS epoch (a cleartext routing
+    // field) over the wire. Bob uses that wire epoch — never a literal — both to
+    // reconstruct the invite and to assert epoch convergence.
     alice_doc.insert(0, "Hello from Alice!");
     let alice_update = alice_doc.get_encrypted_update().unwrap();
-
-    // Alice sends the encrypted update
+    assert_eq!(
+        alice_update.epoch, invite.epoch,
+        "sanity: the update epoch equals the invite epoch (same group epoch)"
+    );
     alice
         .send(&ClientMessage::YrsUpdate {
             doc_id: doc_id.clone(),
@@ -494,16 +501,56 @@ async fn test_two_users_collaborate() {
         .await
         .unwrap();
 
-    // Bob receives the update
-    let ServerMessage::YrsUpdate { encrypted, epoch, .. } = bob.recv().await.unwrap() else {
-        panic!("Expected YrsUpdate message")
+    // === Step 5: Bob receives Welcome, Commit, and the wire epoch off the wire ===
+    let ServerMessage::MlsHandshake {
+        payload: welcome_payload,
+        message_type: MlsMessageType::Welcome,
+        ..
+    } = bob.recv().await.unwrap()
+    else {
+        panic!("Bob expected the Welcome over the wire")
+    };
+    let ServerMessage::MlsHandshake {
+        payload: commit_payload,
+        message_type: MlsMessageType::Commit,
+        ..
+    } = bob.recv().await.unwrap()
+    else {
+        panic!("Bob expected the Commit over the wire")
+    };
+    assert!(
+        !commit_payload.is_empty(),
+        "the Commit that crossed the wire must be a real MLS commit, not a #46 vec![] fake"
+    );
+    let ServerMessage::YrsUpdate { encrypted, epoch: wire_epoch, .. } = bob.recv().await.unwrap()
+    else {
+        panic!("Bob expected Alice's encrypted YrsUpdate")
     };
 
-    // Bob decrypts and applies the update
-    let received_op = EncryptedOp { ciphertext: encrypted, epoch };
+    // Bob reconstructs the invite from the REAL welcome/commit/epoch that crossed
+    // the wire — no hardcoded `vec![]` / `1`.
+    let bob_invite = collab_core::Invite {
+        doc_id: doc_id.clone(),
+        welcome: welcome_payload,
+        commit: commit_payload,
+        epoch: wire_epoch,
+    };
+    let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
+
+    // === Step 6: Bob decrypts and applies Alice's update ===
+    let received_op = EncryptedOp { ciphertext: encrypted, epoch: wire_epoch };
     bob_doc.apply_encrypted_update(&received_op).unwrap();
 
-    // Verify Bob has the same content as Alice
+    // === Assertions (the teeth) ===
+    // Both clients independently reached the same, non-trivial epoch from the real
+    // handshake.
+    assert_eq!(alice_doc.epoch(), bob_doc.epoch(), "both clients must reach the same epoch");
+    assert!(alice_doc.epoch() >= 1, "epoch must be non-trivial (real add-commit merged)");
+    // The converged epoch equals the value carried over the wire, not a literal.
+    assert_eq!(bob_doc.epoch(), wire_epoch, "Bob's epoch must equal the wire epoch");
+    assert_eq!(alice_doc.epoch(), wire_epoch, "Alice's epoch must equal the wire epoch");
+
+    // The encrypted update decrypts to the expected plaintext on the peer.
     assert_eq!(bob_doc.get_content(), "Hello from Alice!");
     assert_eq!(alice_doc.get_content(), bob_doc.get_content());
 }
@@ -546,22 +593,41 @@ async fn test_offline_message_delivery() {
     let relay_url = "ws://localhost:8080/ws";
     let doc_id: DocumentId = "test-doc-offline".to_string();
 
-    // Alice connects and subscribes
+    // Alice subscribes first so her subscription is registered before Bob
+    // publishes his KeyPackage.
     let mut alice = TestClient::connect_as(relay_url, "alice").await.unwrap();
-    alice.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await.unwrap();
-    let _ = alice.recv().await.unwrap(); // Subscription confirmation
+    alice.subscribe(&doc_id).await.unwrap();
 
     // Bob connects and subscribes
     let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
-    bob.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await.unwrap();
-    let _ = bob.recv().await.unwrap(); // Subscription confirmation
+    bob.subscribe(&doc_id).await.unwrap();
 
-    // Set up MLS group
+    // Alice owns the group (epoch 0 -> 1 after `create_invite`).
     let mut alice_doc = EncryptedDocument::create(&doc_id, "alice").unwrap();
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
-    let invite = alice_doc.create_invite(bob_pending.key_package()).unwrap();
 
-    // Send welcome to Bob
+    // Bob PUBLISHES his KeyPackage over the wire.
+    bob.send(&ClientMessage::MlsHandshake {
+        doc_id: doc_id.clone(),
+        payload: bob_pending.key_package().to_vec(),
+        message_type: MlsMessageType::KeyPackage,
+    })
+    .await
+    .unwrap();
+
+    // Alice receives the KeyPackage OFF THE WIRE and builds the invite from the
+    // wire bytes only — no local handle to Bob's PendingMember.
+    let ServerMessage::MlsHandshake {
+        payload: bob_key_package,
+        message_type: MlsMessageType::KeyPackage,
+        ..
+    } = alice.recv().await.unwrap()
+    else {
+        panic!("Alice expected Bob's KeyPackage over the wire")
+    };
+    let invite = alice_doc.create_invite(&bob_key_package).unwrap();
+
+    // Welcome + Commit cross the wire.
     alice
         .send(&ClientMessage::MlsHandshake {
             doc_id: doc_id.clone(),
@@ -570,24 +636,48 @@ async fn test_offline_message_delivery() {
         })
         .await
         .unwrap();
+    alice
+        .send(&ClientMessage::MlsHandshake {
+            doc_id: doc_id.clone(),
+            payload: invite.commit.clone(),
+            message_type: MlsMessageType::Commit,
+        })
+        .await
+        .unwrap();
 
-    // Bob receives welcome and joins
+    // Bob receives Welcome + Commit off the wire and reconstructs the invite from
+    // the REAL welcome/commit/epoch that crossed the wire (no hardcoded vec![]/1).
     let ServerMessage::MlsHandshake {
         payload: welcome_payload,
         message_type: MlsMessageType::Welcome,
         ..
     } = bob.recv().await.unwrap()
     else {
-        panic!("Expected MlsHandshake Welcome message")
+        panic!("Bob expected the Welcome over the wire")
     };
-
+    let ServerMessage::MlsHandshake {
+        payload: commit_payload,
+        message_type: MlsMessageType::Commit,
+        ..
+    } = bob.recv().await.unwrap()
+    else {
+        panic!("Bob expected the Commit over the wire")
+    };
+    assert!(
+        !commit_payload.is_empty(),
+        "the Commit that crossed the wire must be a real MLS commit, not a #46 vec![] fake"
+    );
     let bob_invite = collab_core::Invite {
         doc_id: doc_id.clone(),
         welcome: welcome_payload,
-        commit: vec![],
-        epoch: 1,
+        commit: commit_payload,
+        epoch: invite.epoch,
     };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
+
+    // Both clients independently reached the same, non-trivial epoch.
+    assert_eq!(alice_doc.epoch(), bob_doc.epoch(), "both clients must reach the same epoch");
+    assert!(alice_doc.epoch() >= 1, "epoch must be non-trivial (real add-commit merged)");
 
     // Bob goes offline (drop connection)
     drop(bob);
