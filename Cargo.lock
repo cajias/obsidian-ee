@@ -286,6 +286,7 @@ dependencies = [
  "clap",
  "collab-core",
  "collab-proto",
+ "collab-relay",
  "futures",
  "pretty_assertions",
  "serde",

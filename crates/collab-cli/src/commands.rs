@@ -5,9 +5,10 @@ use std::ops::ControlFlow;
 use std::path::Path;
 
 use collab_core::{
-    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument, MlsDocumentGroup,
+    ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument, EncryptedOp,
+    MlsDocumentGroup,
 };
-use collab_proto::Invite;
+use collab_proto::{ClientMessage, Invite, MlsMessageType, ServerMessage};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
@@ -286,10 +287,222 @@ pub struct DemoResult {
     pub message: String,
 }
 
+/// Fixed ceiling for how long a peer waits for any single relay message.
+// ponytail: fixed timeout; make configurable only if a slow relay ever needs it.
+const PEER_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A client-side WebSocket connection to the relay, used by [`session_check`].
+type PeerWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// One relay-connected client: a split WebSocket plus identify/subscribe and
+/// typed send/recv helpers bounded by [`PEER_RECV_TIMEOUT`].
+struct Peer {
+    write: futures::stream::SplitSink<PeerWs, Message>,
+    read: futures::stream::SplitStream<PeerWs>,
+}
+
+impl Peer {
+    /// Connect, identify, and subscribe — returning a ready peer or an error if
+    /// any handshake step is rejected or times out.
+    async fn connect(url: &str, user_id: &str, doc_id: &str) -> anyhow::Result<Self> {
+        let (ws, _) = connect_async(url).await?;
+        let (write, read) = ws.split();
+        let mut peer = Self { write, read };
+
+        peer.send(ClientMessage::Identify { user_id: user_id.to_string(), token: None }).await?;
+        match peer.recv().await? {
+            ServerMessage::Identified { .. } => {}
+            other => return Err(anyhow::anyhow!("expected Identified, got {other:?}")),
+        }
+
+        peer.send(ClientMessage::Subscribe { doc_id: doc_id.to_string() }).await?;
+        match peer.recv().await? {
+            ServerMessage::Subscribed { .. } => {}
+            other => return Err(anyhow::anyhow!("expected Subscribed, got {other:?}")),
+        }
+
+        Ok(peer)
+    }
+
+    /// Serialize and send one client message.
+    async fn send(&mut self, msg: ClientMessage) -> anyhow::Result<()> {
+        self.write.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+        Ok(())
+    }
+
+    /// Receive the next server message, erroring on timeout, close, transport
+    /// failure, or an `Error` frame from the relay.
+    async fn recv(&mut self) -> anyhow::Result<ServerMessage> {
+        let next = tokio::time::timeout(PEER_RECV_TIMEOUT, self.read_frame())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for a relay message"))??;
+
+        match next {
+            ServerMessage::Error { code, message } => {
+                Err(anyhow::anyhow!("relay error {code:?}: {message}"))
+            }
+            msg => Ok(msg),
+        }
+    }
+
+    /// Read frames until a text frame arrives, parsing it into a `ServerMessage`.
+    /// Ping/pong/binary frames are skipped; a close or transport error errors.
+    async fn read_frame(&mut self) -> anyhow::Result<ServerMessage> {
+        while let Some(frame) = self.read.next().await {
+            match frame.map_err(|e| anyhow::anyhow!("websocket transport error: {e}"))? {
+                // Parse the first text frame; return whatever it decodes to.
+                Message::Text(text) => return parse_server_message(&text),
+                Message::Close(_) => break,
+                // ping/pong/binary: keep waiting for a text frame.
+                _ => (),
+            }
+        }
+        Err(anyhow::anyhow!("relay closed the connection"))
+    }
+
+    /// Receive an MLS handshake payload, asserting the expected message type.
+    async fn recv_mls(&mut self, expected: MlsMessageType) -> anyhow::Result<Vec<u8>> {
+        match self.recv().await? {
+            ServerMessage::MlsHandshake { payload, message_type, .. }
+                if message_type == expected =>
+            {
+                Ok(payload)
+            }
+            other => Err(anyhow::anyhow!("expected {expected:?} handshake, got {other:?}")),
+        }
+    }
+
+    /// Receive a forwarded Yrs update's ciphertext and epoch.
+    async fn recv_yrs(&mut self) -> anyhow::Result<(Vec<u8>, u64)> {
+        match self.recv().await? {
+            ServerMessage::YrsUpdate { encrypted, epoch, .. } => Ok((encrypted, epoch)),
+            other => Err(anyhow::anyhow!("expected a Yrs update, got {other:?}")),
+        }
+    }
+}
+
+/// Parse a relay text frame into a [`ServerMessage`].
+fn parse_server_message(text: &str) -> anyhow::Result<ServerMessage> {
+    serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid server message: {e}"))
+}
+
+/// Result of a machine-checkable two-client session.
+#[derive(Debug, Serialize)]
+pub struct SessionCheckResult {
+    /// The document identifier used for the session.
+    pub doc_id: String,
+    /// The text the peer actually decrypted.
+    pub received: String,
+    /// The text the peer was expected to decrypt.
+    pub expected: String,
+    /// True iff the peer decrypted exactly the expected text.
+    pub matched: bool,
+}
+
+/// Run a real two-client session over a relay and report whether the receiving
+/// peer decrypted exactly the expected text.
+///
+/// This composes keygen -> invite -> join -> connect -> encrypted round-trip
+/// between two independently-keyed clients (Alice sends, Bob receives). Both
+/// clients share one process, but every message crosses a real relay and the
+/// MLS `KeyPackage` -> `Welcome` handshake is genuine. When `relay_url` is
+/// `None` a self-contained in-process relay is started and torn down automatically.
+///
+/// # Errors
+///
+/// Returns an error if the relay fails to start, any connect/handshake step is
+/// rejected or times out, or the encrypted update fails to decrypt (a tampered
+/// or wrong-key payload fails closed here rather than silently mismatching).
+pub async fn session_check(
+    relay_url: Option<&str>,
+    doc_id: &str,
+    send_text: &str,
+    expect: &str,
+) -> anyhow::Result<SessionCheckResult> {
+    // Start a self-contained relay unless the caller supplied one; keep the
+    // handle alive for the whole session and shut it down on every exit path.
+    let (url, bound) = if let Some(u) = relay_url {
+        (u.to_string(), None)
+    } else {
+        let bound = collab_relay::RelayServer::new().bind("127.0.0.1:0").await?;
+        (format!("ws://{}", bound.addr), Some(bound))
+    };
+
+    let outcome = run_session(&url, doc_id, send_text, expect).await;
+
+    if let Some(bound) = bound {
+        bound.handle.shutdown();
+    }
+    outcome
+}
+
+/// Drive the two-client choreography over an already-known relay URL.
+async fn run_session(
+    url: &str,
+    doc_id: &str,
+    send_text: &str,
+    expect: &str,
+) -> anyhow::Result<SessionCheckResult> {
+    // Alice subscribes before Bob publishes so she is present to route to.
+    let mut alice = Peer::connect(url, "alice", doc_id).await?;
+    let mut bob = Peer::connect(url, "bob", doc_id).await?;
+
+    // Bob generates a key package and publishes it to the group.
+    let bob_pending = MlsDocumentGroup::generate_key_package("bob")?;
+    bob.send(ClientMessage::MlsHandshake {
+        doc_id: doc_id.to_string(),
+        payload: bob_pending.key_package().to_vec(),
+        message_type: MlsMessageType::KeyPackage,
+    })
+    .await?;
+
+    // Alice receives the key package, creates the doc, and sends the welcome.
+    let key_package = alice.recv_mls(MlsMessageType::KeyPackage).await?;
+    let mut alice_doc = EncryptedDocument::create(doc_id, "alice")?;
+    let invite = alice_doc.create_invite(&key_package)?;
+    alice
+        .send(ClientMessage::MlsHandshake {
+            doc_id: doc_id.to_string(),
+            payload: invite.welcome.clone(),
+            message_type: MlsMessageType::Welcome,
+        })
+        .await?;
+
+    // Bob receives the welcome and joins the group (a 2-party joiner reads only
+    // the welcome — correct MLS semantics; the KeyPackage genuinely crossed the wire).
+    let welcome = bob.recv_mls(MlsMessageType::Welcome).await?;
+    let bob_invite =
+        collab_core::Invite { doc_id: doc_id.to_string(), welcome, commit: vec![], epoch: 1 };
+    let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
+
+    // Alice writes the text and publishes the encrypted update.
+    alice_doc.insert(0, send_text);
+    let update = alice_doc.get_encrypted_update()?;
+    alice
+        .send(ClientMessage::YrsUpdate {
+            doc_id: doc_id.to_string(),
+            encrypted: update.ciphertext,
+            epoch: update.epoch,
+        })
+        .await?;
+
+    // Bob receives and decrypts. A tampered/wrong-key payload errors here and
+    // bubbles up via `?` to a non-zero exit (fail closed).
+    let (ciphertext, epoch) = bob.recv_yrs().await?;
+    bob_doc.apply_encrypted_update(&EncryptedOp { ciphertext, epoch })?;
+    let received = bob_doc.get_content();
+
+    Ok(SessionCheckResult {
+        doc_id: doc_id.to_string(),
+        matched: received == expect,
+        received,
+        expected: expect.to_string(),
+    })
+}
+
 /// Handle a server message by printing appropriate output.
 fn handle_server_message(server_msg: collab_proto::ServerMessage) {
-    use collab_proto::ServerMessage;
-
     match server_msg {
         ServerMessage::Identified { user_id } => {
             println!("Identified as {user_id}");
@@ -335,8 +548,6 @@ async fn run_ws_session(
     user_id: &str,
     doc_id: &str,
 ) -> anyhow::Result<()> {
-    use collab_proto::{ClientMessage, ServerMessage};
-
     let (mut write, mut read) = ws.split();
 
     let identify = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
@@ -574,6 +785,25 @@ mod tests {
         let (ws, _) = connect_async(&url).await.unwrap();
         let result = run_ws_session(ws, "user", "doc").await;
         assert!(result.is_err(), "transport drop must return Err, got {result:?}");
+    }
+
+    /// Positive path: the peer decrypts exactly the expected text over a real
+    /// in-process relay + MLS handshake, so `matched` is true.
+    #[tokio::test]
+    async fn test_session_check_matches() {
+        let r = session_check(None, "sc-doc", "Hello, session!", "Hello, session!").await.unwrap();
+        assert!(r.matched);
+        assert_eq!(r.received, "Hello, session!");
+    }
+
+    /// Negative-path regression: sending different text than expected must be
+    /// detected (`matched` false, `received` reflects what was really decrypted,
+    /// not a hardcoded pass). This is the teeth that proves the gate can flip.
+    #[tokio::test]
+    async fn test_session_check_mismatch_is_detected() {
+        let r = session_check(None, "sc-doc", "tampered", "Hello, session!").await.unwrap();
+        assert!(!r.matched);
+        assert_eq!(r.received, "tampered");
     }
 
     #[test]

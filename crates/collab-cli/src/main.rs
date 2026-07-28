@@ -78,6 +78,23 @@ enum Commands {
         #[arg(default_value = "demo-doc")]
         doc_id: String,
     },
+    /// Run a machine-checkable two-client session over a relay and assert the
+    /// peer decrypts the expected text. Exits non-zero on mismatch.
+    SessionCheck {
+        /// Expected text the peer must decrypt (the assertion target).
+        #[arg(short, long)]
+        expect: String,
+        /// Text the sender inserts. Defaults to --expect; set it different to
+        /// exercise the negative path (mismatch -> non-zero exit).
+        #[arg(short, long)]
+        send: Option<String>,
+        /// Relay URL. If omitted, a self-contained in-process relay is started.
+        #[arg(short, long)]
+        relay_url: Option<String>,
+        /// Document identifier.
+        #[arg(short, long, default_value = "session-check")]
+        doc: String,
+    },
 }
 
 #[tokio::main]
@@ -110,7 +127,32 @@ async fn main() -> anyhow::Result<()> {
             let result = collab_cli::commands::demo(&doc_id)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Commands::SessionCheck { expect, send, relay_url, doc } => {
+            run_session_check(&expect, send.as_deref(), relay_url.as_deref(), &doc).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Run the session-check command: report the result and exit non-zero on a
+/// mismatch (the machine-checkable acceptance gate for issue #47).
+async fn run_session_check(
+    expect: &str,
+    send: Option<&str>,
+    relay_url: Option<&str>,
+    doc: &str,
+) -> anyhow::Result<()> {
+    let send_text = send.unwrap_or(expect);
+    let result = collab_cli::commands::session_check(relay_url, doc, send_text, expect).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if result.matched {
+        println!("session-check: PASS (received == expected)");
+        return Ok(());
+    }
+    eprintln!(
+        "session-check: FAIL (received != expected)\n  received={:?}\n  expected={:?}",
+        result.received, result.expected
+    );
+    std::process::exit(1);
 }

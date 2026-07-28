@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 collab-core = { path = "../collab-core" }
 collab-proto = { path = "../collab-proto" }
+collab-relay = { path = "../collab-relay" }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true
