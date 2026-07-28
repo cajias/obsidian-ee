@@ -503,8 +503,6 @@ async fn run_session(
 
 /// Handle a server message by printing appropriate output.
 fn handle_server_message(server_msg: collab_proto::ServerMessage) {
-    use collab_proto::ServerMessage;
-
     match server_msg {
         ServerMessage::Identified { user_id } => {
             println!("Identified as {user_id}");
@@ -550,8 +548,6 @@ async fn run_ws_session(
     user_id: &str,
     doc_id: &str,
 ) -> anyhow::Result<()> {
-    use collab_proto::{ClientMessage, ServerMessage};
-
     let (mut write, mut read) = ws.split();
 
     let identify = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
