@@ -214,6 +214,14 @@ jobs:
         working-directory: plugins/obsidian-ee
         run: npx tsc --noEmit
 
+      # The e2e/ specs are outside the main tsconfig's rootDir (./src) so the step
+      # above skips them; this dedicated project type-checks them so the headline
+      # Playwright spec cannot silently drift into type errors (Playwright's esbuild
+      # transpile strips types without checking). Real gate, no continue-on-error.
+      - name: Type-check plugin e2e specs
+        working-directory: plugins/obsidian-ee
+        run: npm run typecheck:e2e
+
       - name: Build plugin bundle
         working-directory: plugins/obsidian-ee
         run: npm run build

@@ -10,6 +10,7 @@
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.esm.config.mjs --watch",
     "e2e": "playwright test",
     "e2e:headed": "playwright test --headed",
+    "typecheck:e2e": "tsc --noEmit --project tsconfig.e2e.json",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/"
