@@ -8,6 +8,12 @@
 
 use std::env;
 use std::process::{Command, ExitCode};
+use std::time::Duration;
+
+/// Number of healthcheck polls before giving up (30 * 2s ≈ 60s).
+const HEALTHCHECK_RETRIES: u32 = 30;
+/// Delay between healthcheck polls.
+const HEALTHCHECK_DELAY: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -71,12 +77,44 @@ fn run_e2e() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Wait for services to be ready
-    println!("Waiting for services to be ready...");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Gate on the compose healthcheck, not a fixed sleep: a dead relay must fail
+    // fast instead of running the wire tests against nothing.
+    println!("Waiting for the relay to become healthy...");
+    if !wait_until(relay_healthy, HEALTHCHECK_RETRIES, HEALTHCHECK_DELAY) {
+        eprintln!("Relay did not become healthy; aborting E2E run (not testing a dead relay).");
+        return ExitCode::FAILURE;
+    }
+    println!("Relay is healthy.");
 
-    // Run the tests
-    run_cmd("cargo", &["test", "-p", "e2e-tests", "--", "--ignored", "--test-threads=1"])
+    // ponytail: shared gate invariant with scripts/e2e-test.sh — gate on the relay
+    // healthcheck before running tests, and pass `--include-ignored` so BOTH the
+    // in-process and the #[ignore]d wire tests run. Keep this rule in sync across both
+    // entry points. The docker-absent case intentionally DIFFERS: this xtask requires
+    // docker and returns FAILURE (above), whereas the script degrades to non-ignored tests.
+    run_cmd("cargo", &["test", "-p", "e2e-tests", "--", "--include-ignored", "--test-threads=1"])
+}
+
+/// True iff `docker compose ps relay` reports the relay as `(healthy)`.
+fn relay_healthy() -> bool {
+    Command::new("docker")
+        .args(["compose", "-f", "docker/docker-compose.yml", "ps", "relay"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("(healthy)"))
+}
+
+/// Poll `ready` up to `retries` times, sleeping `delay` between attempts.
+/// Returns `true` on the first success, `false` once retries are exhausted.
+/// Side-effect-free except for calling `ready` and sleeping.
+fn wait_until(mut ready: impl FnMut() -> bool, retries: u32, delay: Duration) -> bool {
+    for attempt in 0..retries {
+        if ready() {
+            return true;
+        }
+        if attempt + 1 < retries {
+            std::thread::sleep(delay);
+        }
+    }
+    false
 }
 
 fn run_lint() -> ExitCode {
@@ -255,5 +293,58 @@ fn run_cmd(cmd: &str, args: &[&str]) -> ExitCode {
             eprintln!("Failed to execute '{cmd}': {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn never_ready_returns_false() {
+        let calls = Cell::new(0u32);
+        let ok = wait_until(
+            || {
+                calls.set(calls.get() + 1);
+                false
+            },
+            5,
+            Duration::ZERO,
+        );
+        assert!(!ok, "exhausting all retries with no success must return false");
+        assert_eq!(calls.get(), 5, "ready should be polled exactly `retries` times");
+    }
+
+    #[test]
+    fn immediately_ready_returns_true() {
+        let calls = Cell::new(0u32);
+        let ok = wait_until(
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+            5,
+            Duration::ZERO,
+        );
+        assert!(ok, "a first-call success must return true");
+        assert_eq!(calls.get(), 1, "must stop polling after the first success");
+    }
+
+    #[test]
+    fn eventually_ready_returns_true() {
+        let calls = Cell::new(0u32);
+        let ok = wait_until(
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                n >= 2 // false on calls 0 and 1, true on call 2
+            },
+            5,
+            Duration::ZERO,
+        );
+        assert!(ok, "success after transient failures must return true");
+        assert_eq!(calls.get(), 3, "false twice then true → polled three times");
     }
 }
