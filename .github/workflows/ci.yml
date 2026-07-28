@@ -66,39 +66,59 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  # Deploy-gated wire-test gate (#49, exercises the #22 wire tests). Self-
+  # contained: it boots the relay, gates on the compose healthcheck, and runs
+  # the --ignored docker-gated wire tests DIRECTLY so it is a real gate
+  # regardless of whether #22's e2e-test.sh change has merged. CI fails if the
+  # relay is down or any wire test fails.
   e2e:
-    name: E2E Tests
+    name: E2E Tests (deploy-gated wire tests)
     runs-on: ubuntu-latest
     needs: test
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.87.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
 
-      - name: Start Docker Compose
-        run: docker compose -f docker/docker-compose.yml up -d
-        continue-on-error: true
+      # No continue-on-error: a failed relay bring-up MUST fail the job. --build
+      # because CI has no prebuilt relay image (local dev uses one).
+      - name: Start relay (docker compose)
+        run: docker compose -f docker/docker-compose.yml up -d --build
 
-      - name: Wait for services
-        run: sleep 10
-
-      - name: Build release binaries
-        run: cargo build --workspace --release
-
-      - name: Run E2E tests
+      # Deploy gate: poll the compose healthcheck (nc -z localhost 8080) until the
+      # relay reports (healthy). Up to 30 x 5s = 150s. If it never becomes
+      # healthy, dump the relay logs for debugging and fail the job.
+      - name: Wait for relay healthcheck
         run: |
-          if [ -f ./scripts/e2e-test.sh ]; then
-            chmod +x ./scripts/e2e-test.sh
-            ./scripts/e2e-test.sh
-          else
-            echo "E2E test script not yet implemented"
-          fi
+          for i in $(seq 1 30); do
+            if docker compose -f docker/docker-compose.yml ps relay | grep -q '(healthy)'; then
+              echo "relay healthy after attempt $i"
+              exit 0
+            fi
+            echo "attempt $i: relay not healthy yet; waiting 5s"
+            sleep 5
+          done
+          echo "relay never became healthy; dumping logs:"
+          docker compose -f docker/docker-compose.yml logs relay
+          exit 1
 
-      - name: Stop Docker Compose
+      - name: Build workspace
+        run: cargo build --workspace
+
+      # --ignored runs ONLY the #[ignore]d docker-gated wire tests (the relay-
+      # dependent ones); the in-process tests are covered by the `test` job this
+      # job needs. --test-threads=1 avoids relay port contention. A wire-test
+      # failure fails the job (no continue-on-error, no `|| true`).
+      - name: Run wire tests (--ignored)
+        run: cargo test -p e2e-tests -- --ignored --test-threads=1
+
+      # Teardown may keep continue-on-error: a teardown failure should not fail an
+      # otherwise-green run.
+      - name: Stop relay (docker compose)
         if: always()
         run: docker compose -f docker/docker-compose.yml down
         continue-on-error: true
