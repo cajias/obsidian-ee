@@ -86,9 +86,11 @@ fn run_e2e() -> ExitCode {
     }
     println!("Relay is healthy.");
 
-    // ponytail: shared gate invariant — must match scripts/e2e-test.sh:
-    // healthcheck-gated bring-up + `--include-ignored` so BOTH the in-process and
-    // the #[ignore]d wire tests run. Change both entry points together.
+    // ponytail: shared gate invariant with scripts/e2e-test.sh — gate on the relay
+    // healthcheck before running tests, and pass `--include-ignored` so BOTH the
+    // in-process and the #[ignore]d wire tests run. Keep this rule in sync across both
+    // entry points. The docker-absent case intentionally DIFFERS: this xtask requires
+    // docker and returns FAILURE (above), whereas the script degrades to non-ignored tests.
     run_cmd("cargo", &["test", "-p", "e2e-tests", "--", "--include-ignored", "--test-threads=1"])
 }
 

@@ -5,9 +5,11 @@ echo "=== Starting E2E Test Suite ==="
 
 COMPOSE="docker compose -f docker/docker-compose.yml"
 
-# ponytail: shared gate invariant — must match xtask/src/main.rs run_e2e():
-# healthcheck-gated bring-up + `--include-ignored` so BOTH the in-process and
-# the #[ignore]d wire tests run. Change both entry points together.
+# ponytail: shared gate invariant with xtask/src/main.rs run_e2e() — gate on the
+# relay healthcheck before running tests, and pass `--include-ignored` so BOTH the
+# in-process and the #[ignore]d wire tests run. Keep this rule in sync across both
+# entry points. The docker-absent case intentionally DIFFERS: this script degrades
+# to the non-ignored tests, whereas xtask requires docker and returns FAILURE.
 
 echo "Building release binaries..."
 cargo build --workspace --release
