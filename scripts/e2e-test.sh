@@ -5,32 +5,43 @@ echo "=== Starting E2E Test Suite ==="
 
 COMPOSE="docker compose -f docker/docker-compose.yml"
 
-# Best-effort: bring up the relay. E2E infra failures must not mask the actual
-# test result, so infra bring-up is tolerant; the test command below is not.
-if command -v docker >/dev/null 2>&1; then
-    if ! $COMPOSE ps --quiet 2>/dev/null | grep -q .; then
-        echo "Starting relay via Docker Compose..."
-        $COMPOSE up -d || echo "WARN: could not start Docker Compose; Docker-gated tests will be skipped"
-    fi
-
-    echo "Waiting for the relay to become healthy..."
-    for i in $(seq 1 30); do
-        if $COMPOSE ps relay 2>/dev/null | grep -q "(healthy)"; then
-            echo "Relay is ready!"
-            break
-        fi
-        sleep 2
-    done
-else
-    echo "WARN: docker not available; running only the Docker-independent E2E tests"
-fi
+# ponytail: shared gate invariant — must match xtask/src/main.rs run_e2e():
+# healthcheck-gated bring-up + `--include-ignored` so BOTH the in-process and
+# the #[ignore]d wire tests run. Change both entry points together.
 
 echo "Building release binaries..."
 cargo build --workspace --release
 
-# Real gate: the Docker-independent full-flow tests must pass. The Docker-gated
-# tests are #[ignore]d and only run manually with a live relay.
-echo "Running E2E tests..."
-cargo test --package e2e-tests --test full_flow
+if command -v docker >/dev/null 2>&1; then
+    if ! $COMPOSE ps --quiet 2>/dev/null | grep -q .; then
+        echo "Starting relay via Docker Compose..."
+        $COMPOSE up -d
+    fi
+
+    echo "Waiting for the relay to become healthy..."
+    healthy=0
+    for _ in $(seq 1 30); do
+        if $COMPOSE ps relay 2>/dev/null | grep -q "(healthy)"; then
+            healthy=1
+            echo "Relay is healthy."
+            break
+        fi
+        sleep 2
+    done
+
+    if [ "$healthy" -ne 1 ]; then
+        echo "ERROR: relay never became healthy — refusing to run wire tests against a dead relay." >&2
+        exit 1
+    fi
+
+    # --include-ignored runs BOTH the regular and the #[ignore]d wire tests;
+    # --test-threads=1 avoids relay port contention.
+    echo "Running E2E tests (including Docker-gated wire tests)..."
+    cargo test --package e2e-tests -- --include-ignored --test-threads=1
+else
+    echo "SKIP: docker unavailable — wire tests not run"
+    echo "Running Docker-independent E2E tests only..."
+    cargo test --package e2e-tests
+fi
 
 echo "=== E2E Test Suite Complete ==="
