@@ -16,6 +16,12 @@ src/wasm/
 # Coverage
 coverage/
 
+# Playwright E2E output
+test-results/
+playwright-report/
+blob-report/
+.last-run.json
+
 # IDE
 .idea/
 *.swp
