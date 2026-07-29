@@ -1,3 +1,8 @@
+mod mls;
+pub use mls::{
+    generate_key_package, WasmEncryptedDocument, WasmEncryptedOp, WasmInvite, WasmPendingMember,
+};
+
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,

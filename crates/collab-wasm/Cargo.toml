@@ -16,6 +16,13 @@ yrs.workspace = true
 js-sys = "0.3"
 # For simplified encryption (MVP) - will be replaced with MLS later
 aes-gcm = "0.10"
+# MLS engine reused across the wasm-bindgen boundary (issue #28).
+collab-core = { path = "../collab-core" }
+
+# wasm32 needs openmls's `js` clock; gating it here keeps `openmls/js` out of the
+# native dependency graph, so feature unification can never turn it on for native.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+collab-core = { path = "../collab-core", features = ["wasm-clock"] }
 
 [dependencies.web-sys]
 workspace = true

@@ -7,6 +7,11 @@ authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Opt-in on wasm32 only: routes openmls's clock through fluvio_wasm_timer.
+# Kept off the native graph so the relay/CLI keep the OS clock (see collab-wasm).
+wasm-clock = ["openmls/js"]
+
 [dependencies]
 yrs.workspace = true
 openmls.workspace = true
