@@ -129,7 +129,7 @@ npx playwright test
 
 | Test File | Description |
 |-----------|-------------|
-| `two-user-sync.spec.ts` | Full Playwright test with mock relay |
+| `two-user-sync.spec.ts` | Real two-client AES-PSK sync + fail-closed (wrong-key, all-zeros-key) assertions over the mock relay, using the compiled WASM in the Playwright/Node context. Does not drive Electron/Obsidian yet; a full Obsidian-driving E2E is tracked separately. |
 | `mock-relay.ts` | WebSocket mock for testing without real server |
 
 ## Build

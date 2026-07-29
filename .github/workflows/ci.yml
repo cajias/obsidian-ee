@@ -214,9 +214,28 @@ jobs:
         working-directory: plugins/obsidian-ee
         run: npx tsc --noEmit
 
+      # The e2e/ specs are outside the main tsconfig's rootDir (./src) so the step
+      # above skips them; this dedicated project type-checks them so the headline
+      # Playwright spec cannot silently drift into type errors (Playwright's esbuild
+      # transpile strips types without checking). Real gate, no continue-on-error.
+      - name: Type-check plugin e2e specs
+        working-directory: plugins/obsidian-ee
+        run: npm run typecheck:e2e
+
       - name: Build plugin bundle
         working-directory: plugins/obsidian-ee
         run: npm run build
+
+      # Real gate (no continue-on-error): the headline Playwright spec drives two
+      # CollabClients over the ws mock relay with the compiled WASM, asserting
+      # AES-PSK sync + fail-closed on a wrong key. Runs here because it needs both
+      # the built WASM (build-wasm step above) and node_modules (npm ci above).
+      # The spec is Node-only (no `page`/browser fixture), so Playwright launches
+      # no browser and `npx playwright install` is deliberately omitted to keep CI
+      # lean; add the browser install if a future spec drives a real page.
+      - name: Run plugin E2E (real two-client AES-PSK sync)
+        working-directory: plugins/obsidian-ee
+        run: npm run e2e -- --reporter=list
 
   # Secret scan: fail the build if a credential is committed. Independent gate
   # (no `needs:`) like `audit` and `plugin`, and no `continue-on-error` — it is
