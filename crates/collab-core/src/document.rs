@@ -37,9 +37,19 @@ impl CollabDocument {
     }
 
     /// Delete text starting at the specified index.
+    ///
+    /// Out-of-range `index`/`len` are clamped to the current text length (a
+    /// no-op if `index` is past the end), mirroring how `insert` tolerates an
+    /// out-of-range index. Without this guard, yrs `remove_range` panics, which
+    /// across the wasm boundary surfaces as `RuntimeError: unreachable` and
+    /// poisons the instance.
     pub fn delete(&mut self, index: u32, len: u32) {
-        let mut txn = self.doc.transact_mut();
-        self.text.remove_range(&mut txn, index, len);
+        // Clamp to the deletable range: 0 when `index` is past the end.
+        let text_len = self.text.len(&self.doc.transact());
+        let clamped_len = len.min(text_len.saturating_sub(index));
+        if clamped_len > 0 {
+            self.text.remove_range(&mut self.doc.transact_mut(), index, clamped_len);
+        }
     }
 
     /// Get the current text content.
@@ -93,6 +103,25 @@ mod tests {
         doc.insert(0, "Hello World");
         doc.delete(5, 6); // delete " World"
         assert_eq!(doc.get_content(), "Hello");
+    }
+
+    #[test]
+    fn test_delete_out_of_range_is_clamped_not_panic() {
+        // Arrange: a 3-char doc.
+        let mut doc = CollabDocument::new("test-doc".into());
+        doc.insert(0, "abc");
+
+        // Act + Assert: len overruns content -> clamps to end.
+        doc.delete(2, 50);
+        assert_eq!(doc.get_content(), "ab");
+
+        // Act + Assert: index past end -> no-op, unchanged.
+        doc.delete(5, 1);
+        assert_eq!(doc.get_content(), "ab");
+
+        // Act + Assert: over-range from start -> deletes everything.
+        doc.delete(0, 100);
+        assert_eq!(doc.get_content(), "");
     }
 
     #[test]
