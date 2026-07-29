@@ -36,6 +36,23 @@ pub struct WasmInvite(Invite);
 
 #[wasm_bindgen]
 impl WasmInvite {
+    /// Reconstruct an invite on the JOINER's side from the two things a joiner
+    /// actually has: its LOCALLY-TRUSTED `doc_id` and the `welcome` bytes read
+    /// off the wire. `create_invite` builds the full `WasmInvite` on the owner's
+    /// side, but a joiner only receives raw Welcome bytes over the relay and has
+    /// no way to obtain the owner's `WasmInvite` object. `join` reads only
+    /// `doc_id` + `welcome` (commit/epoch are for existing members), so those are
+    /// left empty here. `doc_id` MUST be the joiner's own trusted value, NEVER a
+    /// field taken from the inbound frame.
+    pub fn from_welcome(doc_id: &str, welcome: &[u8]) -> WasmInvite {
+        WasmInvite(Invite {
+            doc_id: doc_id.to_string(),
+            welcome: welcome.to_vec(),
+            commit: Vec::new(),
+            epoch: 0,
+        })
+    }
+
     #[wasm_bindgen(getter)]
     pub fn welcome(&self) -> Vec<u8> {
         self.0.welcome.clone()
