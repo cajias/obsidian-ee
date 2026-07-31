@@ -1,10 +1,17 @@
-import { CollabCore } from './wasm/collab_wasm';
+import {
+    WasmEncryptedDocument,
+    WasmInvite,
+    WasmPendingMember,
+    generate_key_package,
+} from './wasm/collab_wasm';
+
+export type CollabRole = 'owner' | 'joiner';
 
 export interface CollabClientConfig {
     relayUrl: string;
     userId: string;
     docId: string;
-    encryptionKey: Uint8Array;
+    role: CollabRole; // owner creates the MLS group; joiner joins via a Welcome
 }
 
 export type UpdateCallback = (text: string) => void;
@@ -24,6 +31,13 @@ export interface YrsUpdateMessage {
     encrypted: number[];
     doc_id?: string;
     epoch?: number;
+}
+
+export interface MlsHandshakeMessage {
+    type: 'mls_handshake';
+    doc_id?: string;
+    payload: number[];
+    message_type: 'key_package' | 'welcome' | 'commit';
 }
 
 /**
@@ -96,28 +110,16 @@ function validateConfig(config: CollabClientConfig): void {
         throw new ConfigValidationError('docId must be a non-empty string');
     }
 
-    // Validate encryptionKey
-    if (!(config.encryptionKey instanceof Uint8Array)) {
-        throw new ConfigValidationError('encryptionKey must be a Uint8Array');
-    }
-    if (config.encryptionKey.length !== 32) {
-        throw new ConfigValidationError(
-            `encryptionKey must be exactly 32 bytes for AES-256, got ${config.encryptionKey.length} bytes`
-        );
-    }
-    // Fail closed on the all-zeros placeholder key: an all-zeros key is not a real
-    // secret, so accepting it would ship documents "encrypted" with a publicly-known
-    // key. This guard is the single choke point every caller routes through.
-    if (config.encryptionKey.every((b) => b === 0)) {
-        throw new ConfigValidationError(
-            'encryptionKey must not be all zeros (placeholder key is insecure)'
-        );
+    // Validate role
+    if (config.role !== 'owner' && config.role !== 'joiner') {
+        throw new ConfigValidationError('role must be "owner" or "joiner"');
     }
 }
 
 export class CollabClient {
     private ws: WebSocket | null = null;
-    private collabCore: CollabCore;
+    private doc: WasmEncryptedDocument | null = null;
+    private pending: WasmPendingMember | null = null;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
     private onDisconnectCallback: DisconnectCallback | null = null;
@@ -132,11 +134,30 @@ export class CollabClient {
     private isInitialConnect = true;
     private connectPromise: Promise<void> | null = null;
 
-    constructor(collabCore: CollabCore, config: CollabClientConfig) {
+    constructor(config: CollabClientConfig) {
         validateConfig(config);
-        this.collabCore = collabCore;
         this.config = config;
-        this.collabCore.set_encryption_key(config.encryptionKey);
+    }
+
+    /**
+     * Establish the MLS group for this connection. Called from onopen after
+     * identify/subscribe so group state is fresh per connection.
+     * - owner: creates the group document immediately.
+     * - joiner: generates a single-use key package and ships it as an
+     *   mls_handshake frame; `this.doc` stays null until the Welcome arrives.
+     */
+    private establishGroup(): void {
+        if (this.config.role === 'owner') {
+            this.doc = WasmEncryptedDocument.create(this.config.docId, this.config.userId);
+            return;
+        }
+        this.pending = generate_key_package(this.config.userId);
+        this.send({
+            type: 'mls_handshake',
+            doc_id: this.config.docId,
+            payload: [...this.pending.key_package],
+            message_type: 'key_package',
+        });
     }
 
     connect(): Promise<void> {
@@ -176,6 +197,8 @@ export class CollabClient {
                         reject(error);
                         return;
                     }
+
+                    this.establishGroup();
 
                     this.flushMessageQueue();
                     this.reconnectAttempts = 0;
@@ -295,6 +318,9 @@ export class CollabClient {
                 case 'yrs_update':
                     this.handleYrsUpdate(message as YrsUpdateMessage);
                     break;
+                case 'mls_handshake':
+                    this.handleMlsHandshake(message as MlsHandshakeMessage);
+                    break;
                 case 'subscribed':
                     console.log('Subscribed to document:', message.doc_id);
                     break;
@@ -345,20 +371,84 @@ export class CollabClient {
                     `yrs_update doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
                 );
             }
+            // Fail closed: an update that arrives before the MLS group is
+            // established cannot be decrypted. Surface it as an error rather than
+            // silently dropping it.
+            if (this.doc === null) {
+                throw new Error('no MLS group established');
+            }
             const encrypted = new Uint8Array(message.encrypted);
-            // Bind the locally-trusted docId as AEAD associated data. A ciphertext
-            // encrypted for another document fails authentication here, so an
-            // untrusted relay cannot splice doc A's content into doc B.
-            this.collabCore.apply_update_encrypted(this.config.docId, encrypted);
+            // MLS authenticates and decrypts under the group's current epoch.
+            this.doc.apply_encrypted_update(encrypted, BigInt(message.epoch ?? 0));
 
             if (this.onUpdateCallback) {
-                this.onUpdateCallback(this.collabCore.get_text());
+                this.onUpdateCallback(this.doc.get_content());
             }
         } catch (error) {
             console.error('Failed to apply update:', error);
             if (this.onErrorCallback) {
                 const collabError: CollabError = {
                     type: 'decryption',
+                    message: extractErrorMessage(error),
+                    docId: this.config.docId,
+                    originalError: error instanceof Error ? error : undefined,
+                };
+                this.onErrorCallback(collabError);
+            }
+        }
+    }
+
+    /**
+     * Handle the MLS handshake wire protocol (#51):
+     * - owner receives a joiner's key_package → builds and sends a Welcome.
+     * - joiner receives a Welcome → joins the group, consuming its key package.
+     * - either side receives a commit → applies it to advance the epoch.
+     */
+    private handleMlsHandshake(message: MlsHandshakeMessage): void {
+        try {
+            if (!message.payload || !Array.isArray(message.payload)) {
+                throw new Error('Invalid mls_handshake message: missing or invalid payload');
+            }
+            const payload = new Uint8Array(message.payload);
+
+            switch (message.message_type) {
+                case 'key_package': {
+                    // Owner side: only if the group document exists.
+                    if (!this.doc) {
+                        return;
+                    }
+                    const invite = this.doc.create_invite(payload);
+                    this.send({
+                        type: 'mls_handshake',
+                        doc_id: this.config.docId,
+                        payload: [...invite.welcome],
+                        message_type: 'welcome',
+                    });
+                    break;
+                }
+                case 'welcome': {
+                    // Joiner side: bind the LOCAL docId, never message.doc_id.
+                    const invite = WasmInvite.from_welcome(this.config.docId, payload);
+                    this.doc = WasmEncryptedDocument.join(invite, this.pending!);
+                    this.pending = null;
+                    break;
+                }
+                case 'commit': {
+                    this.doc?.process_commit(payload);
+                    break;
+                }
+                default:
+                    console.warn(
+                        `[CollabClient] Unknown mls_handshake message_type: ${message.message_type}`,
+                        message
+                    );
+                    break;
+            }
+        } catch (error) {
+            console.error('Failed to process MLS handshake:', error);
+            if (this.onErrorCallback) {
+                const collabError: CollabError = {
+                    type: 'sync',
                     message: extractErrorMessage(error),
                     docId: this.config.docId,
                     originalError: error instanceof Error ? error : undefined,
@@ -446,30 +536,35 @@ export class CollabClient {
 
         // Apply minimal operations
         if (deleteLen > 0) {
-            this.collabCore.delete(prefixLen, deleteLen);
+            this.doc?.delete(prefixLen, deleteLen);
         }
         if (insertText.length > 0) {
-            this.collabCore.insert(prefixLen, insertText);
+            this.doc?.insert(prefixLen, insertText);
         }
     }
 
     sendUpdate(text: string): boolean {
+        // Fail-closed guard (replaces the old all-zeros-key guard): without an
+        // established MLS group there is no key to encrypt under, so send NOTHING
+        // rather than falling back to a plaintext path.
+        if (this.doc === null) {
+            return false;
+        }
         try {
-            const currentText = this.collabCore.get_text();
+            const currentText = this.doc.get_content();
 
             if (text !== currentText) {
                 // Apply minimal diff instead of clearing and reinserting
                 this.applyTextDiff(currentText, text);
             }
 
-            // Bind the docId as AEAD associated data so the emitted ciphertext is
-            // cryptographically tied to this document (see handleYrsUpdate).
-            const encrypted = this.collabCore.encode_state_encrypted(this.config.docId);
+            // MLS encrypts under the group's current epoch; the op carries both.
+            const op = this.doc.get_encrypted_update();
             return this.send({
                 type: 'yrs_update',
                 doc_id: this.config.docId,
-                encrypted: [...encrypted],
-                epoch: 0,
+                encrypted: [...op.ciphertext],
+                epoch: Number(op.epoch),
             });
         } catch (error) {
             console.error('Failed to send update:', error);
@@ -503,7 +598,7 @@ export class CollabClient {
     }
 
     getText(): string {
-        return this.collabCore.get_text();
+        return this.doc?.get_content() ?? '';
     }
 
     disconnect(): void {
@@ -516,5 +611,7 @@ export class CollabClient {
         }
         this.ws?.close();
         this.ws = null;
+        this.doc?.free();
+        this.doc = null;
     }
 }

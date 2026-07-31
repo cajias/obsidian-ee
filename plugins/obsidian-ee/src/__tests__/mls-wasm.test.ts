@@ -130,4 +130,17 @@ describe('MLS WASM surface', () => {
             (doc as unknown as { has_encryption_key?: unknown }).has_encryption_key
         ).toBeUndefined();
     });
+
+    it('exposes no AES surface anywhere on the loaded WASM MODULE (AES-256-GCM path removed)', async () => {
+        // Module-level assertion (not just one document): the whole AES CollabCore
+        // surface is gone from the compiled artifact after #28. RED before the AES
+        // removal (CollabCore + set/has_encryption_key were exported), GREEN after.
+        const mod = (await import('../wasm/collab_wasm')) as unknown as Record<string, unknown>;
+        expect(mod.CollabCore).toBeUndefined();
+        expect(mod.set_encryption_key).toBeUndefined();
+        expect(mod.has_encryption_key).toBeUndefined();
+        // The MLS surface is what remains.
+        expect(mod.WasmEncryptedDocument).toBeDefined();
+        expect(mod.generate_key_package).toBeDefined();
+    });
 });

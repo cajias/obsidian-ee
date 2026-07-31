@@ -43,42 +43,57 @@ class MockWebSocket {
 // @ts-ignore - Override global WebSocket
 global.WebSocket = MockWebSocket;
 
+// A mock of the MLS document surface the client drives. There is NO
+// set_encryption_key / has_encryption_key / encode_state_encrypted here — the AES
+// CollabCore is gone; MLS derives keys from group membership.
+const makeMockDoc = () => ({
+    get_content: jest.fn<() => string>().mockReturnValue(''),
+    insert: jest.fn(),
+    delete: jest.fn(),
+    get_encrypted_update: jest
+        .fn<() => { ciphertext: Uint8Array; epoch: bigint }>()
+        .mockReturnValue({ ciphertext: new Uint8Array([1, 2, 3]), epoch: 1n }),
+    apply_encrypted_update: jest.fn(),
+    create_invite: jest
+        .fn<() => { welcome: Uint8Array }>()
+        .mockReturnValue({ welcome: new Uint8Array([9, 9]) }),
+    process_commit: jest.fn(),
+    free: jest.fn(),
+});
+
 jest.unstable_mockModule('../wasm/collab_wasm', () => ({
     __esModule: true,
-    CollabCore: jest.fn().mockImplementation(() => ({
-        set_encryption_key: jest.fn(),
-        get_text: jest.fn().mockReturnValue('test content'),
-        insert: jest.fn(),
-        delete: jest.fn(),
-        encode_state_encrypted: jest.fn().mockReturnValue(new Uint8Array([1, 2, 3])),
-        apply_update_encrypted: jest.fn(),
+    WasmEncryptedDocument: {
+        // Owner creates its group up front; a joiner joins via a Welcome.
+        create: jest.fn(() => makeMockDoc()),
+        join: jest.fn(() => makeMockDoc()),
+    },
+    WasmInvite: {
+        from_welcome: jest.fn(() => ({ welcome: new Uint8Array() })),
+    },
+    generate_key_package: jest.fn(() => ({
+        key_package: new Uint8Array([7, 7, 7]),
         free: jest.fn(),
     })),
 }));
 
-const { CollabCore } = await import('../wasm/collab_wasm');
+const { WasmEncryptedDocument, generate_key_package } = await import('../wasm/collab_wasm');
 const { CollabClient, ConfigValidationError } = await import('../collab-client');
 type CollabClient = InstanceType<typeof CollabClient>;
 
-// A valid (non-placeholder) 32-byte key for tests that need a *valid* config.
-// All-zeros is rejected by validateConfig as an insecure placeholder.
-const VALID_KEY = new Uint8Array(32).fill(1);
-
 describe('CollabClient', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -87,68 +102,48 @@ describe('CollabClient', () => {
     });
 
     describe('constructor', () => {
-        it('should set encryption key on CollabCore', () => {
-            expect(mockCore.set_encryption_key).toHaveBeenCalledWith(config.encryptionKey);
-        });
-
         it('should throw ConfigValidationError for empty relayUrl', () => {
             const invalidConfig = { ...config, relayUrl: '' };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
                 'relayUrl must be a non-empty string'
             );
         });
 
         it('should throw ConfigValidationError for invalid relayUrl protocol', () => {
             const invalidConfig = { ...config, relayUrl: 'http://localhost:8080' };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
                 'relayUrl must start with ws:// or wss://'
             );
         });
 
         it('should accept wss:// relayUrl', () => {
             const secureConfig = { ...config, relayUrl: 'wss://secure.example.com' };
-            expect(() => new CollabClient(mockCore, secureConfig)).not.toThrow();
+            expect(() => new CollabClient(secureConfig)).not.toThrow();
         });
 
         it('should throw ConfigValidationError for empty userId', () => {
             const invalidConfig = { ...config, userId: '' };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
                 'userId must be a non-empty string'
             );
         });
 
         it('should throw ConfigValidationError for empty docId', () => {
             const invalidConfig = { ...config, docId: '' };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
                 'docId must be a non-empty string'
             );
         });
 
-        it('should throw ConfigValidationError for wrong encryptionKey type', () => {
-            const invalidConfig = { ...config, encryptionKey: [1, 2, 3] as any };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
-                'encryptionKey must be a Uint8Array'
-            );
-        });
-
-        it('should throw ConfigValidationError for wrong encryptionKey length', () => {
-            const invalidConfig = { ...config, encryptionKey: new Uint8Array(16) };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
-                'encryptionKey must be exactly 32 bytes for AES-256, got 16 bytes'
-            );
-        });
-
-        it('should throw ConfigValidationError for all-zeros encryptionKey (placeholder)', () => {
-            const invalidConfig = { ...config, encryptionKey: new Uint8Array(32) };
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(ConfigValidationError);
-            expect(() => new CollabClient(mockCore, invalidConfig)).toThrow(
-                'encryptionKey must not be all zeros (placeholder key is insecure)'
+        it('should throw ConfigValidationError for an invalid role', () => {
+            const invalidConfig = { ...config, role: 'admin' as any };
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
+                'role must be "owner" or "joiner"'
             );
         });
     });
@@ -201,7 +196,7 @@ describe('CollabClient', () => {
                 }
             };
 
-            const testClient = new CollabClient(mockCore, config);
+            const testClient = new CollabClient(config);
             const connectPromise = testClient.connect();
 
             jest.runAllTimers();
@@ -243,7 +238,7 @@ describe('CollabClient', () => {
             client.disconnect();
 
             // Create new client for fresh connection
-            const newClient = new CollabClient(mockCore, config);
+            const newClient = new CollabClient(config);
 
             // Second connection should be allowed (different promise)
             const connectPromise2 = newClient.connect();
@@ -290,7 +285,7 @@ describe('CollabClient', () => {
                 }
             };
 
-            const testClient = new CollabClient(mockCore, config);
+            const testClient = new CollabClient(config);
 
             // First connection should fail
             const connectPromise1 = testClient.connect();
@@ -310,19 +305,21 @@ describe('CollabClient', () => {
     });
 
     describe('sendUpdate', () => {
-        it('should send encrypted update to relay', async () => {
+        it('should send an MLS-encrypted update to the relay', async () => {
             const connectPromise = client.connect();
             jest.runAllTimers();
             await connectPromise;
 
+            // Owner's group is created on connect; drive that document.
+            const doc = (client as any).doc;
             // Delta-diff: "old content" → "new content"
             // Common suffix is " content", so only "old" → "new" changes
-            mockCore.get_text.mockReturnValue('old content');
+            doc.get_content.mockReturnValue('old content');
             client.sendUpdate('new content');
 
-            expect(mockCore.delete).toHaveBeenCalledWith(0, 3); // delete "old"
-            expect(mockCore.insert).toHaveBeenCalledWith(0, 'new'); // insert "new"
-            expect(mockCore.encode_state_encrypted).toHaveBeenCalled();
+            expect(doc.delete).toHaveBeenCalledWith(0, 3); // delete "old"
+            expect(doc.insert).toHaveBeenCalledWith(0, 'new'); // insert "new"
+            expect(doc.get_encrypted_update).toHaveBeenCalled();
         });
 
         it('should not modify if text is unchanged', async () => {
@@ -330,11 +327,12 @@ describe('CollabClient', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            mockCore.get_text.mockReturnValue('same content');
+            const doc = (client as any).doc;
+            doc.get_content.mockReturnValue('same content');
             client.sendUpdate('same content');
 
-            expect(mockCore.delete).not.toHaveBeenCalled();
-            expect(mockCore.insert).not.toHaveBeenCalled();
+            expect(doc.delete).not.toHaveBeenCalled();
+            expect(doc.insert).not.toHaveBeenCalled();
         });
     });
 
@@ -355,9 +353,18 @@ describe('CollabClient', () => {
     });
 
     describe('getText', () => {
-        it('should return current text from CollabCore', () => {
-            mockCore.get_text.mockReturnValue('hello world');
+        it('should return current text from the MLS document', async () => {
+            const connectPromise = client.connect();
+            jest.runAllTimers();
+            await connectPromise;
+
+            const doc = (client as any).doc;
+            doc.get_content.mockReturnValue('hello world');
             expect(client.getText()).toBe('hello world');
+        });
+
+        it('should return empty string before a group is established', () => {
+            expect(client.getText()).toBe('');
         });
     });
 
@@ -429,7 +436,7 @@ describe('CollabClient', () => {
                 }
             };
 
-            const testClient = new CollabClient(mockCore, config);
+            const testClient = new CollabClient(config);
             const disconnectCallback = jest.fn();
             testClient.onDisconnect(disconnectCallback);
 
@@ -466,20 +473,107 @@ describe('CollabClient', () => {
     });
 });
 
-describe('CollabClient message handling', () => {
-    let client: CollabClient;
-    let mockCore: any;
-
+describe('CollabClient MLS-only crypto surface', () => {
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
+        (WasmEncryptedDocument.create as unknown as jest.Mock).mockClear();
+        (generate_key_package as unknown as jest.Mock).mockClear();
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    it('has no encryptionKey in config and injects no key (owner creates an MLS group)', async () => {
         const config: CollabClientConfig = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        const client = new CollabClient(config);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Owner path creates the MLS group. There is no set_encryption_key call
+        // (the mocked surface has no such method) — MLS keys come from the group.
+        expect(WasmEncryptedDocument.create as unknown as jest.Mock).toHaveBeenCalledWith(
+            'doc1',
+            'user1'
+        );
+        const doc = (client as any).doc;
+        expect(doc.set_encryption_key).toBeUndefined();
+        // The config type carries no PSK field.
+        expect((config as unknown as Record<string, unknown>).encryptionKey).toBeUndefined();
+
+        client.disconnect();
+    });
+
+    it('joiner generates a single-use key package instead of taking a key', async () => {
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'bob',
+            docId: 'doc1',
+            role: 'joiner',
+        };
+        const client = new CollabClient(config);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        expect(generate_key_package as unknown as jest.Mock).toHaveBeenCalledWith('bob');
+        // No group yet (awaiting the Welcome): the document is null.
+        expect((client as any).doc).toBeNull();
+
+        client.disconnect();
+    });
+
+    it('fails closed: sendUpdate before the MLS group is established returns false and emits no frame', async () => {
+        // A joiner before its Welcome arrives has no MLS group. sendUpdate must NOT
+        // encrypt to nobody and must NOT fall back to a plaintext frame — it returns
+        // false and sends nothing over the wire (CLAUDE.md fail-closed invariant).
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'bob',
+            docId: 'doc1',
+            role: 'joiner',
+        };
+        const client = new CollabClient(config);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        const ws = (client as any).ws;
+        const sentBefore = ws.sentMessages.length;
+        const result = client.sendUpdate('secret text');
+
+        expect(result).toBe(false);
+        // No new frame at all — and specifically no yrs_update carrying content.
+        expect(ws.sentMessages.length).toBe(sentBefore);
+        const yrsFrames = ws.sentMessages.filter(
+            (m: string) => JSON.parse(m).type === 'yrs_update'
+        );
+        expect(yrsFrames).toHaveLength(0);
+        // The group never silently materialized.
+        expect((client as any).doc).toBeNull();
+
+        client.disconnect();
+    });
+});
+
+describe('CollabClient message handling', () => {
+    let client: CollabClient;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            role: 'owner',
+        };
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -510,19 +604,17 @@ describe('CollabClient message handling', () => {
 
 describe('CollabClient message queueing', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -531,9 +623,11 @@ describe('CollabClient message queueing', () => {
     });
 
     describe('when WebSocket is not ready', () => {
-        it('should queue messages when WebSocket is not open', () => {
-            // Don't connect - WebSocket is null
-            mockCore.get_text.mockReturnValue('');
+        it('should queue messages when a group exists but the WebSocket is not open', () => {
+            // With an established MLS group but no open socket, updates are queued
+            // rather than dropped. (Before a group exists, sendUpdate fails closed and
+            // never reaches the queue — covered by the fail-closed test.)
+            (client as any).doc = makeMockDoc();
 
             // This should queue the message instead of dropping it
             client.sendUpdate('test content');
@@ -542,11 +636,10 @@ describe('CollabClient message queueing', () => {
             expect(client.getQueueLength()).toBe(1);
         });
 
-        it('should queue multiple messages when WebSocket is not open', () => {
-            mockCore.get_text.mockReturnValue('');
+        it('should queue multiple messages when the WebSocket is not open', () => {
+            (client as any).doc = makeMockDoc();
 
             client.sendUpdate('content 1');
-            mockCore.get_text.mockReturnValue('content 1');
             client.sendUpdate('content 2');
 
             expect(client.getQueueLength()).toBe(2);
@@ -555,8 +648,8 @@ describe('CollabClient message queueing', () => {
 
     describe('when WebSocket connection is established', () => {
         it('should flush queued messages when connection opens', async () => {
-            // Queue a message before connecting
-            mockCore.get_text.mockReturnValue('');
+            // Queue a message before connecting (group already established).
+            (client as any).doc = makeMockDoc();
             client.sendUpdate('queued content');
 
             expect(client.getQueueLength()).toBe(1);
@@ -575,7 +668,6 @@ describe('CollabClient message queueing', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            mockCore.get_text.mockReturnValue('');
             client.sendUpdate('direct content');
 
             // Message should be sent immediately, not queued
@@ -584,7 +676,7 @@ describe('CollabClient message queueing', () => {
 
         it('should evict oldest messages when queue exceeds max size', () => {
             // Fill queue beyond the limit (maxQueueSize = 1000)
-            mockCore.get_text.mockReturnValue('');
+            (client as any).doc = makeMockDoc();
             const consoleSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
             // Queue 1001 messages while disconnected
@@ -605,7 +697,7 @@ describe('CollabClient message queueing', () => {
 
     describe('send return value', () => {
         it('should return false when message is queued', () => {
-            mockCore.get_text.mockReturnValue('');
+            (client as any).doc = makeMockDoc();
 
             const result = client.sendUpdate('test content');
 
@@ -617,7 +709,6 @@ describe('CollabClient message queueing', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            mockCore.get_text.mockReturnValue('');
             const result = client.sendUpdate('test content');
 
             expect(result).toBe(true);
@@ -627,19 +718,17 @@ describe('CollabClient message queueing', () => {
 
 describe('CollabClient disconnect notification', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -726,19 +815,17 @@ describe('CollabClient disconnect notification', () => {
 
 describe('CollabClient error handling', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -893,7 +980,6 @@ describe('CollabClient error handling', () => {
             await connectPromise;
 
             // Queue a message first
-            mockCore.get_text.mockReturnValue('');
             (client as any).ws.readyState = 3; // CLOSED
             client.sendUpdate('queued message');
             expect(client.getQueueLength()).toBe(1);
@@ -913,7 +999,7 @@ describe('CollabClient error handling', () => {
     });
 
     describe('sendUpdate WASM error handling', () => {
-        it('should invoke onErrorCallback when WASM operation fails in sendUpdate', async () => {
+        it('should invoke onErrorCallback when the MLS op fails in sendUpdate', async () => {
             const errorCallback = jest.fn();
             client.onError(errorCallback);
 
@@ -921,8 +1007,9 @@ describe('CollabClient error handling', () => {
             jest.runAllTimers();
             await connectPromise;
 
-            // Make WASM throw
-            mockCore.get_text.mockImplementation(() => {
+            // Make the MLS document throw
+            const doc = (client as any).doc;
+            doc.get_content.mockImplementation(() => {
                 throw new Error('WASM error');
             });
 
@@ -936,12 +1023,13 @@ describe('CollabClient error handling', () => {
             );
         });
 
-        it('should return false when WASM operation fails', async () => {
+        it('should return false when the MLS op fails', async () => {
             const connectPromise = client.connect();
             jest.runAllTimers();
             await connectPromise;
 
-            mockCore.get_text.mockImplementation(() => {
+            const doc = (client as any).doc;
+            doc.get_content.mockImplementation(() => {
                 throw new Error('WASM error');
             });
 
@@ -976,17 +1064,15 @@ describe('CollabClient error handling', () => {
 });
 
 describe('CollabClient initialization verification', () => {
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
     });
 
@@ -1017,7 +1103,7 @@ describe('CollabClient initialization verification', () => {
                 }
             };
 
-            const client = new CollabClient(mockCore, config);
+            const client = new CollabClient(config);
             const connectPromise = client.connect();
             jest.runAllTimers();
 
@@ -1056,7 +1142,7 @@ describe('CollabClient initialization verification', () => {
                 }
             };
 
-            const client = new CollabClient(mockCore, config);
+            const client = new CollabClient(config);
             const connectPromise = client.connect();
             jest.runAllTimers();
 
@@ -1070,19 +1156,17 @@ describe('CollabClient initialization verification', () => {
 
 describe('CollabClient handleReconnect timer cleanup', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -1110,19 +1194,17 @@ describe('CollabClient handleReconnect timer cleanup', () => {
 
 describe('CollabClient handleYrsUpdate validation', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -1193,7 +1275,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         );
     });
 
-    it('should process valid yrs_update message with encrypted array', async () => {
+    it('should process a valid yrs_update message through the MLS document', async () => {
         const updateCallback = jest.fn();
         client.onUpdate(updateCallback);
 
@@ -1201,15 +1283,15 @@ describe('CollabClient handleYrsUpdate validation', () => {
         jest.runAllTimers();
         await connectPromise;
 
+        const doc = (client as any).doc;
+
         // Simulate valid yrs_update message
         (client as any).ws?.onmessage?.({
             data: JSON.stringify({ type: 'yrs_update', encrypted: [1, 2, 3] }),
         });
 
-        expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(
-            'doc1',
-            new Uint8Array([1, 2, 3])
-        );
+        // MLS decrypts under the group's current epoch (default 0 when omitted).
+        expect(doc.apply_encrypted_update).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]), 0n);
         expect(updateCallback).toHaveBeenCalled();
     });
 
@@ -1226,6 +1308,8 @@ describe('CollabClient handleYrsUpdate validation', () => {
         jest.runAllTimers();
         await connectPromise;
 
+        const doc = (client as any).doc;
+
         // config.docId is 'doc1'; this frame claims 'other-doc'.
         (client as any).ws?.onmessage?.({
             data: JSON.stringify({
@@ -1235,7 +1319,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
             }),
         });
 
-        expect(mockCore.apply_update_encrypted).not.toHaveBeenCalled();
+        expect(doc.apply_encrypted_update).not.toHaveBeenCalled();
         expect(updateCallback).not.toHaveBeenCalled();
         expect(errorCallback).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -1253,6 +1337,8 @@ describe('CollabClient handleYrsUpdate validation', () => {
         jest.runAllTimers();
         await connectPromise;
 
+        const doc = (client as any).doc;
+
         (client as any).ws?.onmessage?.({
             data: JSON.stringify({
                 type: 'yrs_update',
@@ -1261,10 +1347,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
             }),
         });
 
-        expect(mockCore.apply_update_encrypted).toHaveBeenCalledWith(
-            'doc1',
-            new Uint8Array([1, 2, 3])
-        );
+        expect(doc.apply_encrypted_update).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]), 0n);
         expect(updateCallback).toHaveBeenCalled();
     });
 
@@ -1272,16 +1355,17 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        // Mock apply_update_encrypted to throw a WASM-style error object
-        // WASM CollabError returns a plain object with {type, message} fields
-        const wasmError = { type: 'decryption', message: 'Ciphertext too short' };
-        mockCore.apply_update_encrypted.mockImplementation(() => {
-            throw wasmError;
-        });
-
         const connectPromise = client.connect();
         jest.runAllTimers();
         await connectPromise;
+
+        // Mock apply_encrypted_update to throw a WASM-style error object.
+        // WASM CollabError returns a plain object with {type, message} fields.
+        const doc = (client as any).doc;
+        const wasmError = { type: 'decryption', message: 'Ciphertext too short' };
+        doc.apply_encrypted_update.mockImplementation(() => {
+            throw wasmError;
+        });
 
         // Simulate valid yrs_update message that will trigger decryption error
         (client as any).ws?.onmessage?.({
@@ -1310,13 +1394,14 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        mockCore.apply_update_encrypted.mockImplementation(() => {
-            throw new Error('Standard error message');
-        });
-
         const connectPromise = client.connect();
         jest.runAllTimers();
         await connectPromise;
+
+        const doc = (client as any).doc;
+        doc.apply_encrypted_update.mockImplementation(() => {
+            throw new Error('Standard error message');
+        });
 
         (client as any).ws?.onmessage?.({
             data: JSON.stringify({ type: 'yrs_update', encrypted: [1, 2, 3] }),
@@ -1332,19 +1417,17 @@ describe('CollabClient handleYrsUpdate validation', () => {
 
 describe('CollabClient applyTextDiff edge cases', () => {
     let client: CollabClient;
-    let mockCore: any;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        mockCore = new CollabCore();
         config = {
             relayUrl: 'ws://localhost:8080',
             userId: 'user1',
             docId: 'doc1',
-            encryptionKey: VALID_KEY,
+            role: 'owner',
         };
-        client = new CollabClient(mockCore, config);
+        client = new CollabClient(config);
     });
 
     afterEach(() => {
@@ -1352,195 +1435,141 @@ describe('CollabClient applyTextDiff edge cases', () => {
         client.disconnect();
     });
 
-    it('should not call any CRDT operations when old and new text are identical', async () => {
-        mockCore.get_text.mockReturnValue('same content');
-
+    // Connect an owner (creating its MLS group) and return the mock document so a
+    // test can stage its content before driving sendUpdate through applyTextDiff.
+    async function connectAndGetDoc(): Promise<any> {
         const connectPromise = client.connect();
         jest.runAllTimers();
         await connectPromise;
+        const doc = (client as any).doc;
+        doc.insert.mockClear();
+        doc.delete.mockClear();
+        return doc;
+    }
 
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+    it('should not call any CRDT operations when old and new text are identical', async () => {
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('same content');
 
         client.sendUpdate('same content');
 
-        expect(mockCore.delete).not.toHaveBeenCalled();
-        expect(mockCore.insert).not.toHaveBeenCalled();
+        expect(doc.delete).not.toHaveBeenCalled();
+        expect(doc.insert).not.toHaveBeenCalled();
     });
 
     it('should handle empty old text (insert all)', async () => {
-        mockCore.get_text.mockReturnValue('');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('');
 
         client.sendUpdate('new content');
 
-        expect(mockCore.delete).not.toHaveBeenCalled();
-        expect(mockCore.insert).toHaveBeenCalledWith(0, 'new content');
+        expect(doc.delete).not.toHaveBeenCalled();
+        expect(doc.insert).toHaveBeenCalledWith(0, 'new content');
     });
 
     it('should handle empty new text (delete all)', async () => {
-        mockCore.get_text.mockReturnValue('old content');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('old content');
 
         client.sendUpdate('');
 
-        expect(mockCore.delete).toHaveBeenCalledWith(0, 11); // 'old content'.length
-        expect(mockCore.insert).not.toHaveBeenCalled();
+        expect(doc.delete).toHaveBeenCalledWith(0, 11); // 'old content'.length
+        expect(doc.insert).not.toHaveBeenCalled();
     });
 
     it('should handle both old and new text being empty', async () => {
-        mockCore.get_text.mockReturnValue('');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('');
 
         client.sendUpdate('');
 
-        expect(mockCore.delete).not.toHaveBeenCalled();
-        expect(mockCore.insert).not.toHaveBeenCalled();
+        expect(doc.delete).not.toHaveBeenCalled();
+        expect(doc.insert).not.toHaveBeenCalled();
     });
 
     it('should handle complete replacement (no common prefix or suffix)', async () => {
-        mockCore.get_text.mockReturnValue('abc');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('abc');
 
         client.sendUpdate('xyz');
 
-        expect(mockCore.delete).toHaveBeenCalledWith(0, 3);
-        expect(mockCore.insert).toHaveBeenCalledWith(0, 'xyz');
+        expect(doc.delete).toHaveBeenCalledWith(0, 3);
+        expect(doc.insert).toHaveBeenCalledWith(0, 'xyz');
     });
 
     it('should find common prefix and only modify suffix', async () => {
-        mockCore.get_text.mockReturnValue('Hello World');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('Hello World');
 
         client.sendUpdate('Hello Universe');
 
         // Common prefix: 'Hello ' (6 chars)
         // Delete: 'World' (5 chars starting at index 6)
         // Insert: 'Universe' at index 6
-        expect(mockCore.delete).toHaveBeenCalledWith(6, 5);
-        expect(mockCore.insert).toHaveBeenCalledWith(6, 'Universe');
+        expect(doc.delete).toHaveBeenCalledWith(6, 5);
+        expect(doc.insert).toHaveBeenCalledWith(6, 'Universe');
     });
 
     it('should find common suffix and only modify prefix', async () => {
-        mockCore.get_text.mockReturnValue('Hello World');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('Hello World');
 
         client.sendUpdate('Goodbye World');
 
         // Common suffix: ' World' (6 chars)
         // Delete: 'Hello' (5 chars starting at index 0)
         // Insert: 'Goodbye' at index 0
-        expect(mockCore.delete).toHaveBeenCalledWith(0, 5);
-        expect(mockCore.insert).toHaveBeenCalledWith(0, 'Goodbye');
+        expect(doc.delete).toHaveBeenCalledWith(0, 5);
+        expect(doc.insert).toHaveBeenCalledWith(0, 'Goodbye');
     });
 
     it('should handle insertion in the middle', async () => {
-        mockCore.get_text.mockReturnValue('HelloWorld');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('HelloWorld');
 
         client.sendUpdate('Hello World');
 
         // Common prefix: 'Hello' (5 chars)
         // Common suffix: 'World' (5 chars)
         // No deletion, insert ' ' at position 5
-        expect(mockCore.delete).not.toHaveBeenCalled();
-        expect(mockCore.insert).toHaveBeenCalledWith(5, ' ');
+        expect(doc.delete).not.toHaveBeenCalled();
+        expect(doc.insert).toHaveBeenCalledWith(5, ' ');
     });
 
     it('should handle deletion in the middle', async () => {
-        mockCore.get_text.mockReturnValue('Hello World');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('Hello World');
 
         client.sendUpdate('HelloWorld');
 
         // Common prefix: 'Hello' (5 chars)
         // Common suffix: 'World' (5 chars)
         // Delete ' ' (1 char at position 5)
-        expect(mockCore.delete).toHaveBeenCalledWith(5, 1);
-        expect(mockCore.insert).not.toHaveBeenCalled();
+        expect(doc.delete).toHaveBeenCalledWith(5, 1);
+        expect(doc.insert).not.toHaveBeenCalled();
     });
 
     it('should handle Unicode characters correctly', async () => {
-        mockCore.get_text.mockReturnValue('Hello 世界');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('Hello 世界');
 
         client.sendUpdate('Hello 世界!');
 
         // Common prefix: 'Hello 世界' (8 chars)
         // Insert '!' at position 8
-        expect(mockCore.delete).not.toHaveBeenCalled();
-        expect(mockCore.insert).toHaveBeenCalledWith(8, '!');
+        expect(doc.delete).not.toHaveBeenCalled();
+        expect(doc.insert).toHaveBeenCalledWith(8, '!');
     });
 
     it('should handle emoji characters correctly', async () => {
-        mockCore.get_text.mockReturnValue('Hello 👋');
-
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
-
-        mockCore.insert.mockClear();
-        mockCore.delete.mockClear();
+        const doc = await connectAndGetDoc();
+        doc.get_content.mockReturnValue('Hello 👋');
 
         client.sendUpdate('Hello 👋 World');
 
         // Common prefix: 'Hello 👋' (8 chars - emoji is 2 code units)
         // Insert ' World' at position 8
-        expect(mockCore.delete).not.toHaveBeenCalled();
-        expect(mockCore.insert).toHaveBeenCalledWith(8, ' World');
+        expect(doc.delete).not.toHaveBeenCalled();
+        expect(doc.insert).toHaveBeenCalledWith(8, ' World');
     });
 });

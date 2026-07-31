@@ -3,7 +3,6 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { webcrypto } from 'node:crypto';
 import init, {
-    CollabCore,
     WasmEncryptedDocument,
     WasmPendingMember,
     WasmInvite,
@@ -24,7 +23,6 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 /** Symbols exported by the generated `collab_wasm` module used by tests. */
 interface RealWasm {
-    CollabCore: typeof CollabCore;
     WasmEncryptedDocument: typeof WasmEncryptedDocument;
     WasmPendingMember: typeof WasmPendingMember;
     WasmInvite: typeof WasmInvite;
@@ -42,16 +40,10 @@ export async function loadRealWasm(): Promise<RealWasm> {
         initialized = true;
     }
     return {
-        CollabCore,
         WasmEncryptedDocument,
         WasmPendingMember,
         WasmInvite,
         WasmEncryptedOp,
         generate_key_package,
     };
-}
-
-export async function newCore(): Promise<InstanceType<typeof CollabCore>> {
-    const { CollabCore: Core } = await loadRealWasm();
-    return new Core();
 }

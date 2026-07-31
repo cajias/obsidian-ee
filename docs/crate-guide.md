@@ -294,44 +294,57 @@ clap, serde, serde_json, anyhow, thiserror, tracing
 
 ## collab-wasm
 
-WASM bindings for the Obsidian plugin. Provides CRDT editing and AES-256-GCM encryption for browser environments.
+WASM bindings for the Obsidian plugin. Exposes `collab-core`'s MLS engine to the browser as the sole crypto surface — there is no separate browser encryption path. The wrappers in `src/mls.rs` are thin owning wrappers over `collab-core` value types; no crypto lives in this crate.
 
 ### API (`#[wasm_bindgen]`)
 
-```rust
-pub struct CollabCore {
-    doc: Doc,                    // Yrs document
-    text: TextRef,               // Text content reference
-    encryption_key: Option<Vec<u8>>,  // AES-256 key
-}
-```
+Free function:
+
+| Function | Description |
+|----------|-------------|
+| `generate_key_package(user_id)` | Generate a `WasmPendingMember` (key package) so an owner can invite this member. Returns `Result<WasmPendingMember, JsError>`. |
+
+`WasmPendingMember` — a member awaiting a Welcome; consumed by value on `WasmEncryptedDocument.join` (single-use).
+
+| Member | Description |
+|--------|-------------|
+| `key_package` (getter) | The key package bytes to send to the owner |
+
+`WasmInvite` — the Welcome for a new member plus the commit for existing members.
+
+| Member | Description |
+|--------|-------------|
+| `from_welcome(doc_id, welcome)` | Reconstruct an invite on the joiner's side from its LOCALLY-TRUSTED `doc_id` and the `welcome` bytes read off the wire. `doc_id` MUST be the joiner's own trusted value, never a field from the inbound frame. |
+| `welcome` (getter) | Welcome message bytes |
+| `commit` (getter) | Commit message bytes (for existing members) |
+| `doc_id` (getter) | Document id |
+| `epoch` (getter) | MLS epoch |
+
+`WasmEncryptedOp` — an encrypted CRDT update to ship over the relay.
+
+| Member | Description |
+|--------|-------------|
+| `ciphertext` (getter) | Encrypted update bytes |
+| `epoch` (getter) | MLS epoch the ciphertext was produced under |
+
+`WasmEncryptedDocument` — an end-to-end-encrypted collaborative document (Yrs CRDT + MLS).
 
 | Method | Description |
 |--------|-------------|
-| `new()` | Create instance |
-| `get_text()` | Get current text content |
-| `insert(index, content)` | Insert text |
-| `delete(index, length)` | Delete text range |
-| `encode_state()` | Get full document state |
-| `apply_update(bytes)` | Apply remote CRDT update |
-| `set_encryption_key(key)` | Set 32-byte AES-256 key |
-| `encrypt(plaintext)` | Encrypt data (nonce prepended) |
-| `decrypt(ciphertext)` | Decrypt data (nonce extracted) |
-| `encode_state_encrypted()` | Encrypt document state |
-| `apply_update_encrypted(bytes)` | Decrypt and apply update |
-
-The WASM module uses AES-256-GCM (not MLS) as an MVP. Full MLS integration is planned.
+| `create(doc_id, user_id)` | Create a document and its MLS group as owner. Returns `Result<Self, JsError>`. |
+| `join(invite, pending)` | Join via a Welcome; consumes `pending` by value (single-use). Returns `Result<Self, JsError>`. |
+| `create_invite(key_package)` | Owner adds a member; returns a `WasmInvite` (welcome + commit) |
+| `process_commit(commit)` | Existing members apply a commit to advance epoch |
+| `insert(index, text)` | Insert text |
+| `delete(index, len)` | Delete text range |
+| `get_content()` | Read current text content |
+| `get_encrypted_update()` | Encrypt pending CRDT changes; returns a `WasmEncryptedOp` |
+| `apply_encrypted_update(ciphertext, epoch)` | Decrypt and apply a remote encrypted update |
+| `epoch` (getter) | Current MLS epoch |
 
 ### Error Handling
 
-WASM errors are converted to structured JavaScript objects:
-
-```javascript
-{ type: "encryption", message: "No encryption key set" }
-{ type: "decryption", message: "Ciphertext too short" }
-{ type: "key_error", message: "Key must be 32 bytes" }
-{ type: "sync_error", message: "Invalid update" }
-```
+WASM errors surface as real JavaScript `Error` objects (via `JsError`), carrying the underlying `collab-core` error message.
 
 ### Build
 
@@ -343,13 +356,12 @@ WASM errors are converted to structured JavaScript objects:
 ### Dependencies
 
 ```toml
+collab-core = { path = "../collab-core" }
 yrs = "0.21"
 wasm-bindgen = "0.2"
-aes-gcm = "0.10"
-getrandom = "0.2" (js feature)
-js-sys = "0.3"
-web-sys = "0.3"
 ```
+
+On the `wasm32` target, `collab-core` is pulled in with its `wasm-clock` feature so MLS gets a browser-compatible clock source (see `docs/design/2026-07-29-issue-28-wasm-mls-surface.md`).
 
 ---
 

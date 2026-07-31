@@ -1,8 +1,8 @@
 //! wasm-bindgen surface exposing collab-core's MLS engine to JS (issue #28).
 //!
 //! Thin owning wrappers over `collab_core` value types; no crypto lives here.
-//! Errors surface as real JS `Error`s via [`js_err`], unlike the AES `CollabCore`
-//! path which returns `{type, message}` objects.
+//! Errors surface as real JS `Error`s via [`js_err`], unlike the removed AES
+//! path which returned `{type, message}` objects.
 
 use collab_core::{EncryptedDocument, EncryptedOp, Invite, MlsDocumentGroup, PendingMember};
 use wasm_bindgen::prelude::*;

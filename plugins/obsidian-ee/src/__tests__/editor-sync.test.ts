@@ -48,7 +48,7 @@ describe('EditorSync', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        client = new CollabClient({} as any, {} as any);
+        client = new CollabClient({} as any);
         sync = new EditorSync(client);
     });
 
