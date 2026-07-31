@@ -19,7 +19,7 @@
 //! - File content to CRDT document mapping
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use collab_core::DocumentRegistry;
@@ -198,7 +198,7 @@ async fn test_detects_file_deletion() {
     assert!(
         events
             .iter()
-            .any(|e| e.kind == VaultEventKind::Deleted && e.path == PathBuf::from("doomed.md")),
+            .any(|e| e.kind == VaultEventKind::Deleted && e.path == Path::new("doomed.md")),
         "expected a Deleted event for doomed.md, got: {events:?}"
     );
 
