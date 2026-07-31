@@ -562,6 +562,138 @@ describe('CollabClient MLS-only crypto surface', () => {
     });
 });
 
+describe('CollabClient MLS group lifecycle across reconnect', () => {
+    beforeEach(() => {
+        jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    // Pump the reconnect backoff loop step-wise: run the pending timer, then flush
+    // microtasks (connect()'s .finally that clears connectPromise), mirroring how
+    // real timers interleave macro/microtasks.
+    async function pumpReconnect(): Promise<void> {
+        for (let i = 0; i < 5; i++) {
+            jest.runOnlyPendingTimers();
+            await Promise.resolve();
+            await Promise.resolve();
+        }
+    }
+
+    it('Finding 1: establishes the MLS group EXACTLY ONCE across a reconnect (owner)', async () => {
+        (WasmEncryptedDocument.create as unknown as jest.Mock).mockClear();
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            role: 'owner',
+        };
+        const client = new CollabClient(config);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        const docAfterFirstConnect = (client as any).doc;
+        expect(WasmEncryptedDocument.create as unknown as jest.Mock).toHaveBeenCalledTimes(1);
+        expect(docAfterFirstConnect).not.toBeNull();
+
+        // Drop the live connection; the backoff loop reconnects and re-runs onopen.
+        (client as any).ws?.onclose?.();
+        await pumpReconnect();
+
+        expect(client.getConnectionState()).toBe('connected');
+        // MLS group state is long-lived: reconnect must NOT re-create it (which
+        // would orphan the real group at a fresh epoch-0 solo group).
+        expect(WasmEncryptedDocument.create as unknown as jest.Mock).toHaveBeenCalledTimes(1);
+        expect((client as any).doc).toBe(docAfterFirstConnect);
+
+        client.disconnect();
+    });
+
+    it('Finding 2: a joined joiner does NOT answer a key_package as an owner', async () => {
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'bob',
+            docId: 'doc1',
+            role: 'joiner',
+        };
+        const client = new CollabClient(config);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        // Deliver a Welcome so the joiner joins (doc set, pending consumed).
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'welcome',
+                doc_id: 'doc1',
+                payload: [1, 2],
+            }),
+        });
+        const joinedDoc = (client as any).doc;
+        expect(joinedDoc).not.toBeNull();
+
+        const ws = (client as any).ws;
+        const sentBefore = ws.sentMessages.length;
+
+        // Misroute/replay: a key_package arrives at the (non-owner) joiner.
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'key_package',
+                doc_id: 'doc1',
+                payload: [3, 3, 3],
+            }),
+        });
+
+        // Role guard: the joiner must NOT create an invite nor emit a Welcome.
+        expect(joinedDoc.create_invite).not.toHaveBeenCalled();
+        const welcomeFrames = ws.sentMessages.slice(sentBefore).filter((m: string) => {
+            const p = JSON.parse(m);
+            return p.type === 'mls_handshake' && p.message_type === 'welcome';
+        });
+        expect(welcomeFrames).toHaveLength(0);
+
+        client.disconnect();
+    });
+
+    it('Finding 2: a replayed Welcome does NOT clobber an owner’s established group', async () => {
+        (WasmEncryptedDocument.join as unknown as jest.Mock).mockClear();
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            role: 'owner',
+        };
+        const client = new CollabClient(config);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        const originalDoc = (client as any).doc; // owner's created group
+        expect(originalDoc).not.toBeNull();
+
+        // Attacker replays a Welcome at the owner (who already has a group).
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'welcome',
+                doc_id: 'doc1',
+                payload: [1, 2],
+            }),
+        });
+
+        // Role/state guard: the group handle is unchanged, join() never ran.
+        expect((client as any).doc).toBe(originalDoc);
+        expect(WasmEncryptedDocument.join as unknown as jest.Mock).not.toHaveBeenCalled();
+
+        client.disconnect();
+    });
+});
+
 describe('CollabClient message handling', () => {
     let client: CollabClient;
 

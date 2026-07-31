@@ -120,6 +120,7 @@ export class CollabClient {
     private ws: WebSocket | null = null;
     private doc: WasmEncryptedDocument | null = null;
     private pending: WasmPendingMember | null = null;
+    private groupEstablished = false;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
     private onDisconnectCallback: DisconnectCallback | null = null;
@@ -140,13 +141,27 @@ export class CollabClient {
     }
 
     /**
-     * Establish the MLS group for this connection. Called from onopen after
-     * identify/subscribe so group state is fresh per connection.
+     * Establish the MLS group EXACTLY ONCE, on the first successful connect.
+     * MLS group state is long-lived and persists across reconnects (only
+     * `this.ws` is recreated), so onopen must NOT re-run this on a reconnect:
+     * re-creating would spawn a NEW empty solo group at epoch 0 and orphan the
+     * real group. This guard satisfies the CLAUDE.md reconnect-lifecycle
+     * invariant "guard against a second start that would orphan the prior
+     * client/handle."
      * - owner: creates the group document immediately.
      * - joiner: generates a single-use key package and ships it as an
      *   mls_handshake frame; `this.doc` stays null until the Welcome arrives.
+     *
+     * ponytail: first-cut behavior — a joiner whose socket drops mid-handshake
+     * (before the Welcome) stays un-joined and fails closed (no plaintext), which
+     * is strictly better than a divergent group. A mid-handshake resume state
+     * machine is deliberately NOT built here (YAGNI).
      */
     private establishGroup(): void {
+        if (this.groupEstablished) {
+            return;
+        }
+        this.groupEstablished = true;
         if (this.config.role === 'owner') {
             this.doc = WasmEncryptedDocument.create(this.config.docId, this.config.userId);
             return;
@@ -413,8 +428,8 @@ export class CollabClient {
 
             switch (message.message_type) {
                 case 'key_package': {
-                    // Owner side: only if the group document exists.
-                    if (!this.doc) {
+                    // Only an owner with an established group answers a key package.
+                    if (this.config.role !== 'owner' || !this.doc) {
                         return;
                     }
                     const invite = this.doc.create_invite(payload);
@@ -427,9 +442,16 @@ export class CollabClient {
                     break;
                 }
                 case 'welcome': {
-                    // Joiner side: bind the LOCAL docId, never message.doc_id.
+                    // Only a joiner that has a pending key package and is NOT already
+                    // in a group joins. Rejecting when this.doc is set prevents an
+                    // attacker replaying a Welcome to clobber an established group (and
+                    // the join(invite, null!) throw path when there is no pending).
+                    if (this.config.role !== 'joiner' || !this.pending || this.doc) {
+                        return;
+                    }
+                    // Bind the LOCAL docId, never message.doc_id.
                     const invite = WasmInvite.from_welcome(this.config.docId, payload);
-                    this.doc = WasmEncryptedDocument.join(invite, this.pending!);
+                    this.doc = WasmEncryptedDocument.join(invite, this.pending);
                     this.pending = null;
                     break;
                 }
@@ -613,5 +635,12 @@ export class CollabClient {
         this.ws = null;
         this.doc?.free();
         this.doc = null;
+        // Free a still-unconsumed key package (a joiner that never got its
+        // Welcome). Do NOT free after a successful join — join() consumes the
+        // handle by value, so freeing there would double-free.
+        this.pending?.free();
+        this.pending = null;
+        // Allow a future reconnect after an explicit disconnect to re-establish.
+        this.groupEstablished = false;
     }
 }
