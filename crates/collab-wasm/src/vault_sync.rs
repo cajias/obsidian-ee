@@ -13,6 +13,9 @@ use collab_core::{
 };
 use wasm_bindgen::prelude::*;
 
+#[cfg(test)]
+use collab_core::MAX_NEW_PATHS_PER_APPLY;
+
 /// The well-known manifest document id, exposed so TypeScript can assert it
 /// matches the Rust constant instead of hard-coding the string.
 #[wasm_bindgen]
@@ -27,10 +30,6 @@ fn reg_err(e: RegistryError) -> JsError {
 /// Ceiling on a single remote manifest update frame, matching the relay's
 /// 1 MiB WebSocket frame cap: anything larger could never arrive legitimately.
 const MAX_MANIFEST_UPDATE_BYTES: usize = 1024 * 1024;
-
-/// Ceiling on newly-registered paths accepted from a single manifest apply.
-/// An update announcing more is rejected whole (fail closed), never truncated.
-const MAX_NEW_PATHS_PER_APPLY: usize = 1024;
 
 /// JS-friendly view of a `collab_core::SyncAction`.
 ///
@@ -81,17 +80,20 @@ impl WasmSyncAction {
 pub struct WasmVaultSync(VaultSyncManager);
 
 impl WasmVaultSync {
-    /// Apply a remote manifest with resource bounds enforced at the binding:
-    /// updates over [`MAX_MANIFEST_UPDATE_BYTES`] and applies announcing more
-    /// than [`MAX_NEW_PATHS_PER_APPLY`] new paths are rejected whole (fail
-    /// closed) — over-cap paths are never surfaced or subscribed to.
+    /// Apply a remote manifest with the transport-frame bound enforced at the
+    /// binding: updates over [`MAX_MANIFEST_UPDATE_BYTES`] are rejected before
+    /// ever reaching collab-core, since anything larger could never have
+    /// arrived as a legitimate relay frame.
+    ///
+    /// The new-path count bound (`MAX_NEW_PATHS_PER_APPLY`) is enforced inside
+    /// `collab_core::VaultSyncManager::apply_remote_manifest` itself, checked
+    /// against a scratch copy *before* the CRDT merge — that's a manifest
+    /// invariant every caller must get for free, not something a network
+    /// binding can bolt on after the fact once the merge has already happened.
     ///
     /// The `#[wasm_bindgen]` `apply_remote_manifest` delegates here and maps the
     /// error to a JS `Error`; this variant lets native tests assert the failure
     /// path without constructing a `JsError` (which panics off-wasm).
-    // ponytail: caps live at the binding because the manifest is network-fed; a
-    // full byte-accounted bound belongs in collab_core::VaultSyncManager when
-    // the DynamoDB/persistence work lands.
     pub(crate) fn apply_remote_manifest_internal(
         &mut self,
         update: &[u8],
@@ -102,14 +104,7 @@ impl WasmVaultSync {
                 update.len()
             ));
         }
-        let newly = self.0.apply_remote_manifest(update).map_err(|e| e.to_string())?;
-        if newly.len() > MAX_NEW_PATHS_PER_APPLY {
-            return Err(format!(
-                "manifest update announced {} new paths, exceeding the {MAX_NEW_PATHS_PER_APPLY}-path cap",
-                newly.len()
-            ));
-        }
-        Ok(newly)
+        self.0.apply_remote_manifest(update).map_err(|e| e.to_string())
     }
 }
 
@@ -262,6 +257,21 @@ mod tests {
         let mut peer = sync();
         let res = peer.apply_remote_manifest_internal(&full_state);
         assert!(res.is_err(), "path-count bomb must be rejected whole, not truncated");
+        // The invariant this test is named for: rejection must mean the CRDT
+        // merge never happened at all, not just that the registry create loop
+        // stopped partway through. If the manifest is non-empty here, the
+        // update was applied in full and only *reported* as failed.
+        assert!(
+            peer.list_files().is_empty(),
+            "rejected path-count bomb must leave the peer's manifest untouched"
+        );
+
+        // A legitimate follow-up update must still apply cleanly — proving the
+        // rejected bomb left no partial/corrupted state behind.
+        let mut good_src = sync();
+        let action = good_src.handle_created("fine.md".to_string()).unwrap();
+        let newly = peer.apply_remote_manifest(&action.manifest_update()).unwrap();
+        assert_eq!(newly, vec!["fine.md".to_string()]);
     }
 
     #[test]

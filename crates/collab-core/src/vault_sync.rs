@@ -11,6 +11,13 @@ use crate::registry::{DocumentRegistry, RegistryError};
 use crate::vault_manifest::VaultManifest;
 use crate::DocumentId;
 
+/// Ceiling on newly-registered paths accepted from a single remote manifest apply.
+///
+/// See [`VaultSyncManager::apply_remote_manifest`]. An update announcing more
+/// is rejected whole (fail closed), validated on a scratch copy before any
+/// live state is touched — see that method's docs for why.
+pub const MAX_NEW_PATHS_PER_APPLY: usize = 1024;
+
 /// Settings that control vault-wide synchronization.
 ///
 /// # Defaults
@@ -293,25 +300,35 @@ impl VaultSyncManager {
 
     /// Apply a manifest update received from a remote peer.
     ///
-    /// After merging the CRDT update, computes which files are now *alive* in
-    /// the merged manifest but not yet open in the local registry, and opens
-    /// them. Files that are *deleted* in the manifest are closed locally.
+    /// The update is first merged into a *scratch* copy of the current
+    /// manifest (seeded from `encode_full_state`) so the new-path count can be
+    /// checked against [`MAX_NEW_PATHS_PER_APPLY`] before any live state is
+    /// touched. Yrs merges are irreversible on a live `Doc`, so validating
+    /// on a throwaway copy is the only way to reject an oversized update
+    /// *whole* (fail closed) instead of after it has already been applied.
+    ///
+    /// Only once the update passes validation is it merged into the live
+    /// manifest; computes which files are now *alive* in the merged manifest
+    /// but not yet open in the local registry, and opens them. Files that are
+    /// *deleted* in the manifest are closed locally.
     ///
     /// Returns the list of file paths that were newly registered (callers can
     /// use these to subscribe to the corresponding document IDs on the relay).
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError`] if the update bytes are malformed.
+    /// Returns [`RegistryError`] if the update bytes are malformed, or if the
+    /// update would newly-register more than [`MAX_NEW_PATHS_PER_APPLY`] paths.
     pub fn apply_remote_manifest(&mut self, update: &[u8]) -> Result<Vec<String>, RegistryError> {
-        self.manifest
-            .apply_update(update)
+        // Validate against a scratch copy first: no live mutation happens
+        // until we know the update is within the path-count bound.
+        let scratch = VaultManifest::new();
+        scratch
+            .apply_update(&self.manifest.encode_full_state())
             .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
+        scratch.apply_update(update).map_err(|e| RegistryError::InvalidState(e.to_string()))?;
 
-        // Open documents for alive, in-scope files not yet in the registry.
-        // The doc_id *is* the path, so an unknown doc_id means an unopened file.
-        let to_open: Vec<String> = self
-            .manifest
+        let to_open: Vec<String> = scratch
             .list_files()
             .into_iter()
             .filter(|path| self.config.should_sync(path))
@@ -319,6 +336,18 @@ impl VaultSyncManager {
                 self.registry.get(path).is_none() && self.registry.get_encrypted(path).is_none()
             })
             .collect();
+
+        if to_open.len() > MAX_NEW_PATHS_PER_APPLY {
+            return Err(RegistryError::InvalidState(format!(
+                "manifest update announced {} new paths, exceeding the {MAX_NEW_PATHS_PER_APPLY}-path cap",
+                to_open.len()
+            )));
+        }
+
+        // Validated: now safe to merge into the live manifest for real.
+        self.manifest
+            .apply_update(update)
+            .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
 
         let mut newly_registered = Vec::with_capacity(to_open.len());
         for path in to_open {
@@ -523,6 +552,35 @@ mod tests {
             bob.registry().get("shared.md").is_none(),
             "Bob should close shared after remote delete"
         );
+    }
+
+    #[test]
+    fn test_apply_remote_manifest_rejects_path_count_bomb_before_merge() {
+        // A single update announcing more than MAX_NEW_PATHS_PER_APPLY new
+        // files must be rejected *whole*, fail closed, before the CRDT merge
+        // or any registry.create() call — not truncated after the fact.
+        let mut alice = VaultSyncManager::new(VaultSyncConfig::default());
+        for i in 0..=MAX_NEW_PATHS_PER_APPLY {
+            alice.handle_created(&format!("f{i}.md")).unwrap();
+        }
+        let oversized_update = alice.manifest().encode_full_state();
+
+        let mut peer = VaultSyncManager::new(VaultSyncConfig::default());
+        let res = peer.apply_remote_manifest(&oversized_update);
+        assert!(res.is_err(), "path-count bomb must be rejected");
+
+        // The invariant this test guards: rejection must mean the update was
+        // never merged at all. If it had merged (with only the registry loop
+        // skipped), peer's manifest would already report thousands of alive
+        // files even though the call reported failure.
+        assert!(peer.manifest().list_files().is_empty(), "manifest must be untouched on rejection");
+        assert!(peer.registry().list().is_empty(), "registry must be untouched on rejection");
+
+        // A legitimate follow-up update still applies cleanly afterward.
+        let mut carol = VaultSyncManager::new(VaultSyncConfig::default());
+        carol.handle_created("fine.md").unwrap();
+        let newly = peer.apply_remote_manifest(&carol.manifest().encode_full_state()).unwrap();
+        assert_eq!(newly, vec!["fine.md".to_string()]);
     }
 
     #[test]
