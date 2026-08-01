@@ -1,5 +1,10 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { mockObsidianModule } from './helpers/mock-obsidian';
+import {
+    createCollabWasmMock,
+    mockCollabClientModule,
+    mockEditorSyncModule,
+} from './helpers/mock-collab-modules';
 
 // Mock WebAssembly.compile for WASM loading
 const mockWasmModule = {};
@@ -16,50 +21,12 @@ jest.unstable_mockModule('obsidian', mockObsidianModule);
 // MLS-only: main.ts needs the WASM module initialized (`init`) plus the vault
 // sync surface (#32). The MLS doc classes are driven inside CollabClient, so no
 // CollabCore export is mocked here.
-const mockWasmInit = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
-const mockWasmVaultSync = jest.fn().mockImplementation(() => ({
-    handle_created: jest.fn(),
-    handle_deleted: jest.fn(),
-    handle_renamed: jest.fn(),
-    apply_remote_manifest: jest.fn(),
-    list_files: jest.fn(),
-    free: jest.fn(),
-}));
+const { wasmInit: mockWasmInit, moduleFactory: collabWasmModuleFactory } = createCollabWasmMock();
+jest.unstable_mockModule('../wasm/collab_wasm', collabWasmModuleFactory);
 
-jest.unstable_mockModule('../wasm/collab_wasm', () => ({
-    __esModule: true,
-    default: mockWasmInit,
-    WasmVaultSync: mockWasmVaultSync,
-    manifest_doc_id: jest.fn().mockReturnValue('__vault_manifest__'),
-}));
+jest.unstable_mockModule('../collab-client', mockCollabClientModule());
 
-jest.unstable_mockModule('../collab-client', () => ({
-    CollabClient: jest.fn().mockImplementation(() => ({
-        connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
-        disconnect: jest.fn(),
-        getText: jest.fn().mockReturnValue(''),
-        sendUpdate: jest.fn(),
-        sendManifestUpdate: jest.fn(),
-        onUpdate: jest.fn(),
-        onError: jest.fn(),
-        onDisconnect: jest.fn(),
-        onManifestPaths: jest.fn(),
-    })),
-    // main.ts imports the real extractErrorMessage (not a CollabClient method),
-    // so the mock must still provide it with the same behavior.
-    extractErrorMessage: (error: unknown): string =>
-        error instanceof Error ? error.message : String(error),
-}));
-
-jest.unstable_mockModule('../editor-sync', () => ({
-    EditorSync: jest.fn().mockImplementation(() => ({
-        bindToEditor: jest.fn(),
-        unbind: jest.fn(),
-        onLocalChange: jest.fn(),
-        getText: jest.fn().mockReturnValue(''),
-        setErrorCallback: jest.fn(),
-    })),
-}));
+jest.unstable_mockModule('../editor-sync', mockEditorSyncModule());
 
 const { Notice } = await import('obsidian');
 const { default: CollabPlugin } = await import('../main');

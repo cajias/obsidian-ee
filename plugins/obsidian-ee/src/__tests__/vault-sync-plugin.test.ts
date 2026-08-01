@@ -12,6 +12,11 @@
 
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { mockObsidianModule } from './helpers/mock-obsidian';
+import {
+    createCollabWasmMock,
+    createCollabClientMock,
+    mockEditorSyncModule,
+} from './helpers/mock-collab-modules';
 
 const MANIFEST_ID = '__vault_manifest__';
 
@@ -38,55 +43,22 @@ function makeAction(kind: string, path: string, newPath?: string) {
     };
 }
 
-const mockVaultSyncInstance = {
-    handle_created: jest.fn(),
-    handle_deleted: jest.fn(),
-    handle_renamed: jest.fn(),
-    apply_remote_manifest: jest.fn(),
-    list_files: jest.fn(),
-    free: jest.fn(),
-};
-const MockWasmVaultSync = jest.fn().mockImplementation(() => mockVaultSyncInstance);
-
-const mockWasmInit = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
-
-jest.unstable_mockModule('../wasm/collab_wasm', () => ({
-    __esModule: true,
-    default: mockWasmInit,
+const {
+    wasmInit: mockWasmInit,
+    vaultSyncInstance: mockVaultSyncInstance,
     WasmVaultSync: MockWasmVaultSync,
-    manifest_doc_id: jest.fn().mockReturnValue(MANIFEST_ID),
-}));
+    moduleFactory: collabWasmModuleFactory,
+} = createCollabWasmMock(MANIFEST_ID);
+jest.unstable_mockModule('../wasm/collab_wasm', collabWasmModuleFactory);
 
-const mockClientInstance = {
-    connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
-    disconnect: jest.fn(),
-    getText: jest.fn().mockReturnValue(''),
-    sendUpdate: jest.fn(),
-    sendManifestUpdate: jest.fn(),
-    onUpdate: jest.fn(),
-    onError: jest.fn(),
-    onDisconnect: jest.fn(),
-    onManifestPaths: jest.fn(),
-};
-const MockCollabClient = jest.fn().mockImplementation(() => mockClientInstance);
-
-jest.unstable_mockModule('../collab-client', () => ({
+const {
+    instance: mockClientInstance,
     CollabClient: MockCollabClient,
-    // main.ts imports the real extractErrorMessage (not a CollabClient method),
-    // so the mock must still provide it with the same behavior.
-    extractErrorMessage: (error: unknown): string =>
-        error instanceof Error ? error.message : String(error),
-}));
+    moduleFactory: collabClientModuleFactory,
+} = createCollabClientMock();
+jest.unstable_mockModule('../collab-client', collabClientModuleFactory);
 
-jest.unstable_mockModule('../editor-sync', () => ({
-    EditorSync: jest.fn().mockImplementation(() => ({
-        bindToEditor: jest.fn(),
-        unbind: jest.fn(),
-        onLocalChange: jest.fn(),
-        getText: jest.fn().mockReturnValue(''),
-        setErrorCallback: jest.fn(),
-    })),
-}));
+jest.unstable_mockModule('../editor-sync', mockEditorSyncModule());
 
 const { default: CollabPlugin } = await import('../main');
 type CollabPlugin = InstanceType<typeof CollabPlugin>;
@@ -153,28 +125,35 @@ function manifestCallback(): (paths: string[]) => Promise<void> | void {
     return calls[0][0] as (paths: string[]) => Promise<void> | void;
 }
 
-describe('CollabPlugin vault sync wiring', () => {
-    let consoleSpy: ReturnType<typeof jest.spyOn>;
+// Shared by both describe blocks below: they drive the same started-plugin
+// setup, so the common mock reset lives once here rather than duplicated
+// per describe.
+let consoleSpy: ReturnType<typeof jest.spyOn>;
 
+beforeEach(() => {
+    consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.clearAllMocks();
+    mockCompile.mockResolvedValue(mockWasmModule as WebAssembly.Module);
+    mockWasmInit.mockResolvedValue(undefined);
+    mockClientInstance.connect.mockResolvedValue(undefined);
+    MockWasmVaultSync.mockImplementation(() => mockVaultSyncInstance);
+    MockCollabClient.mockImplementation(() => mockClientInstance);
+    mockVaultSyncInstance.handle_created.mockReturnValue(makeAction('created', 'notes/x.md'));
+});
+
+afterEach(() => {
+    jest.restoreAllMocks();
+});
+
+describe('CollabPlugin vault sync wiring', () => {
+    // Extra fixtures only these tests need (rename/delete flows).
     beforeEach(() => {
-        consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-        jest.spyOn(console, 'log').mockImplementation(() => {});
-        jest.spyOn(console, 'warn').mockImplementation(() => {});
-        jest.clearAllMocks();
-        mockCompile.mockResolvedValue(mockWasmModule as WebAssembly.Module);
-        mockWasmInit.mockResolvedValue(undefined);
-        mockClientInstance.connect.mockResolvedValue(undefined);
-        MockWasmVaultSync.mockImplementation(() => mockVaultSyncInstance);
-        MockCollabClient.mockImplementation(() => mockClientInstance);
-        mockVaultSyncInstance.handle_created.mockReturnValue(makeAction('created', 'notes/x.md'));
         mockVaultSyncInstance.handle_deleted.mockReturnValue(makeAction('deleted', 'notes/x.md'));
         mockVaultSyncInstance.handle_renamed.mockReturnValue(
             makeAction('renamed', 'old.md', 'new.md')
         );
-    });
-
-    afterEach(() => {
-        jest.restoreAllMocks();
     });
 
     it('startSession constructs a WasmVaultSync and passes it (plus the manifest doc id) to the client', async () => {
@@ -277,25 +256,6 @@ describe('CollabPlugin vault sync wiring', () => {
 });
 
 describe('CollabPlugin remote file materialization (#32)', () => {
-    let consoleSpy: ReturnType<typeof jest.spyOn>;
-
-    beforeEach(() => {
-        consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-        jest.spyOn(console, 'log').mockImplementation(() => {});
-        jest.spyOn(console, 'warn').mockImplementation(() => {});
-        jest.clearAllMocks();
-        mockCompile.mockResolvedValue(mockWasmModule as WebAssembly.Module);
-        mockWasmInit.mockResolvedValue(undefined);
-        mockClientInstance.connect.mockResolvedValue(undefined);
-        MockWasmVaultSync.mockImplementation(() => mockVaultSyncInstance);
-        MockCollabClient.mockImplementation(() => mockClientInstance);
-        mockVaultSyncInstance.handle_created.mockReturnValue(makeAction('created', 'notes/x.md'));
-    });
-
-    afterEach(() => {
-        jest.restoreAllMocks();
-    });
-
     it('registers an onManifestPaths callback with the client', async () => {
         await startedPlugin();
         expect(mockClientInstance.onManifestPaths).toHaveBeenCalledWith(expect.any(Function));
