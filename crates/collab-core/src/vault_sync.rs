@@ -18,6 +18,16 @@ use crate::DocumentId;
 /// live state is touched — see that method's docs for why.
 pub const MAX_NEW_PATHS_PER_APPLY: usize = 1024;
 
+/// Ceiling on a single remote manifest update frame, matching the relay's
+/// 1 MiB WebSocket frame cap: anything larger could never arrive legitimately.
+///
+/// Enforced here so every caller gets the bound "for free" — not just the
+/// wasm binding (`collab-wasm`'s `WasmVaultSync` also checks this constant as
+/// a fast-path rejection before ever crossing into collab-core), but native
+/// callers too (e2e tests, a future CLI) that invoke `VaultSyncManager`
+/// directly and would otherwise get no byte protection at all.
+pub const MAX_MANIFEST_UPDATE_BYTES: usize = 1024 * 1024;
+
 /// Settings that control vault-wide synchronization.
 ///
 /// # Defaults
@@ -300,7 +310,13 @@ impl VaultSyncManager {
 
     /// Apply a manifest update received from a remote peer.
     ///
-    /// The update is first merged into a *scratch* copy of the current
+    /// The raw update bytes are bounded by [`MAX_MANIFEST_UPDATE_BYTES`] before
+    /// any decode or merge work — this is a network-fed collection and must be
+    /// bounded by bytes, not just by item count, since a single new path with
+    /// an oversized string value would otherwise pass a count-only check and
+    /// still allow unbounded memory growth.
+    ///
+    /// The update is then merged into a *scratch* copy of the current
     /// manifest (seeded from `encode_full_state`) so the new-path count can be
     /// checked against [`MAX_NEW_PATHS_PER_APPLY`] before any live state is
     /// touched. Yrs merges are irreversible on a live `Doc`, so validating
@@ -317,16 +333,27 @@ impl VaultSyncManager {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError`] if the update bytes are malformed, or if the
-    /// update would newly-register more than [`MAX_NEW_PATHS_PER_APPLY`] paths.
+    /// Returns [`RegistryError`] if the update bytes are malformed, exceed
+    /// [`MAX_MANIFEST_UPDATE_BYTES`], or would newly-register more than
+    /// [`MAX_NEW_PATHS_PER_APPLY`] paths.
     pub fn apply_remote_manifest(&mut self, update: &[u8]) -> Result<Vec<String>, RegistryError> {
+        if update.len() > MAX_MANIFEST_UPDATE_BYTES {
+            return Err(RegistryError::InvalidState(format!(
+                "manifest update of {} bytes exceeds the {MAX_MANIFEST_UPDATE_BYTES}-byte cap",
+                update.len()
+            )));
+        }
+
+        // Shared error mapper: every fallible Yrs decode/merge below reports
+        // through the same RegistryError variant, so bind it once instead of
+        // repeating the closure per call site.
+        let to_invalid_state = |e: crate::Error| RegistryError::InvalidState(e.to_string());
+
         // Validate against a scratch copy first: no live mutation happens
         // until we know the update is within the path-count bound.
         let scratch = VaultManifest::new();
-        scratch
-            .apply_update(&self.manifest.encode_full_state())
-            .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
-        scratch.apply_update(update).map_err(|e| RegistryError::InvalidState(e.to_string()))?;
+        scratch.apply_update(&self.manifest.encode_full_state()).map_err(to_invalid_state)?;
+        scratch.apply_update(update).map_err(to_invalid_state)?;
 
         let to_open: Vec<String> = scratch
             .list_files()
@@ -345,9 +372,7 @@ impl VaultSyncManager {
         }
 
         // Validated: now safe to merge into the live manifest for real.
-        self.manifest
-            .apply_update(update)
-            .map_err(|e| RegistryError::InvalidState(e.to_string()))?;
+        self.manifest.apply_update(update).map_err(to_invalid_state)?;
 
         let mut newly_registered = Vec::with_capacity(to_open.len());
         for path in to_open {
@@ -573,6 +598,34 @@ mod tests {
         // never merged at all. If it had merged (with only the registry loop
         // skipped), peer's manifest would already report thousands of alive
         // files even though the call reported failure.
+        assert!(peer.manifest().list_files().is_empty(), "manifest must be untouched on rejection");
+        assert!(peer.registry().list().is_empty(), "registry must be untouched on rejection");
+
+        // A legitimate follow-up update still applies cleanly afterward.
+        let mut carol = VaultSyncManager::new(VaultSyncConfig::default());
+        carol.handle_created("fine.md").unwrap();
+        let newly = peer.apply_remote_manifest(&carol.manifest().encode_full_state()).unwrap();
+        assert_eq!(newly, vec!["fine.md".to_string()]);
+    }
+
+    #[test]
+    fn test_apply_remote_manifest_rejects_oversized_update_before_merge() {
+        // A single new path with an oversized string value passes the
+        // path-COUNT check (it's one path) but must still be rejected by the
+        // BYTE bound: a count-only cap on a network-fed collection permits
+        // OOM whenever items can be MiB-scale, which a giant path is.
+        let mut alice = VaultSyncManager::new(VaultSyncConfig::default());
+        let giant_path = format!("{}.md", "a".repeat(MAX_MANIFEST_UPDATE_BYTES));
+        alice.handle_created(&giant_path).unwrap();
+        let oversized_update = alice.manifest().encode_full_state();
+        assert!(oversized_update.len() > MAX_MANIFEST_UPDATE_BYTES);
+
+        let mut peer = VaultSyncManager::new(VaultSyncConfig::default());
+        let res = peer.apply_remote_manifest(&oversized_update);
+        assert!(res.is_err(), "update over MAX_MANIFEST_UPDATE_BYTES must be rejected");
+
+        // Rejection must mean the CRDT merge never happened at all, matching
+        // the path-count-bomb invariant above.
         assert!(peer.manifest().list_files().is_empty(), "manifest must be untouched on rejection");
         assert!(peer.registry().list().is_empty(), "registry must be untouched on rejection");
 

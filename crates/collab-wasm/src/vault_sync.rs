@@ -10,6 +10,7 @@
 
 use collab_core::{
     RegistryError, SyncAction, SyncActionKind, VaultSyncConfig, VaultSyncManager, MANIFEST_DOC_ID,
+    MAX_MANIFEST_UPDATE_BYTES,
 };
 use wasm_bindgen::prelude::*;
 
@@ -26,10 +27,6 @@ pub fn manifest_doc_id() -> String {
 fn reg_err(e: RegistryError) -> JsError {
     JsError::new(&e.to_string())
 }
-
-/// Ceiling on a single remote manifest update frame, matching the relay's
-/// 1 MiB WebSocket frame cap: anything larger could never arrive legitimately.
-const MAX_MANIFEST_UPDATE_BYTES: usize = 1024 * 1024;
 
 /// JS-friendly view of a `collab_core::SyncAction`.
 ///
@@ -80,16 +77,17 @@ impl WasmSyncAction {
 pub struct WasmVaultSync(VaultSyncManager);
 
 impl WasmVaultSync {
-    /// Apply a remote manifest with the transport-frame bound enforced at the
-    /// binding: updates over [`MAX_MANIFEST_UPDATE_BYTES`] are rejected before
-    /// ever reaching collab-core, since anything larger could never have
-    /// arrived as a legitimate relay frame.
+    /// Apply a remote manifest update.
     ///
-    /// The new-path count bound (`MAX_NEW_PATHS_PER_APPLY`) is enforced inside
-    /// `collab_core::VaultSyncManager::apply_remote_manifest` itself, checked
-    /// against a scratch copy *before* the CRDT merge — that's a manifest
-    /// invariant every caller must get for free, not something a network
-    /// binding can bolt on after the fact once the merge has already happened.
+    /// Both bounds are manifest invariants enforced inside
+    /// `collab_core::VaultSyncManager::apply_remote_manifest` itself, so every
+    /// caller (this binding, e2e tests, a future CLI) gets them "for free":
+    /// the byte bound ([`MAX_MANIFEST_UPDATE_BYTES`]) rejects anything larger
+    /// than a legitimate relay frame before any decode work, and the new-path
+    /// count bound (`MAX_NEW_PATHS_PER_APPLY`) is checked against a scratch
+    /// copy *before* the CRDT merge. This binding additionally re-checks the
+    /// byte bound as a fast path, rejecting an oversized frame before it ever
+    /// crosses the wasm boundary.
     ///
     /// The `#[wasm_bindgen]` `apply_remote_manifest` delegates here and maps the
     /// error to a JS `Error`; this variant lets native tests assert the failure
