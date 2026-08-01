@@ -129,6 +129,16 @@ function mockWorkspaceWithView(overrides: Record<string, unknown> = {}) {
     };
 }
 
+// A plugin instance ready for startSession()/stopSession(): an active
+// markdown view is open and registerEvent is stubbed, exactly what every
+// startSession/stopSession test needs before it can drive the plugin.
+function createReadyPlugin(workspaceOverrides: Record<string, unknown> = {}): CollabPlugin {
+    const plugin = createMockPlugin();
+    (plugin as any).app.workspace = mockWorkspaceWithView(workspaceOverrides);
+    (plugin as any).registerEvent = jest.fn();
+    return plugin;
+}
+
 describe('CollabPlugin', () => {
     let consoleSpy: ReturnType<typeof jest.spyOn>;
     let consoleWarnSpy: ReturnType<typeof jest.spyOn>;
@@ -259,9 +269,7 @@ describe('CollabPlugin', () => {
 
     describe('startSession', () => {
         it('should start a session as owner (creating the MLS group)', async () => {
-            const plugin = createMockPlugin();
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin();
 
             const { CollabClient } = await import('../collab-client');
 
@@ -280,9 +288,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should start a session as joiner', async () => {
-            const plugin = createMockPlugin();
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin();
 
             const { CollabClient } = await import('../collab-client');
 
@@ -314,9 +320,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should register onError and onDisconnect callbacks', async () => {
-            const plugin = createMockPlugin();
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin();
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -327,9 +331,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should register EditorSync error callback', async () => {
-            const plugin = createMockPlugin();
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin();
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -339,10 +341,8 @@ describe('CollabPlugin', () => {
         });
 
         it('should not start a second session while one is already active', async () => {
-            const plugin = createMockPlugin();
             const onMock = jest.fn().mockReturnValue({ unload: jest.fn() });
-            (plugin as any).app.workspace = mockWorkspaceWithView({ on: onMock });
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin({ on: onMock });
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -362,12 +362,8 @@ describe('CollabPlugin', () => {
         });
 
         it('should store editor change handler reference', async () => {
-            const plugin = createMockPlugin();
             const mockHandler = { unload: jest.fn() };
-            (plugin as any).app.workspace = mockWorkspaceWithView({
-                on: jest.fn().mockReturnValue(mockHandler),
-            });
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin({ on: jest.fn().mockReturnValue(mockHandler) });
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -378,14 +374,12 @@ describe('CollabPlugin', () => {
 
     describe('stopSession', () => {
         it('should unregister editor change handler', async () => {
-            const plugin = createMockPlugin();
             const mockHandler = { unload: jest.fn() };
             const offrefMock = jest.fn();
-            (plugin as any).app.workspace = mockWorkspaceWithView({
+            const plugin = createReadyPlugin({
                 on: jest.fn().mockReturnValue(mockHandler),
                 offref: offrefMock,
             });
-            (plugin as any).registerEvent = jest.fn();
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -396,9 +390,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should disconnect and null the CollabClient (which frees the MLS document)', async () => {
-            const plugin = createMockPlugin();
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin();
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -415,9 +407,7 @@ describe('CollabPlugin', () => {
         });
 
         it('should allow a fresh startSession after stop', async () => {
-            const plugin = createMockPlugin();
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
+            const plugin = createReadyPlugin();
 
             await plugin.onload();
             await plugin.startSession('owner');
@@ -431,10 +421,8 @@ describe('CollabPlugin', () => {
         });
 
         it('should call stopSession when disconnect callback is invoked', async () => {
-            const plugin = createMockPlugin();
+            const plugin = createReadyPlugin();
             let disconnectCallback: ((reason: string) => void) | null = null;
-            (plugin as any).app.workspace = mockWorkspaceWithView();
-            (plugin as any).registerEvent = jest.fn();
 
             // Capture the disconnect callback
             const { CollabClient } = await import('../collab-client');
