@@ -273,21 +273,20 @@ export default class CollabPlugin extends Plugin {
         if (!this.vaultSync || !this.collabClient) {
             return;
         }
+        let action: WasmSyncAction | undefined;
         try {
-            const action = run();
-            try {
-                if (action.kind !== 'ignored') {
-                    this.collabClient.sendManifestUpdate(action.manifest_update);
-                }
-            } finally {
-                // Free the WASM-owned action even when the send throws.
-                action.free();
+            action = run();
+            if (action.kind !== 'ignored') {
+                this.collabClient.sendManifestUpdate(action.manifest_update);
             }
         } catch (error) {
             console.error('[CollabPlugin] Vault sync error:', error);
             new Notice(
                 `Vault sync error: ${error instanceof Error ? error.message : String(error)}`
             );
+        } finally {
+            // Free the WASM-owned action even when run() or the send throws.
+            action?.free();
         }
     }
 
