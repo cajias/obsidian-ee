@@ -51,13 +51,24 @@ jest.unstable_mockModule('obsidian', () => ({
     MarkdownView: class {},
 }));
 
-// MLS-only: main.ts only needs the WASM module initialized (`init`); the MLS
-// classes are driven inside CollabClient, so no CollabCore export is mocked here.
+// MLS-only: main.ts needs the WASM module initialized (`init`) plus the vault
+// sync surface (#32). The MLS doc classes are driven inside CollabClient, so no
+// CollabCore export is mocked here.
 const mockWasmInit = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
+const mockWasmVaultSync = jest.fn().mockImplementation(() => ({
+    handle_created: jest.fn(),
+    handle_deleted: jest.fn(),
+    handle_renamed: jest.fn(),
+    apply_remote_manifest: jest.fn(),
+    list_files: jest.fn(),
+    free: jest.fn(),
+}));
 
 jest.unstable_mockModule('../wasm/collab_wasm', () => ({
     __esModule: true,
     default: mockWasmInit,
+    WasmVaultSync: mockWasmVaultSync,
+    manifest_doc_id: jest.fn().mockReturnValue('__vault_manifest__'),
 }));
 
 jest.unstable_mockModule('../collab-client', () => ({
@@ -66,9 +77,11 @@ jest.unstable_mockModule('../collab-client', () => ({
         disconnect: jest.fn(),
         getText: jest.fn().mockReturnValue(''),
         sendUpdate: jest.fn(),
+        sendManifestUpdate: jest.fn(),
         onUpdate: jest.fn(),
         onError: jest.fn(),
         onDisconnect: jest.fn(),
+        onManifestPaths: jest.fn(),
     })),
 }));
 
@@ -95,6 +108,13 @@ function createMockPlugin(): CollabPlugin {
                     .fn<() => Promise<ArrayBuffer>>()
                     .mockResolvedValue(new ArrayBuffer(8)),
             },
+            // Vault sync (#32) registers create/delete/rename handlers and
+            // materializes remote paths.
+            on: jest.fn().mockReturnValue({}),
+            offref: jest.fn(),
+            getAbstractFileByPath: jest.fn().mockReturnValue(null),
+            create: jest.fn<() => Promise<unknown>>().mockResolvedValue({}),
+            createFolder: jest.fn<() => Promise<unknown>>().mockResolvedValue({}),
         },
         workspace: {
             getActiveViewOfType: jest.fn(),

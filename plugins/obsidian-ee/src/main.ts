@@ -1,5 +1,7 @@
 import { Plugin, Notice, MarkdownView, PluginSettingTab, App, Setting } from 'obsidian';
-import init from './wasm/collab_wasm';
+import type { EventRef } from 'obsidian';
+import init, { WasmVaultSync, manifest_doc_id } from './wasm/collab_wasm';
+import type { WasmSyncAction } from './wasm/collab_wasm';
 import { CollabClient, CollabClientConfig, CollabRole } from './collab-client';
 import { EditorSync } from './editor-sync';
 
@@ -13,10 +15,28 @@ const DEFAULT_SETTINGS: CollabPluginSettings = {
     relayUrl: 'ws://localhost:8080',
 };
 
+/**
+ * Trust boundary for remote manifest paths (#32). The manifest is network-fed,
+ * so a malicious peer could announce traversal paths; reject anything that is
+ * empty, absolute, contains a backslash, or has `..` (or empty) segments BEFORE
+ * it reaches any vault API.
+ */
+function isSafeVaultPath(path: string): boolean {
+    if (!path || path.startsWith('/') || path.includes('\\')) {
+        return false;
+    }
+    return path.split('/').every((segment) => segment !== '' && segment !== '..');
+}
+
 export default class CollabPlugin extends Plugin {
     settings: CollabPluginSettings = DEFAULT_SETTINGS;
     private collabClient: CollabClient | null = null;
     private editorSync: EditorSync | null = null;
+    private vaultSync: WasmVaultSync | null = null;
+    private vaultEventRefs: EventRef[] = [];
+    // Paths currently being created FROM a remote manifest: the vault 'create'
+    // event they fire must not echo back out as a new manifest update.
+    private materializing = new Set<string>();
     private wasmInitialized = false;
     private editorChangeHandler: ReturnType<typeof this.app.workspace.on> | null = null;
 
@@ -135,7 +155,7 @@ export default class CollabPlugin extends Plugin {
         // the first would orphan the first CollabClient (its WebSocket stays open) and
         // EditorSync, and overwrite editorChangeHandler so stopSession() could no longer
         // unregister the first handler.
-        if (this.collabClient || this.editorSync) {
+        if (this.collabClient || this.editorSync || this.vaultSync) {
             new Notice('Collaboration session already active');
             return;
         }
@@ -154,6 +174,11 @@ export default class CollabPlugin extends Plugin {
             return;
         }
 
+        // Vault sync (#32): default scope (whole vault, .md only), deletions and
+        // renames propagated. The manifest CRDT rides the same relay connection
+        // under its own MLS group, established by the same owner/joiner handshake.
+        this.vaultSync = new WasmVaultSync([], [], true, true);
+
         const config: CollabClientConfig = {
             relayUrl: this.settings.relayUrl,
             userId: `user-${Date.now()}`,
@@ -162,6 +187,8 @@ export default class CollabPlugin extends Plugin {
             // the group's keys are derived by MLS, so a session fails closed until a
             // group is established (CollabClient.sendUpdate returns false, no plaintext).
             role,
+            vaultSync: this.vaultSync,
+            manifestDocId: manifest_doc_id(),
         };
 
         try {
@@ -187,6 +214,10 @@ export default class CollabPlugin extends Plugin {
                 new Notice(`Sync error: ${error.message}`);
             });
 
+            // Materialize files announced by remote manifests (#32): a note
+            // created on one client appears as a file on the others.
+            this.collabClient.onManifestPaths((paths) => this.materializeRemotePaths(paths));
+
             // Connect to relay server
             await this.collabClient.connect();
 
@@ -199,6 +230,9 @@ export default class CollabPlugin extends Plugin {
             });
             this.registerEvent(this.editorChangeHandler);
 
+            // Route vault file events into manifest updates (#32).
+            this.registerVaultHandlers();
+
             new Notice('Collaboration session started');
         } catch (error) {
             console.error('Failed to start collaboration:', error);
@@ -207,11 +241,108 @@ export default class CollabPlugin extends Plugin {
         }
     }
 
+    /**
+     * Wire vault file events into manifest updates (#32). Refs are tracked for
+     * stopSession and also registered with Obsidian for unload cleanup.
+     */
+    private registerVaultHandlers(): void {
+        const refs: EventRef[] = [
+            this.app.vault.on('create', (file) => {
+                // Echo guard: a create we performed ourselves while materializing
+                // a remote manifest path must not loop back into an outbound update.
+                if (this.materializing.has(file.path)) {
+                    return;
+                }
+                this.handleVaultAction(() => this.vaultSync!.handle_created(file.path));
+            }),
+            this.app.vault.on('delete', (file) => {
+                this.handleVaultAction(() => this.vaultSync!.handle_deleted(file.path));
+            }),
+            this.app.vault.on('rename', (file, oldPath) => {
+                this.handleVaultAction(() => this.vaultSync!.handle_renamed(oldPath, file.path));
+            }),
+        ];
+        for (const ref of refs) {
+            this.vaultEventRefs.push(ref);
+            this.registerEvent(ref);
+        }
+    }
+
+    /** Run a vault-sync action and broadcast its manifest update unless ignored. */
+    private handleVaultAction(run: () => WasmSyncAction): void {
+        if (!this.vaultSync || !this.collabClient) {
+            return;
+        }
+        try {
+            const action = run();
+            try {
+                if (action.kind !== 'ignored') {
+                    this.collabClient.sendManifestUpdate(action.manifest_update);
+                }
+            } finally {
+                // Free the WASM-owned action even when the send throws.
+                action.free();
+            }
+        } catch (error) {
+            console.error('[CollabPlugin] Vault sync error:', error);
+            new Notice(
+                `Vault sync error: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+    }
+
+    /**
+     * Create vault files for paths announced by a remote manifest (#32).
+     * Unsafe paths are rejected at the trust boundary (see isSafeVaultPath) and
+     * surfaced as errors; failures never throw out of the manifest callback.
+     */
+    private async materializeRemotePaths(paths: string[]): Promise<void> {
+        for (const path of paths) {
+            if (!isSafeVaultPath(path)) {
+                console.error('[CollabPlugin] Rejected unsafe remote manifest path:', path);
+                new Notice(`Rejected unsafe synced path: ${path}`);
+                continue;
+            }
+            if (this.app.vault.getAbstractFileByPath(path)) {
+                continue;
+            }
+            this.materializing.add(path);
+            try {
+                const parent = path.split('/').slice(0, -1).join('/');
+                if (parent && !this.app.vault.getAbstractFileByPath(parent)) {
+                    await this.app.vault.createFolder(parent);
+                }
+                await this.app.vault.create(path, '');
+            } catch (error) {
+                console.error('[CollabPlugin] Failed to materialize remote file:', path, error);
+                new Notice(
+                    `Failed to create synced file ${path}: ${error instanceof Error ? error.message : String(error)}`
+                );
+            } finally {
+                this.materializing.delete(path);
+            }
+        }
+    }
+
     stopSession(): void {
         // Unregister editor change handler
         if (this.editorChangeHandler) {
             this.app.workspace.offref(this.editorChangeHandler);
             this.editorChangeHandler = null;
+        }
+
+        // Unregister vault event handlers and free the vault-sync manager (#32).
+        for (const ref of this.vaultEventRefs) {
+            this.app.vault.offref(ref);
+        }
+        this.vaultEventRefs = [];
+        if (this.vaultSync) {
+            try {
+                this.vaultSync.free();
+            } catch (error) {
+                console.error('[CollabPlugin] Error freeing vault sync resources:', error);
+            }
+            this.vaultSync = null;
         }
 
         if (this.editorSync) {
