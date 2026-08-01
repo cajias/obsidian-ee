@@ -17,14 +17,31 @@ export type CollabRole = 'owner' | 'joiner';
 // bounds every array parsed out of it.
 const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Narrow view of WasmVaultSync (#32): the client only needs to apply remote
+ * manifest updates; local file-event handling stays with the plugin.
+ */
+export interface VaultSyncLike {
+    apply_remote_manifest(update: Uint8Array): string[];
+}
+
 export interface CollabClientConfig {
     relayUrl: string;
     userId: string;
     docId: string;
     role: CollabRole; // owner creates the MLS group; joiner joins via a Welcome
+    /**
+     * Enables vault-manifest sync when provided (#32). The manifest rides the
+     * same relay connection as its OWN MLS group on `manifestDocId`, established
+     * by the same owner/joiner handshake as the file doc — never a shared key.
+     */
+    vaultSync?: VaultSyncLike;
+    /** The locally-trusted manifest doc id (from wasm `manifest_doc_id()`). */
+    manifestDocId?: string;
 }
 
 export type UpdateCallback = (text: string) => void;
+export type ManifestPathsCallback = (newPaths: string[]) => void | Promise<void>;
 export type DisconnectCallback = (reason: string) => void;
 export type ErrorCallback = (error: CollabError) => void;
 export type ConnectionState = 'connected' | 'connecting' | 'disconnected' | 'reconnecting';
@@ -124,15 +141,43 @@ function validateConfig(config: CollabClientConfig): void {
     if (config.role !== 'owner' && config.role !== 'joiner') {
         throw new ConfigValidationError('role must be "owner" or "joiner"');
     }
+
+    validateVaultSyncConfig(config);
+}
+
+/**
+ * Validate the vault-sync pairing (#32): the manifest doc id names a SEPARATE
+ * MLS group riding the same connection, so it must be present and must differ
+ * from the file doc id — a collision would route file and manifest frames to
+ * the same group and defeat per-group isolation.
+ */
+function validateVaultSyncConfig(config: CollabClientConfig): void {
+    if (!config.vaultSync) {
+        return;
+    }
+    if (!config.manifestDocId || typeof config.manifestDocId !== 'string') {
+        throw new ConfigValidationError(
+            'manifestDocId must be a non-empty string when vaultSync is provided'
+        );
+    }
+    if (config.manifestDocId === config.docId) {
+        throw new ConfigValidationError('manifestDocId must differ from docId');
+    }
 }
 
 export class CollabClient {
     private ws: WebSocket | null = null;
     private doc: WasmEncryptedDocument | null = null;
     private pending: WasmPendingMember | null = null;
+    // Second, independent MLS group for the vault manifest (#32). Same lifecycle
+    // as `doc`/`pending`, keyed on config.manifestDocId. null until established
+    // (owner) or until the Welcome arrives (joiner).
+    private manifestDoc: WasmEncryptedDocument | null = null;
+    private manifestPending: WasmPendingMember | null = null;
     private groupEstablished = false;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
+    private onManifestPathsCallback: ManifestPathsCallback | null = null;
     private onDisconnectCallback: DisconnectCallback | null = null;
     private onErrorCallback: ErrorCallback | null = null;
     private reconnectAttempts = 0;
@@ -174,15 +219,45 @@ export class CollabClient {
         this.groupEstablished = true;
         if (this.config.role === 'owner') {
             this.doc = WasmEncryptedDocument.create(this.config.docId, this.config.userId);
+        } else {
+            this.pending = generate_key_package(this.config.userId);
+            this.send({
+                type: 'mls_handshake',
+                doc_id: this.config.docId,
+                payload: [...this.pending.key_package],
+                message_type: 'key_package',
+            });
+        }
+        // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
+        // established by the same handshake. Same role: whoever owns the file doc
+        // owns the manifest group. Throws here fail the connect() attempt via
+        // tryEstablishGroup, exactly like the file group.
+        if (this.config.vaultSync && this.config.manifestDocId) {
+            this.establishManifestGroup(this.config.manifestDocId);
+        }
+    }
+
+    private establishManifestGroup(manifestDocId: string): void {
+        if (this.config.role === 'owner') {
+            this.manifestDoc = WasmEncryptedDocument.create(manifestDocId, this.config.userId);
             return;
         }
-        this.pending = generate_key_package(this.config.userId);
+        this.manifestPending = generate_key_package(this.config.userId);
         this.send({
             type: 'mls_handshake',
-            doc_id: this.config.docId,
-            payload: [...this.pending.key_package],
+            doc_id: manifestDocId,
+            payload: [...this.manifestPending.key_package],
             message_type: 'key_package',
         });
+    }
+
+    /** True when this frame's doc_id is the configured manifest group. */
+    private isManifestFrame(docId: string | undefined): boolean {
+        return (
+            this.config.vaultSync !== undefined &&
+            this.config.manifestDocId !== undefined &&
+            docId === this.config.manifestDocId
+        );
     }
 
     /**
@@ -325,10 +400,19 @@ export class CollabClient {
     }
 
     private subscribe(): boolean {
-        return this.send({
+        const subscribed = this.send({
             type: 'subscribe',
             doc_id: this.config.docId,
         });
+        // Vault sync rides the same connection: also subscribe to the manifest doc.
+        if (this.config.vaultSync && this.config.manifestDocId) {
+            const manifestSubscribed = this.send({
+                type: 'subscribe',
+                doc_id: this.config.manifestDocId,
+            });
+            return subscribed && manifestSubscribed;
+        }
+        return subscribed;
     }
 
     private send(message: object): boolean {
@@ -446,6 +530,13 @@ export class CollabClient {
             if (!message.encrypted || !Array.isArray(message.encrypted)) {
                 throw new Error('Invalid yrs_update message: missing or invalid encrypted field');
             }
+            // Manifest updates ride the same channel under their own MLS group:
+            // route them before the file-doc guard, which would reject the
+            // manifest doc_id as a misroute.
+            if (this.isManifestFrame(message.doc_id)) {
+                this.handleManifestUpdate(new Uint8Array(message.encrypted));
+                return;
+            }
             this.assertDocId('yrs_update', message.doc_id);
             // Fail closed: an update that arrives before the MLS group is
             // established cannot be decrypted. Surface it as an error rather than
@@ -476,8 +567,14 @@ export class CollabClient {
             if (!message.payload || !Array.isArray(message.payload)) {
                 throw new Error('Invalid mls_handshake message: missing or invalid payload');
             }
-            this.assertDocId('mls_handshake', message.doc_id);
             const payload = new Uint8Array(message.payload);
+            // Manifest-group handshake rides the same channel; route it before the
+            // file-doc guard (which would reject the manifest doc_id as a misroute).
+            if (this.isManifestFrame(message.doc_id)) {
+                this.handleManifestHandshake(message.message_type, payload);
+                return;
+            }
+            this.assertDocId('mls_handshake', message.doc_id);
 
             switch (message.message_type) {
                 case 'key_package': {
@@ -535,6 +632,137 @@ export class CollabClient {
             }
         } catch (error) {
             this.reportError('sync', 'Failed to process MLS handshake:', error);
+        }
+    }
+
+    /**
+     * Manifest-group handshake (#32), a mirror of the file-doc handshake on the
+     * SEPARATE manifest MLS group. Kept as its own method so the file path stays
+     * untouched. The LOCAL manifestDocId is bound as the invite doc id, never a
+     * frame field.
+     */
+    private handleManifestHandshake(
+        messageType: MlsHandshakeMessage['message_type'],
+        payload: Uint8Array
+    ): void {
+        const manifestDocId = this.config.manifestDocId!;
+        try {
+            switch (messageType) {
+                case 'key_package': {
+                    if (this.config.role !== 'owner' || !this.manifestDoc) {
+                        return;
+                    }
+                    const invite = this.manifestDoc.create_invite(payload);
+                    this.send({
+                        type: 'mls_handshake',
+                        doc_id: manifestDocId,
+                        payload: [...invite.welcome],
+                        message_type: 'welcome',
+                    });
+                    break;
+                }
+                case 'welcome': {
+                    if (
+                        this.config.role !== 'joiner' ||
+                        !this.manifestPending ||
+                        this.manifestDoc
+                    ) {
+                        return;
+                    }
+                    const invite = WasmInvite.from_welcome(manifestDocId, payload);
+                    const pending = this.manifestPending;
+                    // Clear BEFORE join(): the wasm glue consumes the handle on call
+                    // entry, so a throw must not leave a dead handle behind (see the
+                    // file-doc welcome branch for the full rationale).
+                    this.manifestPending = null;
+                    this.manifestDoc = WasmEncryptedDocument.join(invite, pending);
+                    break;
+                }
+                case 'commit': {
+                    this.manifestDoc?.process_commit(payload);
+                    break;
+                }
+                default:
+                    console.warn(
+                        `[CollabClient] Unknown manifest mls_handshake message_type: ${messageType}`
+                    );
+                    break;
+            }
+        } catch (error) {
+            this.reportManifestError('sync', 'Failed to process manifest handshake:', error);
+        }
+    }
+
+    /**
+     * Decrypt and apply a remote manifest update (#32).
+     *
+     * Decryption is authenticated by the manifest MLS group: a ciphertext bound
+     * to any other group (a file doc, a stale group) fails here and never
+     * reaches the manifest. Newly-announced paths are subscribed to and surfaced
+     * via onManifestPaths.
+     */
+    private handleManifestUpdate(encrypted: Uint8Array): void {
+        try {
+            if (this.manifestDoc === null) {
+                // Fail closed: an update before the manifest group is established
+                // cannot be decrypted.
+                throw new Error('no manifest MLS group established');
+            }
+            const plaintext = this.manifestDoc.decrypt_bytes(encrypted);
+            const newPaths = this.config.vaultSync!.apply_remote_manifest(plaintext);
+            for (const path of newPaths) {
+                this.send({ type: 'subscribe', doc_id: path });
+            }
+            if (this.onManifestPathsCallback) {
+                void this.onManifestPathsCallback(newPaths);
+            }
+        } catch (error) {
+            this.reportManifestError('decryption', 'Failed to apply manifest update:', error);
+        }
+    }
+
+    /**
+     * Encrypt and broadcast a local manifest update (#32) under the manifest MLS
+     * group's current epoch. Fails closed (returns false) until that group is
+     * established. Queues like any other frame when disconnected.
+     */
+    sendManifestUpdate(update: Uint8Array): boolean {
+        const { vaultSync, manifestDocId } = this.config;
+        if (!vaultSync || !manifestDocId) {
+            console.warn('[CollabClient] sendManifestUpdate called without vault sync configured');
+            return false;
+        }
+        if (this.manifestDoc === null) {
+            return false;
+        }
+        try {
+            const op = this.manifestDoc.encrypt_bytes(update);
+            return this.send({
+                type: 'yrs_update',
+                doc_id: manifestDocId,
+                encrypted: [...op.ciphertext],
+                epoch: Number(op.epoch),
+            });
+        } catch (error) {
+            this.reportManifestError('sync', 'Failed to send manifest update:', error);
+            return false;
+        }
+    }
+
+    onManifestPaths(callback: ManifestPathsCallback): void {
+        this.onManifestPathsCallback = callback;
+    }
+
+    /** Like reportError, but tags the error with the manifest doc id (#32). */
+    private reportManifestError(type: CollabError['type'], label: string, error: unknown): void {
+        console.error(label, error);
+        if (this.onErrorCallback) {
+            this.onErrorCallback({
+                type,
+                message: extractErrorMessage(error),
+                docId: this.config.manifestDocId,
+                originalError: error instanceof Error ? error : undefined,
+            });
         }
     }
 
@@ -684,6 +912,11 @@ export class CollabClient {
         // handle by value, so freeing there would double-free.
         this.pending?.free();
         this.pending = null;
+        // Same lifecycle for the manifest group (#32).
+        this.manifestDoc?.free();
+        this.manifestDoc = null;
+        this.manifestPending?.free();
+        this.manifestPending = null;
         // Allow a future reconnect after an explicit disconnect to re-establish.
         this.groupEstablished = false;
     }
