@@ -435,30 +435,23 @@ export class CollabClient {
      * - joiner receives a Welcome → joins the group, consuming its key package.
      * - either side receives a commit → applies it to advance the epoch.
      */
-    /**
-     * Validate an inbound mls_handshake frame at the trust boundary: payload
-     * shape, plus the doc_id early-reject mirroring handleYrsUpdate. The
-     * untrusted relay routing a frame for a different document must be rejected
-     * BEFORE any MLS state is touched — e.g. an owner must not mint a Welcome
-     * for a key package whose frame claims another doc. (The welcome path
-     * additionally binds the LOCAL docId; this rejects misroutes early and
-     * loudly.) Throws on rejection.
-     */
-    private validateHandshakeFrame(message: MlsHandshakeMessage): Uint8Array {
-        if (!message.payload || !Array.isArray(message.payload)) {
-            throw new Error('Invalid mls_handshake message: missing or invalid payload');
-        }
-        if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
-            throw new Error(
-                `mls_handshake doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
-            );
-        }
-        return new Uint8Array(message.payload);
-    }
-
     private handleMlsHandshake(message: MlsHandshakeMessage): void {
         try {
-            const payload = this.validateHandshakeFrame(message);
+            if (!message.payload || !Array.isArray(message.payload)) {
+                throw new Error('Invalid mls_handshake message: missing or invalid payload');
+            }
+            // Trust boundary: doc_id early-reject mirroring handleYrsUpdate. The
+            // untrusted relay routing a frame for a different document must be
+            // rejected BEFORE any MLS state is touched — e.g. an owner must not
+            // mint a Welcome for a key package whose frame claims another doc.
+            // (The welcome path additionally binds the LOCAL docId; this rejects
+            // misroutes early and loudly.)
+            if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
+                throw new Error(
+                    `mls_handshake doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
+                );
+            }
+            const payload = new Uint8Array(message.payload);
 
             switch (message.message_type) {
                 case 'key_package': {
