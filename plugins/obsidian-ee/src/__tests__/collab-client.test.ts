@@ -534,12 +534,7 @@ describe('CollabClient MLS-only crypto surface', () => {
     });
 
     it('joiner generates a single-use key package instead of taking a key', async () => {
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'bob',
-            docId: 'doc1',
-            role: 'joiner',
-        };
+        const config = makeDefaultConfig({ userId: 'bob', role: 'joiner' });
         const client = new CollabClient(config);
         await connectClient(client);
 
@@ -554,12 +549,7 @@ describe('CollabClient MLS-only crypto surface', () => {
         // A joiner before its Welcome arrives has no MLS group. sendUpdate must NOT
         // encrypt to nobody and must NOT fall back to a plaintext frame — it returns
         // false and sends nothing over the wire (CLAUDE.md fail-closed invariant).
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'bob',
-            docId: 'doc1',
-            role: 'joiner',
-        };
+        const config = makeDefaultConfig({ userId: 'bob', role: 'joiner' });
         const client = new CollabClient(config);
         await connectClient(client);
 
@@ -625,12 +615,7 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
     });
 
     it('Finding 2: a joined joiner does NOT answer a key_package as an owner', async () => {
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'bob',
-            docId: 'doc1',
-            role: 'joiner',
-        };
+        const config = makeDefaultConfig({ userId: 'bob', role: 'joiner' });
         const client = new CollabClient(config);
         await connectClient(client);
 
@@ -738,12 +723,7 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
         // Defense in depth: a Welcome misrouted from another document must not
         // make this joiner join a group.
         (WasmEncryptedDocument.join as unknown as jest.Mock).mockClear();
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'bob',
-            docId: 'doc1',
-            role: 'joiner',
-        };
+        const config = makeDefaultConfig({ userId: 'bob', role: 'joiner' });
         const client = new CollabClient(config);
         const errorCallback = jest.fn();
         client.onError(errorCallback);
@@ -790,12 +770,7 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
         (WasmEncryptedDocument.join as unknown as jest.Mock).mockImplementationOnce(() => {
             throw new Error('malformed welcome payload');
         });
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'bob',
-            docId: 'doc1',
-            role: 'joiner',
-        };
+        const config = makeDefaultConfig({ userId: 'bob', role: 'joiner' });
         const client = new CollabClient(config);
         const errorCallback = jest.fn();
         client.onError(errorCallback);
