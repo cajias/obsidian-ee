@@ -22,7 +22,7 @@
  * WebSocketServer mock relay that fans out both mls_handshake and yrs_update.
  */
 
-import { jest, describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { jest, describe, it, expect, beforeAll, afterAll, afterEach } from '@jest/globals';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
     CollabClient,
@@ -248,8 +248,23 @@ describe('Vault sync over its own MLS group (two clients)', () => {
         }
     });
 
+    // Every test that calls connectedPair() stashes its pair here so afterEach
+    // can tear it down uniformly, instead of each `it` repeating the same
+    // three-line disconnect/wait boilerplate.
+    let pair: { a: TestClient; b: TestClient } | undefined;
+
+    afterEach(async () => {
+        if (!pair) {
+            return;
+        }
+        pair.a.client.disconnect();
+        pair.b.client.disconnect();
+        pair = undefined;
+        await wait(50);
+    });
+
     it('both clients subscribe to the manifest doc on connect', async () => {
-        const { a, b } = await connectedPair('sub');
+        pair = await connectedPair('sub');
         for (const user of ['alice-sub', 'bob-sub']) {
             expect(
                 relay
@@ -257,13 +272,10 @@ describe('Vault sync over its own MLS group (two clients)', () => {
                     .some((f) => f.msg.type === 'subscribe' && f.msg.doc_id === MANIFEST_DOC_ID)
             ).toBe(true);
         }
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
     });
 
     it('propagates a file creation: manifest applies, callback fires, receiver subscribes to the new path', async () => {
-        const { a, b } = await connectedPair('create');
+        const { a, b } = (pair = await connectedPair('create'));
 
         const action = a.vaultSync.handle_created('notes/x.md');
         expect(action.kind).toBe('created');
@@ -277,14 +289,10 @@ describe('Vault sync over its own MLS group (two clients)', () => {
                 .framesFrom('bob-create')
                 .some((f) => f.msg.type === 'subscribe' && f.msg.doc_id === 'notes/x.md')
         ).toBe(true);
-
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
     });
 
     it('propagates a deletion as a tombstone', async () => {
-        const { a, b } = await connectedPair('del');
+        const { a, b } = (pair = await connectedPair('del'));
 
         const created = a.vaultSync.handle_created('notes/y.md');
         a.client.sendManifestUpdate(created.manifest_update);
@@ -296,14 +304,10 @@ describe('Vault sync over its own MLS group (two clients)', () => {
         a.client.sendManifestUpdate(deleted.manifest_update);
         await wait(250);
         expect(b.vaultSync.list_files()).not.toContain('notes/y.md');
-
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
     });
 
     it('propagates a rename and the receiver subscribes to the new path', async () => {
-        const { a, b } = await connectedPair('ren');
+        const { a, b } = (pair = await connectedPair('ren'));
 
         const created = a.vaultSync.handle_created('notes/old.md');
         a.client.sendManifestUpdate(created.manifest_update);
@@ -323,14 +327,10 @@ describe('Vault sync over its own MLS group (two clients)', () => {
                 .framesFrom('bob-ren')
                 .some((f) => f.msg.type === 'subscribe' && f.msg.doc_id === 'notes/new.md')
         ).toBe(true);
-
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
     });
 
     it('sendManifestUpdate carries the manifest group real epoch, not 0', async () => {
-        const { a, b } = await connectedPair('epoch');
+        const { a } = (pair = await connectedPair('epoch'));
         const action = a.vaultSync.handle_created('notes/e.md');
         a.client.sendManifestUpdate(action.manifest_update);
         await wait(250);
@@ -342,15 +342,11 @@ describe('Vault sync over its own MLS group (two clients)', () => {
             .find((f) => f.msg.type === 'yrs_update' && f.msg.doc_id === MANIFEST_DOC_ID);
         expect(update).toBeDefined();
         expect(update!.msg.epoch).toBeGreaterThan(0);
-
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
     });
 
     it('REGRESSION: still rejects a yrs_update whose doc_id is neither the file doc nor the manifest', async () => {
         const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-        const { a, b } = await connectedPair('guard');
+        const { b } = (pair = await connectedPair('guard'));
 
         const mallory = await connectMallory();
         mallory.send(
@@ -368,15 +364,12 @@ describe('Vault sync over its own MLS group (two clients)', () => {
         expect(b.manifestPaths).toHaveLength(0);
 
         mallory.close();
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
         consoleErrorSpy.mockRestore();
     });
 
     it('rejects a FOREIGN-group ciphertext on the manifest channel; manifest unchanged, client survives', async () => {
         const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-        const { a, b } = await connectedPair('foreign');
+        const { a, b } = (pair = await connectedPair('foreign'));
 
         // A ciphertext from an unrelated MLS group (mallory's own document), NOT
         // the group bob's manifest belongs to. AEAD/MLS authentication must fail.
@@ -407,15 +400,12 @@ describe('Vault sync over its own MLS group (two clients)', () => {
         expect(b.vaultSync.list_files()).toContain('notes/after-foreign.md');
 
         mallory.close();
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
         consoleErrorSpy.mockRestore();
     });
 
     it('surfaces malformed manifest plaintext (decrypts under the group, garbage bytes) via onError without crashing', async () => {
         const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-        const { a, b } = await connectedPair('junk');
+        const { a, b } = (pair = await connectedPair('junk'));
 
         // Real peer, real group: the bytes decrypt, but they are not a valid
         // manifest CRDT update, so apply_remote_manifest must reject them.
@@ -433,9 +423,6 @@ describe('Vault sync over its own MLS group (two clients)', () => {
         await wait(250);
         expect(b.vaultSync.list_files()).toContain('notes/after-junk.md');
 
-        a.client.disconnect();
-        b.client.disconnect();
-        await wait(50);
         consoleErrorSpy.mockRestore();
     });
 
