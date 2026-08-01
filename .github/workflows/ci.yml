@@ -227,13 +227,14 @@ jobs:
         run: npm run build
 
       # Real gate (no continue-on-error): the headline Playwright spec drives two
-      # CollabClients over the ws mock relay with the compiled WASM, asserting
-      # AES-PSK sync + fail-closed on a wrong key. Runs here because it needs both
-      # the built WASM (build-wasm step above) and node_modules (npm ci above).
+      # CollabClients over the ws mock relay with the compiled WASM, asserting the
+      # MLS handshake + encrypted sync and fail-closed before the Welcome. Runs here
+      # because it needs both the built WASM (build-wasm step above) and
+      # node_modules (npm ci above).
       # The spec is Node-only (no `page`/browser fixture), so Playwright launches
       # no browser and `npx playwright install` is deliberately omitted to keep CI
       # lean; add the browser install if a future spec drives a real page.
-      - name: Run plugin E2E (real two-client AES-PSK sync)
+      - name: Run plugin E2E (real two-client MLS sync)
         working-directory: plugins/obsidian-ee
         run: npm run e2e -- --reporter=list
 
