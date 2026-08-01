@@ -2,7 +2,7 @@ import { Plugin, Notice, MarkdownView, PluginSettingTab, App, Setting } from 'ob
 import type { EventRef } from 'obsidian';
 import init, { WasmVaultSync, manifest_doc_id } from './wasm/collab_wasm';
 import type { WasmSyncAction } from './wasm/collab_wasm';
-import { CollabClient, CollabClientConfig, CollabRole } from './collab-client';
+import { CollabClient, CollabClientConfig, CollabRole, extractErrorMessage } from './collab-client';
 import { EditorSync } from './editor-sync';
 
 interface CollabPluginSettings {
@@ -133,17 +133,13 @@ export default class CollabPlugin extends Plugin {
             if (error instanceof WebAssembly.CompileError) {
                 throw new Error(`WASM compilation failed: ${error.message}`);
             }
-            throw new Error(
-                `Failed to load WASM module: ${error instanceof Error ? error.message : String(error)}`
-            );
+            throw new Error(`Failed to load WASM module: ${extractErrorMessage(error)}`);
         }
 
         try {
             await init(wasmModule);
         } catch (error) {
-            throw new Error(
-                `WASM initialization failed: ${error instanceof Error ? error.message : String(error)}`
-            );
+            throw new Error(`WASM initialization failed: ${extractErrorMessage(error)}`);
         }
 
         this.wasmInitialized = true;
@@ -281,9 +277,7 @@ export default class CollabPlugin extends Plugin {
             }
         } catch (error) {
             console.error('[CollabPlugin] Vault sync error:', error);
-            new Notice(
-                `Vault sync error: ${error instanceof Error ? error.message : String(error)}`
-            );
+            new Notice(`Vault sync error: ${extractErrorMessage(error)}`);
         } finally {
             // Free the WASM-owned action even when run() or the send throws.
             action?.free();
@@ -314,9 +308,7 @@ export default class CollabPlugin extends Plugin {
                 await this.app.vault.create(path, '');
             } catch (error) {
                 console.error('[CollabPlugin] Failed to materialize remote file:', path, error);
-                new Notice(
-                    `Failed to create synced file ${path}: ${error instanceof Error ? error.message : String(error)}`
-                );
+                new Notice(`Failed to create synced file ${path}: ${extractErrorMessage(error)}`);
             } finally {
                 this.materializing.delete(path);
             }
