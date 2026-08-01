@@ -187,6 +187,17 @@ pub enum SyncActionKind {
     Ignored,
 }
 
+/// Build the [`SyncActionKind::Ignored`] variant of [`SyncAction`] for
+/// `path` — shared by every early-return in the event handlers below so the
+/// literal isn't repeated at each out-of-scope check.
+fn ignored(path: &str) -> SyncAction {
+    SyncAction {
+        path: path.to_string(),
+        kind: SyncActionKind::Ignored,
+        manifest_update: Vec::new(),
+    }
+}
+
 impl VaultSyncManager {
     /// Create a new sync manager with the given configuration.
     #[must_use]
@@ -223,11 +234,7 @@ impl VaultSyncManager {
     /// already exists).
     pub fn handle_created(&mut self, path: &str) -> Result<SyncAction, RegistryError> {
         if !self.config.should_sync(path) {
-            return Ok(SyncAction {
-                path: path.to_string(),
-                kind: SyncActionKind::Ignored,
-                manifest_update: Vec::new(),
-            });
+            return Ok(ignored(path));
         }
 
         let doc_id = VaultSyncConfig::doc_id_for_path(path);
@@ -250,11 +257,7 @@ impl VaultSyncManager {
     /// document in the registry and tombstones the file in the manifest.
     pub fn handle_deleted(&mut self, path: &str) -> SyncAction {
         if !self.config.should_sync(path) || !self.config.sync_deletions {
-            return SyncAction {
-                path: path.to_string(),
-                kind: SyncActionKind::Ignored,
-                manifest_update: Vec::new(),
-            };
+            return ignored(path);
         }
 
         let doc_id = VaultSyncConfig::doc_id_for_path(path);
@@ -285,11 +288,7 @@ impl VaultSyncManager {
             || !self.config.should_sync(old_path)
             || !self.config.should_sync(new_path)
         {
-            return Ok(SyncAction {
-                path: old_path.to_string(),
-                kind: SyncActionKind::Ignored,
-                manifest_update: Vec::new(),
-            });
+            return Ok(ignored(old_path));
         }
 
         let old_doc_id = VaultSyncConfig::doc_id_for_path(old_path);
