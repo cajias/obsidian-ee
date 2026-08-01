@@ -26,7 +26,7 @@ graph TD
 | `collab-relay` | WebSocket relay server | `tokio`, `tokio-tungstenite` |
 | `collab-proto` | Protocol message types | `serde`, `serde_json` |
 | `collab-cli` | Reference CLI client | `clap`, `collab-core` |
-| `collab-wasm` | WASM bindings for browser | `wasm-bindgen`, `yrs`, `aes-gcm` |
+| `collab-wasm` | WASM bindings for browser | `wasm-bindgen`, `collab-core` |
 | `collab-watcher` | File system watcher | `notify`, `tokio` |
 | `e2e-tests` | Integration test suite | All crates |
 
@@ -75,7 +75,7 @@ sequenceDiagram
 block-beta
     columns 1
     A["Obsidian Plugin (TypeScript)\nmain.ts → CollabClient → EditorSync"]
-    B["WASM Bridge (collab-wasm)\nCollabCore: Yrs CRDT + AES-256-GCM"]
+    B["WASM Bridge (collab-wasm)\nBindings over collab-core: Yrs CRDT + MLS"]
     C["Protocol (collab-proto)\nClientMessage | ServerMessage | MlsMessageType"]
     D["Core Library (collab-core)\nCollabDocument | MlsDocumentGroup | Registry\nEncryptedDocument | ConnectionStateMachine"]
     E["Relay Server (collab-relay)\nRelayServer | MessageRouter | OfflineQueue"]
@@ -95,7 +95,7 @@ graph BT
     cli[collab-cli] --> core
     relay ~~~ cli
 
-    wasm[collab-wasm<br/>independent, yrs + aes-gcm]
+    wasm[collab-wasm<br/>bindings] --> core
     plugin[plugins/obsidian-ee<br/>TypeScript] --> wasm
 
     watcher[collab-watcher<br/>independent, file system events]
@@ -104,7 +104,7 @@ graph BT
 Key design decisions:
 - `collab-proto` has zero business logic; it's a pure type definition crate
 - `collab-core` and `collab-relay` depend on `collab-proto` but not on each other
-- `collab-wasm` uses a simplified encryption model (AES-256-GCM) as an MVP, with MLS planned for future integration
+- `collab-wasm` is a thin wasm-bindgen layer over `collab-core`: the same MLS (openmls) encryption path runs in the browser as in native clients. There is no separate WASM crypto model.
 - `collab-watcher` is fully independent and communicates via async channels
 
 ## Connection State Machine
