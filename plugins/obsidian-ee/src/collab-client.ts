@@ -185,6 +185,27 @@ export class CollabClient {
         });
     }
 
+    /**
+     * Run establishGroup(), rejecting this connect() attempt and tearing down the
+     * socket if it throws instead of letting the throw abort onopen unhandled.
+     * WasmEncryptedDocument.create()/generate_key_package() are wasm-bindgen
+     * Result<T, JsError> calls that throw on a crypto-provider/entropy failure;
+     * without this guard connectPromise would never settle (the exact hang class
+     * already fixed once for the sibling identify/subscribe branch in connect()).
+     */
+    private tryEstablishGroup(reject: (reason?: unknown) => void): boolean {
+        try {
+            this.establishGroup();
+            return true;
+        } catch (error) {
+            console.error('[CollabClient] establishGroup failed:', error);
+            this.ws?.close();
+            this.ws = null;
+            reject(error);
+            return false;
+        }
+    }
+
     connect(): Promise<void> {
         // Prevent concurrent connection attempts
         if (this.connectPromise) {
@@ -223,7 +244,9 @@ export class CollabClient {
                         return;
                     }
 
-                    this.establishGroup();
+                    if (!this.tryEstablishGroup(reject)) {
+                        return;
+                    }
 
                     this.flushMessageQueue();
                     this.reconnectAttempts = 0;
@@ -387,21 +410,40 @@ export class CollabClient {
         }
     }
 
+    /**
+     * Reject a frame routed for a different document before touching any crypto
+     * state. The relay is untrusted, so a mismatched doc_id means a misroute or a
+     * cross-document replay attempt. (The AEAD/MLS binding of the LOCAL docId
+     * downstream is the load-bearing guarantee; this rejects the frame early with
+     * a clear error, shared by every inbound frame type that carries a doc_id.)
+     */
+    private assertDocId(frameType: string, docId: string | undefined): void {
+        if (docId !== undefined && docId !== this.config.docId) {
+            throw new Error(
+                `${frameType} doc_id mismatch: expected ${this.config.docId}, got ${docId}`
+            );
+        }
+    }
+
+    private reportError(type: CollabError['type'], label: string, error: unknown): void {
+        console.error(label, error);
+        if (this.onErrorCallback) {
+            const collabError: CollabError = {
+                type,
+                message: extractErrorMessage(error),
+                docId: this.config.docId,
+                originalError: error instanceof Error ? error : undefined,
+            };
+            this.onErrorCallback(collabError);
+        }
+    }
+
     private handleYrsUpdate(message: YrsUpdateMessage): void {
         try {
             if (!message.encrypted || !Array.isArray(message.encrypted)) {
                 throw new Error('Invalid yrs_update message: missing or invalid encrypted field');
             }
-            // Defense in depth: reject a frame routed for a different document
-            // before touching the crypto core. The relay is untrusted, so a
-            // mismatched doc_id means a misroute or a cross-document replay attempt.
-            // (The AEAD doc_id binding below is the load-bearing guarantee; this
-            // rejects the frame early with a clear error.)
-            if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
-                throw new Error(
-                    `yrs_update doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
-                );
-            }
+            this.assertDocId('yrs_update', message.doc_id);
             // Fail closed: an update that arrives before the MLS group is
             // established cannot be decrypted. Surface it as an error rather than
             // silently dropping it.
@@ -416,16 +458,7 @@ export class CollabClient {
                 this.onUpdateCallback(this.doc.get_content());
             }
         } catch (error) {
-            console.error('Failed to apply update:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'decryption',
-                    message: extractErrorMessage(error),
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
-            }
+            this.reportError('decryption', 'Failed to apply update:', error);
         }
     }
 
@@ -440,17 +473,7 @@ export class CollabClient {
             if (!message.payload || !Array.isArray(message.payload)) {
                 throw new Error('Invalid mls_handshake message: missing or invalid payload');
             }
-            // Trust boundary: doc_id early-reject mirroring handleYrsUpdate. The
-            // untrusted relay routing a frame for a different document must be
-            // rejected BEFORE any MLS state is touched — e.g. an owner must not
-            // mint a Welcome for a key package whose frame claims another doc.
-            // (The welcome path additionally binds the LOCAL docId; this rejects
-            // misroutes early and loudly.)
-            if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
-                throw new Error(
-                    `mls_handshake doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
-                );
-            }
+            this.assertDocId('mls_handshake', message.doc_id);
             const payload = new Uint8Array(message.payload);
 
             switch (message.message_type) {
@@ -494,16 +517,7 @@ export class CollabClient {
                     break;
             }
         } catch (error) {
-            console.error('Failed to process MLS handshake:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'sync',
-                    message: extractErrorMessage(error),
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
-            }
+            this.reportError('sync', 'Failed to process MLS handshake:', error);
         }
     }
 

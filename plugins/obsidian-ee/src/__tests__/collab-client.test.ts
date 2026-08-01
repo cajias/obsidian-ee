@@ -302,6 +302,30 @@ describe('CollabClient', () => {
             // Restore original WebSocket
             global.WebSocket = OriginalWebSocket;
         });
+
+        it('rejects (does not hang) when establishGroup throws during onopen', async () => {
+            // WasmEncryptedDocument.create() is a wasm-bindgen Result<T, JsError> call
+            // that throws on a crypto-provider/entropy failure. Without a catch around
+            // establishGroup(), that throw would abort onopen before resolve()/reject()
+            // ran, leaving connectPromise permanently unsettled — the exact hang class
+            // already fixed once for the sibling identify/subscribe branch.
+            (WasmEncryptedDocument.create as unknown as jest.Mock).mockImplementationOnce(() => {
+                throw new Error('crypto provider unavailable');
+            });
+
+            const connectPromise = client.connect();
+            jest.runAllTimers();
+
+            await expect(connectPromise).rejects.toThrow('crypto provider unavailable');
+            expect((client as any).ws).toBeNull();
+
+            // The dedup guard must be cleared so a retry is possible instead of
+            // returning the same never-settling promise forever.
+            const retryPromise = client.connect();
+            expect(retryPromise).not.toBe(connectPromise);
+            jest.runAllTimers();
+            await expect(retryPromise).resolves.toBeUndefined();
+        });
     });
 
     describe('sendUpdate', () => {
