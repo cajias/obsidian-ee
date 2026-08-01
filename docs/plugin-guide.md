@@ -13,7 +13,7 @@ graph TD
         Sync --> Client
         Client["CollabClient (collab-client.ts)<br/>WebSocket connection<br/>Reconnection with backoff<br/>Message queue (1000 max)<br/>Text diff algorithm"]
         Client --> Core
-        Core["CollabCore (WASM module)<br/>Yrs CRDT operations<br/>AES-256-GCM encryption"]
+        Core["collab-wasm (WASM module)<br/>Yrs CRDT operations<br/>MLS group encryption"]
     end
     Client -->|"wss:// WebSocket"| Relay[Relay Server]
 ```
@@ -98,9 +98,9 @@ The `extractErrorMessage()` function in `collab-client.ts` and `wrapError()` in 
 
 ## Security Notes
 
-1. **Placeholder Key**: The current implementation uses an all-zeros encryption key (`new Uint8Array(32)`). This is insecure and only for development.
+1. **Key Management**: There is no configurable encryption key. Keys are established by the MLS handshake (owner creates the group; a joiner sends a key package and joins via a Welcome) and ratchet with each epoch. Key material lives only inside the WASM module's memory and is never persisted to `data.json`.
 2. **Transport Security**: Production deployments must use `wss://` (TLS-encrypted WebSocket).
-3. **Key Management**: Production must generate keys via `crypto.getRandomValues()` and exchange them securely (planned: MLS key exchange via WASM).
+3. **Fail Closed**: Updates arriving before the MLS group is established, or frames whose `doc_id` does not match the local session, are rejected with an error rather than processed. See `docs/security.md` for the full threat model.
 
 ## Testing
 
@@ -121,15 +121,15 @@ npx playwright test
 | `main.test.ts` | Plugin lifecycle, WASM initialization |
 | `collab-client.test.ts` | WebSocket client, reconnection, message queue |
 | `editor-sync.test.ts` | Editor binding, remote updates, cursor preservation |
-| `encryption-integration.test.ts` | WASM encryption roundtrip |
-| `wasm-integration.test.ts` | WASM CRDT operations |
-| `two-user-integration.test.ts` | Multi-user collaboration |
+| `mls-wasm.test.ts` | MLS group create/join/commit via the compiled WASM |
+| `no-aes-regression.test.ts` | Guard: no AES/pre-shared-key surface reappears in the plugin |
+| `two-user-mls-integration.test.ts` | Two clients: MLS handshake + encrypted sync |
 
 ### E2E Tests
 
 | Test File | Description |
 |-----------|-------------|
-| `two-user-sync.spec.ts` | Real two-client AES-PSK sync + fail-closed (wrong-key, all-zeros-key) assertions over the mock relay, using the compiled WASM in the Playwright/Node context. Does not drive Electron/Obsidian yet; a full Obsidian-driving E2E is tracked separately. |
+| `two-user-sync.spec.ts` | Real two-client MLS handshake (key_package -> welcome -> commit) and encrypted sync over the mock relay, using the compiled WASM in the Playwright/Node context. Does not drive Electron/Obsidian yet; a full Obsidian-driving E2E is tracked separately. |
 | `mock-relay.ts` | WebSocket mock for testing without real server |
 
 ## Build

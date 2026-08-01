@@ -13,9 +13,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen.workspace = true
 yrs.workspace = true
-js-sys = "0.3"
-# For simplified encryption (MVP) - will be replaced with MLS later
-aes-gcm = "0.10"
 # MLS engine reused across the wasm-bindgen boundary (issue #28).
 collab-core = { path = "../collab-core" }
 
@@ -23,10 +20,3 @@ collab-core = { path = "../collab-core" }
 # native dependency graph, so feature unification can never turn it on for native.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 collab-core = { path = "../collab-core", features = ["wasm-clock"] }
-
-[dependencies.web-sys]
-workspace = true
-features = ["console", "Crypto", "SubtleCrypto"]
-
-[dependencies.getrandom]
-workspace = true

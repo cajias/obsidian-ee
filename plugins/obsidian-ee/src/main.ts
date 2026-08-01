@@ -1,47 +1,20 @@
 import { Plugin, Notice, MarkdownView, PluginSettingTab, App, Setting } from 'obsidian';
-import init, { CollabCore } from './wasm/collab_wasm';
-import { CollabClient, CollabClientConfig } from './collab-client';
+import init from './wasm/collab_wasm';
+import { CollabClient, CollabClientConfig, CollabRole } from './collab-client';
 import { EditorSync } from './editor-sync';
 
 interface CollabPluginSettings {
     relayUrl: string;
-    // Base64-encoded 32-byte AES-256 key shared out-of-band with collaborators.
-    // MVP: stored in plaintext in the vault's data.json. This is transitional PSK
-    // material — MLS-derived keys (#28) will replace manual key entry. Empty by
-    // default so sessions fail closed until the user sets a real key.
-    encryptionKey: string;
 }
 
 // SECURITY: Default uses ws:// for local development only.
 // Production deployments MUST use wss:// (TLS-encrypted WebSocket).
 const DEFAULT_SETTINGS: CollabPluginSettings = {
     relayUrl: 'ws://localhost:8080',
-    encryptionKey: '',
 };
-
-/**
- * Decode a base64 string to bytes, returning null if it is empty or not valid
- * base64. atob/btoa are native in both the Obsidian (Electron) renderer and Node.
- */
-function decodeBase64Key(base64: string): Uint8Array | null {
-    if (!base64) {
-        return null;
-    }
-    try {
-        return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
-    } catch {
-        return null;
-    }
-}
-
-/** Encode bytes to a base64 string (inverse of decodeBase64Key). */
-function encodeBase64Key(key: Uint8Array): string {
-    return btoa(String.fromCharCode(...key));
-}
 
 export default class CollabPlugin extends Plugin {
     settings: CollabPluginSettings = DEFAULT_SETTINGS;
-    private collabCore: CollabCore | null = null;
     private collabClient: CollabClient | null = null;
     private editorSync: EditorSync | null = null;
     private wasmInitialized = false;
@@ -54,10 +27,19 @@ export default class CollabPlugin extends Plugin {
 
         try {
             await this.initWasm();
+            // Two entry points: the owner creates the MLS group; the joiner joins
+            // an existing one via a Welcome. Role is chosen by which command runs,
+            // not persisted in settings.
             this.addCommand({
-                id: 'start-collab',
-                name: 'Start Collaboration Session',
-                callback: () => this.startSession(),
+                id: 'start-collab-owner',
+                name: 'Start Collaboration (create group)',
+                callback: () => this.startSession('owner'),
+            });
+
+            this.addCommand({
+                id: 'start-collab-join',
+                name: 'Join Collaboration',
+                callback: () => this.startSession('joiner'),
             });
 
             this.addCommand({
@@ -76,8 +58,23 @@ export default class CollabPlugin extends Plugin {
 
     async loadSettings(): Promise<void> {
         try {
-            const loadedData = await this.loadData();
-            this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+            const loadedData = (await this.loadData()) as Record<string, unknown> | null;
+            // Copy ONLY known settings fields. A data.json written by an older
+            // plugin version can carry legacy fields (including plaintext key
+            // material from the removed pre-MLS crypto); picking known fields
+            // drops them in memory.
+            this.settings = {
+                relayUrl:
+                    typeof loadedData?.relayUrl === 'string'
+                        ? loadedData.relayUrl
+                        : DEFAULT_SETTINGS.relayUrl,
+            };
+            // Purge legacy fields from DISK immediately: without this rewrite the
+            // old plaintext pre-MLS key would linger in data.json until the user
+            // happened to edit a setting and trigger saveSettings.
+            if (loadedData && Object.keys(loadedData).some((key) => !(key in this.settings))) {
+                await this.saveSettings();
+            }
         } catch (error) {
             console.error('[CollabPlugin] Failed to load settings, using defaults:', error);
             this.settings = { ...DEFAULT_SETTINGS };
@@ -96,11 +93,6 @@ export default class CollabPlugin extends Plugin {
 
     async initWasm(): Promise<void> {
         if (this.wasmInitialized) {
-            // WASM module is already loaded; recreate the core cheaply if a prior
-            // stopSession() freed it (F16 lazy re-init). No need to reload the module.
-            if (!this.collabCore) {
-                this.collabCore = new CollabCore();
-            }
             return;
         }
 
@@ -134,12 +126,11 @@ export default class CollabPlugin extends Plugin {
             );
         }
 
-        this.collabCore = new CollabCore();
         this.wasmInitialized = true;
         console.log('WASM initialized successfully');
     }
 
-    async startSession(): Promise<void> {
+    async startSession(role: CollabRole): Promise<void> {
         // F15: Guard against double-start. Starting a second session without stopping
         // the first would orphan the first CollabClient (its WebSocket stays open) and
         // EditorSync, and overwrite editorChangeHandler so stopSession() could no longer
@@ -149,20 +140,11 @@ export default class CollabPlugin extends Plugin {
             return;
         }
 
-        // F16: stopSession() frees and nulls collabCore; re-initialize it lazily here
-        // so we don't hold a live WASM core between sessions.
-        if (!this.collabCore) {
-            try {
-                await this.initWasm();
-            } catch (error) {
-                console.error('[CollabPlugin] Failed to initialize WASM:', error);
-                new Notice('Failed to initialize collaboration plugin');
-                return;
-            }
-        }
-
-        if (!this.collabCore) {
-            new Notice('Plugin not initialized');
+        try {
+            await this.initWasm();
+        } catch (error) {
+            console.error('[CollabPlugin] Failed to initialize WASM:', error);
+            new Notice('Failed to initialize collaboration plugin');
             return;
         }
 
@@ -172,31 +154,20 @@ export default class CollabPlugin extends Plugin {
             return;
         }
 
-        // SECURITY: Fail closed if no real key is configured. An empty, malformed,
-        // wrong-length, or all-zeros key is not a usable secret — starting a session
-        // with one would "encrypt" documents with publicly-known bytes. The user must
-        // set a key in settings (Generate random key, then share it out-of-band).
-        const encryptionKey = decodeBase64Key(this.settings.encryptionKey);
-        if (!encryptionKey || encryptionKey.length !== 32 || encryptionKey.every((b) => b === 0)) {
-            new Notice(
-                'Set a valid encryption key in the E2E Collaboration settings before starting a session.',
-                8000
-            );
-            return;
-        }
-
         const config: CollabClientConfig = {
             relayUrl: this.settings.relayUrl,
             userId: `user-${Date.now()}`,
             docId: activeView.file?.path || 'unknown',
-            // MVP: key comes from settings (plaintext in data.json), shared out-of-band.
-            // Transitional until MLS-derived keys land (#28).
-            encryptionKey,
+            // owner creates the MLS group; joiner joins via a Welcome. No key input:
+            // the group's keys are derived by MLS, so a session fails closed until a
+            // group is established (CollabClient.sendUpdate returns false, no plaintext).
+            role,
         };
 
         try {
-            // Create client and editor sync
-            this.collabClient = new CollabClient(this.collabCore, config);
+            // Create client and editor sync. CollabClient owns the MLS document
+            // lifetime and frees it in disconnect().
+            this.collabClient = new CollabClient(config);
             this.editorSync = new EditorSync(this.collabClient);
 
             // Register error and disconnect callbacks
@@ -248,21 +219,10 @@ export default class CollabPlugin extends Plugin {
             this.editorSync = null;
         }
 
+        // CollabClient owns the MLS document and frees it in disconnect().
         if (this.collabClient) {
             this.collabClient.disconnect();
             this.collabClient = null;
-        }
-
-        // F16: Free CollabCore to release WASM memory and null the reference.
-        // startSession() re-creates it lazily via initWasm(), so we don't hold a
-        // live core between sessions (and onunload() won't allocate one just to free it).
-        if (this.collabCore) {
-            try {
-                this.collabCore.free();
-            } catch (error) {
-                console.error('[CollabPlugin] Error freeing WASM resources:', error);
-            }
-            this.collabCore = null;
         }
 
         new Notice('Collaboration session stopped');
@@ -275,15 +235,6 @@ export default class CollabPlugin extends Plugin {
             this.stopSession();
         } catch (error) {
             console.error('[CollabPlugin] Error stopping session during unload:', error);
-        }
-
-        if (this.collabCore) {
-            try {
-                this.collabCore.free();
-            } catch (error) {
-                console.error('[CollabPlugin] Error freeing WASM resources:', error);
-            }
-            this.collabCore = null;
         }
     }
 }
@@ -315,32 +266,5 @@ class CollabSettingTab extends PluginSettingTab {
                         await plugin.saveSettings();
                     })
             );
-
-        const keySetting = new Setting(containerEl)
-            .setName('Encryption Key (base64)')
-            .setDesc(
-                'Base64-encoded 32-byte AES-256 key. All collaborators on a document ' +
-                    'must use the same key; share it over a secure channel. Generate a ' +
-                    'random key below, or paste one you already share.'
-            )
-            .addText((text) =>
-                text
-                    .setPlaceholder('base64 32-byte key')
-                    .setValue(plugin.settings.encryptionKey)
-                    .onChange(async (value) => {
-                        plugin.settings.encryptionKey = value.trim();
-                        await plugin.saveSettings();
-                    })
-            );
-
-        keySetting.addButton((button) =>
-            button.setButtonText('Generate random key').onClick(async () => {
-                const key = crypto.getRandomValues(new Uint8Array(32));
-                plugin.settings.encryptionKey = encodeBase64Key(key);
-                await plugin.saveSettings();
-                // Re-render so the text field shows the freshly generated key.
-                this.display();
-            })
-        );
     }
 }

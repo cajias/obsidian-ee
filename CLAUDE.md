@@ -90,9 +90,13 @@ zero-knowledge router: a ciphertext valid for one document MUST fail authenticat
 applied to another. Bind the LOCALLY-TRUSTED context (e.g. `config.docId`), NEVER a
 value taken from the inbound frame.
 
-Never ship a real encryption path that accepts a placeholder/all-zeros/hardcoded key.
-Keep the fail-closed guards (`validateConfig` / `startSession`) and cover them with a
-test asserting an all-zeros key is rejected.
+Encryption is MLS-only: there is no user-supplied or configured key material, so
+"reject a placeholder key" is not the guard anymore. The fail-closed invariant is that
+NO update is encrypted, sent, or applied before the MLS group is established — an
+owner must have created its group and a joiner must have consumed a Welcome. Keep the
+guards that make `sendUpdate` refuse (return false, send nothing) without an MLS group,
+and cover them with a negative-path test proving a pre-Welcome client emits no frame
+and no plaintext ever leaves the client.
 
 When a security audit CONFIRMS a trust-boundary finding, the fix MUST leave a
 negative-path regression test behind that is RED before the fix and GREEN after — the

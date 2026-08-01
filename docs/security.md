@@ -4,9 +4,9 @@ This document describes the encryption architecture, threat model, and security 
 
 ## Cryptographic Primitives
 
-### MLS (RFC 9420) - collab-core
+### MLS (RFC 9420)
 
-Used for group key management in the native Rust crates.
+Used for group key management across all crates: the native Rust crates (`collab-core`) and the WASM/browser client (`collab-wasm`, which wraps `collab-core`'s MLS engine — there is no separate browser crypto path).
 
 | Parameter | Value |
 |-----------|-------|
@@ -17,18 +17,7 @@ Used for group key management in the native Rust crates.
 | Signatures | Ed25519 |
 | Implementation | `openmls 0.7` |
 
-### AES-256-GCM - collab-wasm (MVP)
-
-The WASM module uses a simplified encryption scheme as a stepping stone toward full MLS integration in the browser.
-
-| Parameter | Value |
-|-----------|-------|
-| Algorithm | AES-256-GCM (AEAD) |
-| Key Size | 256 bits (32 bytes) |
-| Nonce Size | 96 bits (12 bytes) |
-| Nonce Generation | `getrandom` (OS CSPRNG) |
-| Wire Format | `nonce (12B) || ciphertext` |
-| Implementation | `aes-gcm` crate via `wasm-bindgen` |
+The AES-128-GCM AEAD in the ciphersuite is internal to MLS; there is no standalone pre-shared-key encryption path. The WASM/browser client reaches this same MLS engine via `collab-wasm`.
 
 ## Threat Model
 
@@ -38,7 +27,7 @@ The WASM module uses a simplified encryption scheme as a stepping stone toward f
 |--------|------------|
 | **Relay server compromise** | E2E encryption; relay never has keys |
 | **Network eavesdropping** | MLS encryption + TLS transport |
-| **Message tampering** | AEAD authentication (AES-GCM) |
+| **Message tampering** | MLS authenticated encryption (AEAD) |
 | **Replay attacks** | MLS epoch tracking |
 | **Forward secrecy violation** | MLS key ratcheting per epoch |
 | **Post-compromise recovery** | MLS epoch advancement on membership changes |
@@ -55,6 +44,20 @@ The WASM module uses a simplified encryption scheme as a stepping stone toward f
 | **Denial of service** | No rate limiting on the relay server currently |
 | **Document access control** | Subscription-based only; no cryptographic access control beyond MLS group membership |
 | **User authentication** | User IDs are self-asserted; no identity verification system |
+| **Group admission control** | The owner auto-invites ANY key package arriving on the document channel; see below |
+
+#### Open admission (current model)
+
+In the plugin client (`plugins/obsidian-ee/src/collab-client.ts`, `handleMlsHandshake`),
+an owner with an established group answers every `key_package` message received on its
+document channel with a Welcome. There is no allowlist, invitation token, or user
+confirmation step: anyone who can reach the relay and send a key package on a known
+`doc_id` is admitted to the MLS group and can decrypt all subsequent updates.
+Relay-reachability therefore equals admission today. MLS still guarantees everything
+above (the relay itself learns nothing, non-members who were never welcomed cannot
+decrypt), but the decision of WHO becomes a member is unguarded. An explicit admission
+gate (owner approval / pre-shared invite verification before `create_invite`) is
+deliberately deferred and tracked in a follow-up issue.
 
 ## Zero-Knowledge Relay Design
 
@@ -135,23 +138,14 @@ flowchart TD
     F --> G["CollabDocument::apply_update(bytes)"]
 ```
 
-### WASM (collab-wasm, MVP)
-
-```mermaid
-flowchart TD
-    A[Plaintext<br/>Yrs state bytes] --> B["AES-256-GCM encrypt<br/>12-byte random nonce (CSPRNG)<br/>32-byte shared key"]
-    B --> C["Wire format: nonce (12B) ‖ ciphertext"]
-    C --> D[Network transmission]
-    D --> E["AES-256-GCM decrypt<br/>Extract nonce from first 12 bytes<br/>Verify AEAD authentication tag"]
-    E --> F[Plaintext<br/>Yrs state bytes]
-```
+The WASM/browser client (`collab-wasm`) uses this same MLS flow: it wraps `collab-core`'s `EncryptedDocument`, so encryption and decryption go through `MlsDocumentGroup` exactly as above.
 
 ## Security Properties by Layer
 
 | Layer | Property | Mechanism |
 |-------|----------|-----------|
 | **Transport** | Confidentiality | TLS (wss://) |
-| **Application** | E2E Encryption | MLS / AES-GCM |
+| **Application** | E2E Encryption | MLS |
 | **Application** | Authentication | AEAD tag verification |
 | **Application** | Integrity | AEAD tag verification |
 | **MLS** | Forward Secrecy | Epoch-based key ratcheting |
@@ -164,16 +158,14 @@ flowchart TD
 
 ### Current MVP Limitations
 
-1. **WASM uses static shared key**: The Obsidian plugin currently uses AES-256-GCM with a pre-shared key. MLS integration in WASM is planned.
-2. **Placeholder encryption key**: The plugin default uses an all-zeros key for development. Production must use `crypto.getRandomValues()` for key generation.
-3. **BasicCredential only**: MLS uses simple string-based credentials. X.509 certificate support would provide stronger identity guarantees.
-4. **No key persistence**: MLS group state is in-memory only. Restarting a client requires re-joining the group.
-5. **No revocation**: Member removal and key revocation are not yet implemented.
+1. **BasicCredential only**: MLS uses simple string-based credentials. X.509 certificate support would provide stronger identity guarantees.
+2. **No key persistence**: MLS group state is in-memory only. Restarting a client requires re-joining the group.
+3. **No revocation**: Member removal and key revocation are not yet implemented.
 
 ### Production Requirements
 
-- [ ] Replace placeholder encryption key with secure key exchange
-- [ ] Implement MLS in WASM (via `openmls` compiled to WASM or a JS MLS library)
+- [x] Replace placeholder encryption key with secure key exchange (MLS key exchange; no pre-shared key)
+- [x] Implement MLS in WASM (`collab-wasm` wraps `collab-core`'s MLS engine)
 - [ ] Add user identity verification (e.g., Obsidian account integration)
 - [ ] Implement rate limiting on the relay server
 - [ ] Add TLS termination at the infrastructure level

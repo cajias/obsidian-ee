@@ -20,7 +20,7 @@ use e2e_tests::helpers::TestClient;
 /// Alice's encrypted update off the wire but cannot decrypt it — proving
 /// fail-closed holds over the real relay, not just in-process.
 ///
-/// GIVEN Alice and Bob establish a real MLS group over the relay (KeyPackage →
+/// GIVEN Alice and Bob establish a real MLS group over the relay (`KeyPackage` →
 /// Welcome crossing the wire), AND Eve is a third client with her OWN
 /// independent MLS group (wrong key) subscribed to the same `doc_id`.
 /// WHEN Alice edits and sends an encrypted `YrsUpdate` over the relay (fanned

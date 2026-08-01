@@ -16,34 +16,20 @@ beforeAll(async () => {
     wasm = await loadRealWasm();
 });
 
-/** True if `needle`'s bytes appear as a contiguous window in `haystack`. */
-function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
-    if (needle.length === 0 || needle.length > haystack.length) {
-        return false;
-    }
-    for (let i = 0; i <= haystack.length - needle.length; i++) {
-        let match = true;
-        for (let j = 0; j < needle.length; j++) {
-            if (haystack[i + j] !== needle[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            return true;
-        }
-    }
-    return false;
+/** Arrange a two-member MLS group: Alice owns doc1, Bob joins via a Welcome. */
+function setupAliceAndBob(w: Wasm) {
+    const { WasmEncryptedDocument, generate_key_package } = w;
+    const bobPending = generate_key_package('bob');
+    const alice = WasmEncryptedDocument.create('doc1', 'alice');
+    const invite = alice.create_invite(bobPending.key_package);
+    const bob = WasmEncryptedDocument.join(invite, bobPending);
+    return { alice, bob };
 }
 
 describe('MLS WASM surface', () => {
     it('round-trips an encrypted update between two group members', () => {
         // Arrange: Alice owns doc1, Bob joins via a Welcome.
-        const { WasmEncryptedDocument, generate_key_package } = wasm;
-        const bobPending = generate_key_package('bob');
-        const alice = WasmEncryptedDocument.create('doc1', 'alice');
-        const invite = alice.create_invite(bobPending.key_package);
-        const bob = WasmEncryptedDocument.join(invite, bobPending);
+        const { alice, bob } = setupAliceAndBob(wasm);
 
         // Act: Alice edits and ships the encrypted op to Bob.
         alice.insert(0, 'Hello');
@@ -57,18 +43,16 @@ describe('MLS WASM surface', () => {
         expect(bob.epoch).toBe(1n);
 
         // The plaintext must not appear verbatim in the ciphertext.
+        // Buffer (extends Uint8Array) is available under Jest/Node and its
+        // .includes() already does contiguous byte-subsequence containment.
         const plaintext = new TextEncoder().encode('Hello');
-        expect(containsBytes(op.ciphertext, plaintext)).toBe(false);
+        expect(Buffer.from(op.ciphertext).includes(Buffer.from(plaintext))).toBe(false);
     });
 
     it('rejects a ciphertext from a different group (cross-group replay)', () => {
         // Arrange: group1 = alice + bob; carol is in an unrelated doc2 group.
-        const { WasmEncryptedDocument, generate_key_package } = wasm;
-        const bobPending = generate_key_package('bob');
-        const alice = WasmEncryptedDocument.create('doc1', 'alice');
-        const invite = alice.create_invite(bobPending.key_package);
-        WasmEncryptedDocument.join(invite, bobPending);
-        const carol = WasmEncryptedDocument.create('doc2', 'carol');
+        const { alice } = setupAliceAndBob(wasm);
+        const carol = wasm.WasmEncryptedDocument.create('doc2', 'carol');
 
         // Act: alice produces a real op for her group.
         alice.insert(0, 'secret');
@@ -105,11 +89,7 @@ describe('MLS WASM surface', () => {
 
     it('clamps an out-of-range delete instead of trapping the wasm instance', () => {
         // Arrange: a real two-member group so this exercises the full MLS surface.
-        const { WasmEncryptedDocument, generate_key_package } = wasm;
-        const bobPending = generate_key_package('bob');
-        const alice = WasmEncryptedDocument.create('doc1', 'alice');
-        const invite = alice.create_invite(bobPending.key_package);
-        WasmEncryptedDocument.join(invite, bobPending);
+        const { alice } = setupAliceAndBob(wasm);
         alice.insert(0, 'Hello');
 
         // Act: delete overruns content (index 2, len 50 on a 5-char doc).
@@ -129,5 +109,18 @@ describe('MLS WASM surface', () => {
         expect(
             (doc as unknown as { has_encryption_key?: unknown }).has_encryption_key
         ).toBeUndefined();
+    });
+
+    it('exposes no AES surface anywhere on the loaded WASM MODULE (AES-256-GCM path removed)', async () => {
+        // Module-level assertion (not just one document): the whole AES CollabCore
+        // surface is gone from the compiled artifact after #28. RED before the AES
+        // removal (CollabCore + set/has_encryption_key were exported), GREEN after.
+        const mod = (await import('../wasm/collab_wasm')) as unknown as Record<string, unknown>;
+        expect(mod.CollabCore).toBeUndefined();
+        expect(mod.set_encryption_key).toBeUndefined();
+        expect(mod.has_encryption_key).toBeUndefined();
+        // The MLS surface is what remains.
+        expect(mod.WasmEncryptedDocument).toBeDefined();
+        expect(mod.generate_key_package).toBeDefined();
     });
 });

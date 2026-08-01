@@ -1,10 +1,27 @@
-import { CollabCore } from './wasm/collab_wasm';
+import {
+    WasmEncryptedDocument,
+    WasmInvite,
+    WasmPendingMember,
+    generate_key_package,
+} from './wasm/collab_wasm';
+
+export type CollabRole = 'owner' | 'joiner';
+
+// Inbound frames come from an UNTRUSTED relay (zero-knowledge threat model), so
+// network-fed collections are bounded by BYTES before any allocation: a huge
+// frame would otherwise flow JSON.parse -> number[] -> Uint8Array -> Rust
+// Vec<u8> and OOM the Electron renderer. Legit frames are already capped at
+// 1 MiB by the relay itself (MAX_MESSAGE_SIZE in collab-relay/src/relay.rs);
+// 2 MiB here leaves slack for relay-added fields. Measured on the raw JSON
+// text (UTF-16 code units ~= bytes for this ASCII protocol), which strictly
+// bounds every array parsed out of it.
+const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 
 export interface CollabClientConfig {
     relayUrl: string;
     userId: string;
     docId: string;
-    encryptionKey: Uint8Array;
+    role: CollabRole; // owner creates the MLS group; joiner joins via a Welcome
 }
 
 export type UpdateCallback = (text: string) => void;
@@ -24,6 +41,13 @@ export interface YrsUpdateMessage {
     encrypted: number[];
     doc_id?: string;
     epoch?: number;
+}
+
+export interface MlsHandshakeMessage {
+    type: 'mls_handshake';
+    doc_id?: string;
+    payload: number[];
+    message_type: 'key_package' | 'welcome' | 'commit';
 }
 
 /**
@@ -96,28 +120,17 @@ function validateConfig(config: CollabClientConfig): void {
         throw new ConfigValidationError('docId must be a non-empty string');
     }
 
-    // Validate encryptionKey
-    if (!(config.encryptionKey instanceof Uint8Array)) {
-        throw new ConfigValidationError('encryptionKey must be a Uint8Array');
-    }
-    if (config.encryptionKey.length !== 32) {
-        throw new ConfigValidationError(
-            `encryptionKey must be exactly 32 bytes for AES-256, got ${config.encryptionKey.length} bytes`
-        );
-    }
-    // Fail closed on the all-zeros placeholder key: an all-zeros key is not a real
-    // secret, so accepting it would ship documents "encrypted" with a publicly-known
-    // key. This guard is the single choke point every caller routes through.
-    if (config.encryptionKey.every((b) => b === 0)) {
-        throw new ConfigValidationError(
-            'encryptionKey must not be all zeros (placeholder key is insecure)'
-        );
+    // Validate role
+    if (config.role !== 'owner' && config.role !== 'joiner') {
+        throw new ConfigValidationError('role must be "owner" or "joiner"');
     }
 }
 
 export class CollabClient {
     private ws: WebSocket | null = null;
-    private collabCore: CollabCore;
+    private doc: WasmEncryptedDocument | null = null;
+    private pending: WasmPendingMember | null = null;
+    private groupEstablished = false;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
     private onDisconnectCallback: DisconnectCallback | null = null;
@@ -132,11 +145,76 @@ export class CollabClient {
     private isInitialConnect = true;
     private connectPromise: Promise<void> | null = null;
 
-    constructor(collabCore: CollabCore, config: CollabClientConfig) {
+    constructor(config: CollabClientConfig) {
         validateConfig(config);
-        this.collabCore = collabCore;
         this.config = config;
-        this.collabCore.set_encryption_key(config.encryptionKey);
+    }
+
+    /**
+     * Establish the MLS group EXACTLY ONCE, on the first successful connect.
+     * MLS group state is long-lived and persists across reconnects (only
+     * `this.ws` is recreated), so onopen must NOT re-run this on a reconnect:
+     * re-creating would spawn a NEW empty solo group at epoch 0 and orphan the
+     * real group. This guard satisfies the CLAUDE.md reconnect-lifecycle
+     * invariant "guard against a second start that would orphan the prior
+     * client/handle."
+     * - owner: creates the group document immediately.
+     * - joiner: generates a single-use key package and ships it as an
+     *   mls_handshake frame; `this.doc` stays null until the Welcome arrives.
+     *
+     * ponytail: first-cut behavior — a joiner whose socket drops mid-handshake
+     * (before the Welcome) stays un-joined and fails closed (no plaintext), which
+     * is strictly better than a divergent group. A mid-handshake resume state
+     * machine is deliberately NOT built here (YAGNI).
+     */
+    private establishGroup(): void {
+        if (this.groupEstablished) {
+            return;
+        }
+        this.groupEstablished = true;
+        if (this.config.role === 'owner') {
+            this.doc = WasmEncryptedDocument.create(this.config.docId, this.config.userId);
+            return;
+        }
+        this.pending = generate_key_package(this.config.userId);
+        this.send({
+            type: 'mls_handshake',
+            doc_id: this.config.docId,
+            payload: [...this.pending.key_package],
+            message_type: 'key_package',
+        });
+    }
+
+    /**
+     * Shared by every onopen failure branch (identify/subscribe send failure,
+     * establishGroup throwing): close and drop the socket, then reject this
+     * connect() attempt. Without settling here, connectPromise would never
+     * resolve/reject and the dedup guard in connect() would return the same
+     * stale, never-settling promise forever.
+     */
+    private failConnect(reject: (reason?: unknown) => void, error: unknown): void {
+        console.error('[CollabClient]', error);
+        this.ws?.close();
+        this.ws = null;
+        reject(error);
+    }
+
+    /**
+     * Run establishGroup(), rejecting this connect() attempt and tearing down the
+     * socket if it throws instead of letting the throw abort onopen unhandled.
+     * WasmEncryptedDocument.create()/generate_key_package() are wasm-bindgen
+     * Result<T, JsError> calls that throw on a crypto-provider/entropy failure;
+     * without this guard connectPromise would never settle (the exact hang class
+     * already fixed once for the sibling identify/subscribe branch in connect()).
+     */
+    private tryEstablishGroup(reject: (reason?: unknown) => void): boolean {
+        try {
+            this.establishGroup();
+            return true;
+        } catch (error) {
+            this.failConnect(reject, error);
+            return false;
+        }
     }
 
     connect(): Promise<void> {
@@ -169,11 +247,14 @@ export class CollabClient {
                     const subscribed = this.subscribe();
 
                     if (!identified || !subscribed) {
-                        const error = new Error('Failed to send initialization messages');
-                        console.error('[CollabClient]', error.message);
-                        this.ws?.close();
-                        this.ws = null;
-                        reject(error);
+                        this.failConnect(
+                            reject,
+                            new Error('Failed to send initialization messages')
+                        );
+                        return;
+                    }
+
+                    if (!this.tryEstablishGroup(reject)) {
                         return;
                     }
 
@@ -187,21 +268,19 @@ export class CollabClient {
                 };
 
                 this.ws.onerror = (error) => {
-                    console.error('WebSocket error:', error);
                     if (!hasOpened) {
                         // Socket failed before opening. Reject this attempt's promise so
                         // .finally() clears connectPromise (rejection is delegated to
                         // onclose, which follows onerror, to drive the backoff loop).
+                        console.error('WebSocket error:', error);
                         reject(error);
-                    } else if (this.onErrorCallback) {
+                    } else {
                         // Post-open error on a live connection: surface via error callback.
-                        const collabError: CollabError = {
-                            type: 'connection',
-                            message: error instanceof Error ? error.message : 'WebSocket error',
-                            docId: this.config.docId,
-                            originalError: error instanceof Error ? error : undefined,
-                        };
-                        this.onErrorCallback(collabError);
+                        this.reportError(
+                            'connection',
+                            'WebSocket error:',
+                            error instanceof Error ? error : new Error('WebSocket error')
+                        );
                     }
                 };
 
@@ -289,25 +368,26 @@ export class CollabClient {
 
     private handleMessage(data: string): void {
         try {
+            // Reject oversized frames BEFORE parsing (see MAX_INBOUND_FRAME_BYTES).
+            if (data.length > MAX_INBOUND_FRAME_BYTES) {
+                throw new Error(
+                    `inbound frame exceeds ${MAX_INBOUND_FRAME_BYTES} bytes (got ${data.length})`
+                );
+            }
             const message = JSON.parse(data);
 
             switch (message.type) {
                 case 'yrs_update':
                     this.handleYrsUpdate(message as YrsUpdateMessage);
                     break;
+                case 'mls_handshake':
+                    this.handleMlsHandshake(message as MlsHandshakeMessage);
+                    break;
                 case 'subscribed':
                     console.log('Subscribed to document:', message.doc_id);
                     break;
                 case 'error':
-                    console.error('Server error:', message.message);
-                    if (this.onErrorCallback) {
-                        const collabError: CollabError = {
-                            type: 'sync',
-                            message: message.message || 'Server error',
-                            docId: this.config.docId,
-                        };
-                        this.onErrorCallback(collabError);
-                    }
+                    this.reportError('sync', 'Server error:', message.message || 'Server error');
                     break;
                 default:
                     console.warn(
@@ -317,16 +397,47 @@ export class CollabClient {
                     break;
             }
         } catch (error) {
-            console.error('Failed to parse message:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'sync',
-                    message: `Failed to parse message: ${extractErrorMessage(error)}`,
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
-            }
+            // Prefix preserved so callers can distinguish "the relay sent unparseable
+            // JSON" from other 'sync' errors (message asserted on in tests).
+            this.reportError(
+                'sync',
+                'Failed to parse message:',
+                error,
+                'Failed to parse message: '
+            );
+        }
+    }
+
+    /**
+     * Reject a frame routed for a different document before touching any crypto
+     * state. The relay is untrusted, so a mismatched doc_id means a misroute or a
+     * cross-document replay attempt. (The AEAD/MLS binding of the LOCAL docId
+     * downstream is the load-bearing guarantee; this rejects the frame early with
+     * a clear error, shared by every inbound frame type that carries a doc_id.)
+     */
+    private assertDocId(frameType: string, docId: string | undefined): void {
+        if (docId !== undefined && docId !== this.config.docId) {
+            throw new Error(
+                `${frameType} doc_id mismatch: expected ${this.config.docId}, got ${docId}`
+            );
+        }
+    }
+
+    private reportError(
+        type: CollabError['type'],
+        label: string,
+        error: unknown,
+        messagePrefix = ''
+    ): void {
+        console.error(label, error);
+        if (this.onErrorCallback) {
+            const collabError: CollabError = {
+                type,
+                message: `${messagePrefix}${extractErrorMessage(error)}`,
+                docId: this.config.docId,
+                originalError: error instanceof Error ? error : undefined,
+            };
+            this.onErrorCallback(collabError);
         }
     }
 
@@ -335,36 +446,95 @@ export class CollabClient {
             if (!message.encrypted || !Array.isArray(message.encrypted)) {
                 throw new Error('Invalid yrs_update message: missing or invalid encrypted field');
             }
-            // Defense in depth: reject a frame routed for a different document
-            // before touching the crypto core. The relay is untrusted, so a
-            // mismatched doc_id means a misroute or a cross-document replay attempt.
-            // (The AEAD doc_id binding below is the load-bearing guarantee; this
-            // rejects the frame early with a clear error.)
-            if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
-                throw new Error(
-                    `yrs_update doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
-                );
+            this.assertDocId('yrs_update', message.doc_id);
+            // Fail closed: an update that arrives before the MLS group is
+            // established cannot be decrypted. Surface it as an error rather than
+            // silently dropping it.
+            if (this.doc === null) {
+                throw new Error('no MLS group established');
             }
             const encrypted = new Uint8Array(message.encrypted);
-            // Bind the locally-trusted docId as AEAD associated data. A ciphertext
-            // encrypted for another document fails authentication here, so an
-            // untrusted relay cannot splice doc A's content into doc B.
-            this.collabCore.apply_update_encrypted(this.config.docId, encrypted);
+            // MLS authenticates and decrypts under the group's current epoch.
+            this.doc.apply_encrypted_update(encrypted, BigInt(message.epoch ?? 0));
 
             if (this.onUpdateCallback) {
-                this.onUpdateCallback(this.collabCore.get_text());
+                this.onUpdateCallback(this.doc.get_content());
             }
         } catch (error) {
-            console.error('Failed to apply update:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'decryption',
-                    message: extractErrorMessage(error),
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
+            this.reportError('decryption', 'Failed to apply update:', error);
+        }
+    }
+
+    /**
+     * Handle the MLS handshake wire protocol (#51):
+     * - owner receives a joiner's key_package → builds and sends a Welcome.
+     * - joiner receives a Welcome → joins the group, consuming its key package.
+     * - either side receives a commit → applies it to advance the epoch.
+     */
+    private handleMlsHandshake(message: MlsHandshakeMessage): void {
+        try {
+            if (!message.payload || !Array.isArray(message.payload)) {
+                throw new Error('Invalid mls_handshake message: missing or invalid payload');
             }
+            this.assertDocId('mls_handshake', message.doc_id);
+            const payload = new Uint8Array(message.payload);
+
+            switch (message.message_type) {
+                case 'key_package': {
+                    // Only an owner with an established group answers a key package.
+                    if (this.config.role !== 'owner' || !this.doc) {
+                        return;
+                    }
+                    const invite = this.doc.create_invite(payload);
+                    this.send({
+                        type: 'mls_handshake',
+                        doc_id: this.config.docId,
+                        payload: [...invite.welcome],
+                        message_type: 'welcome',
+                    });
+                    break;
+                }
+                case 'welcome': {
+                    // Only a joiner that has a pending key package and is NOT already
+                    // in a group joins. Rejecting when this.doc is set prevents an
+                    // attacker replaying a Welcome to clobber an established group (and
+                    // the join(invite, null!) throw path when there is no pending).
+                    if (this.config.role !== 'joiner' || !this.pending || this.doc) {
+                        return;
+                    }
+                    // Bind the LOCAL docId, never message.doc_id.
+                    const invite = WasmInvite.from_welcome(this.config.docId, payload);
+                    const pending = this.pending;
+                    // Clear the reference BEFORE calling join(), not after: the
+                    // generated wasm-bindgen glue destroys `pending`'s handle
+                    // unconditionally on call entry (pending.__destroy_into_raw()),
+                    // before the Rust call even runs — so the key package is consumed
+                    // whether join() succeeds or throws (e.g. a malformed/malicious
+                    // Welcome from the untrusted relay). If we nulled this.pending only
+                    // on the success line below, a throw here would leave it pointing
+                    // at the now-dead handle, and every later Welcome (including a
+                    // legitimate one) would retry join() with that dead handle and
+                    // throw forever. Clearing in lockstep with the consuming call makes
+                    // a failed join fail closed exactly like the documented
+                    // socket-drops-mid-handshake case: un-joined, no plaintext, a fresh
+                    // session is required to retry.
+                    this.pending = null;
+                    this.doc = WasmEncryptedDocument.join(invite, pending);
+                    break;
+                }
+                case 'commit': {
+                    this.doc?.process_commit(payload);
+                    break;
+                }
+                default:
+                    console.warn(
+                        `[CollabClient] Unknown mls_handshake message_type: ${message.message_type}`,
+                        message
+                    );
+                    break;
+            }
+        } catch (error) {
+            this.reportError('sync', 'Failed to process MLS handshake:', error);
         }
     }
 
@@ -386,16 +556,11 @@ export class CollabClient {
                     return;
                 }
                 this.connect().catch((error) => {
-                    console.error('Reconnect failed:', error);
-                    if (this.onErrorCallback) {
-                        const collabError: CollabError = {
-                            type: 'connection',
-                            message: error instanceof Error ? error.message : 'Reconnection failed',
-                            docId: this.config.docId,
-                            originalError: error instanceof Error ? error : undefined,
-                        };
-                        this.onErrorCallback(collabError);
-                    }
+                    this.reportError(
+                        'connection',
+                        'Reconnect failed:',
+                        error instanceof Error ? error : new Error('Reconnection failed')
+                    );
                 });
             }, delay);
         } else {
@@ -446,42 +611,38 @@ export class CollabClient {
 
         // Apply minimal operations
         if (deleteLen > 0) {
-            this.collabCore.delete(prefixLen, deleteLen);
+            this.doc?.delete(prefixLen, deleteLen);
         }
         if (insertText.length > 0) {
-            this.collabCore.insert(prefixLen, insertText);
+            this.doc?.insert(prefixLen, insertText);
         }
     }
 
     sendUpdate(text: string): boolean {
+        // Fail-closed guard (replaces the old all-zeros-key guard): without an
+        // established MLS group there is no key to encrypt under, so send NOTHING
+        // rather than falling back to a plaintext path.
+        if (this.doc === null) {
+            return false;
+        }
         try {
-            const currentText = this.collabCore.get_text();
+            const currentText = this.doc.get_content();
 
             if (text !== currentText) {
                 // Apply minimal diff instead of clearing and reinserting
                 this.applyTextDiff(currentText, text);
             }
 
-            // Bind the docId as AEAD associated data so the emitted ciphertext is
-            // cryptographically tied to this document (see handleYrsUpdate).
-            const encrypted = this.collabCore.encode_state_encrypted(this.config.docId);
+            // MLS encrypts under the group's current epoch; the op carries both.
+            const op = this.doc.get_encrypted_update();
             return this.send({
                 type: 'yrs_update',
                 doc_id: this.config.docId,
-                encrypted: [...encrypted],
-                epoch: 0,
+                encrypted: [...op.ciphertext],
+                epoch: Number(op.epoch),
             });
         } catch (error) {
-            console.error('Failed to send update:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'sync',
-                    message: extractErrorMessage(error),
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
-            }
+            this.reportError('sync', 'Failed to send update:', error);
             return false;
         }
     }
@@ -503,7 +664,7 @@ export class CollabClient {
     }
 
     getText(): string {
-        return this.collabCore.get_text();
+        return this.doc?.get_content() ?? '';
     }
 
     disconnect(): void {
@@ -516,5 +677,14 @@ export class CollabClient {
         }
         this.ws?.close();
         this.ws = null;
+        this.doc?.free();
+        this.doc = null;
+        // Free a still-unconsumed key package (a joiner that never got its
+        // Welcome). Do NOT free after a successful join — join() consumes the
+        // handle by value, so freeing there would double-free.
+        this.pending?.free();
+        this.pending = null;
+        // Allow a future reconnect after an explicit disconnect to re-establish.
+        this.groupEstablished = false;
     }
 }
