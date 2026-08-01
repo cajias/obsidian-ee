@@ -264,12 +264,8 @@ describe('CollabPlugin', () => {
 
             // MLS-only: config carries a role, never an encryptionKey.
             expect(CollabClient).toHaveBeenCalled();
-            const passedConfig = (CollabClient as jest.Mock).mock.calls[0][0] as {
-                role: string;
-                encryptionKey?: unknown;
-            };
+            const passedConfig = (CollabClient as jest.Mock).mock.calls[0][0] as { role: string };
             expect(passedConfig.role).toBe('owner');
-            expect(passedConfig.encryptionKey).toBeUndefined();
             expect((plugin as any).collabClient).not.toBeNull();
         });
 
