@@ -44,6 +44,20 @@ The AES-128-GCM AEAD in the ciphersuite is internal to MLS; there is no standalo
 | **Denial of service** | No rate limiting on the relay server currently |
 | **Document access control** | Subscription-based only; no cryptographic access control beyond MLS group membership |
 | **User authentication** | User IDs are self-asserted; no identity verification system |
+| **Group admission control** | The owner auto-invites ANY key package arriving on the document channel; see below |
+
+#### Open admission (current model)
+
+In the plugin client (`plugins/obsidian-ee/src/collab-client.ts`, `handleMlsHandshake`),
+an owner with an established group answers every `key_package` message received on its
+document channel with a Welcome. There is no allowlist, invitation token, or user
+confirmation step: anyone who can reach the relay and send a key package on a known
+`doc_id` is admitted to the MLS group and can decrypt all subsequent updates.
+Relay-reachability therefore equals admission today. MLS still guarantees everything
+above (the relay itself learns nothing, non-members who were never welcomed cannot
+decrypt), but the decision of WHO becomes a member is unguarded. An explicit admission
+gate (owner approval / pre-shared invite verification before `create_invite`) is
+deliberately deferred and tracked in a follow-up issue.
 
 ## Zero-Knowledge Relay Design
 
