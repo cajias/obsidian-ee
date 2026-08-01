@@ -195,6 +195,30 @@ describe('CollabPlugin', () => {
         expect((plugin as any).wasmInitialized).toBe(true);
     });
 
+    describe('loadSettings', () => {
+        it('drops the legacy plaintext encryptionKey so it is never persisted back', async () => {
+            const plugin = createMockPlugin();
+            // A data.json written by the old AES-PSK plugin still carries the key.
+            (plugin as any).loadData = jest.fn<() => Promise<unknown>>().mockResolvedValue({
+                relayUrl: 'ws://localhost:8080',
+                encryptionKey: '00'.repeat(32),
+            });
+            const saveData = jest
+                .fn<(data: unknown) => Promise<void>>()
+                .mockResolvedValue(undefined);
+            (plugin as any).saveData = saveData;
+
+            await plugin.loadSettings();
+            await plugin.saveSettings();
+
+            expect(
+                (plugin.settings as unknown as Record<string, unknown>).encryptionKey
+            ).toBeUndefined();
+            expect(saveData).toHaveBeenCalledTimes(1);
+            expect(saveData.mock.calls[0][0]).not.toHaveProperty('encryptionKey');
+        });
+    });
+
     describe('onunload', () => {
         it('should handle errors in stopSession gracefully', async () => {
             const plugin = createMockPlugin();
