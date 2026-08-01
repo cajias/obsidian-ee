@@ -4,6 +4,7 @@ import {
     WasmPendingMember,
     generate_key_package,
 } from './wasm/collab_wasm';
+import type { WasmEncryptedOp } from './wasm/collab_wasm';
 
 export type CollabRole = 'owner' | 'joiner';
 
@@ -93,8 +94,9 @@ function isWasmCollabError(error: unknown): error is WasmCollabError {
 /**
  * Extract error message from various error types including WASM errors.
  * WASM errors are plain objects that would produce "[object Object]" with String().
+ * Exported so callers outside this module (e.g. main.ts) don't reimplement it.
  */
-function extractErrorMessage(error: unknown): string {
+export function extractErrorMessage(error: unknown): string {
     if (error instanceof Error) {
         return error.message;
     }
@@ -735,6 +737,16 @@ export class CollabClient {
         }
     }
 
+    /** Broadcast an encrypted CRDT op as a `yrs_update` frame for `docId`. */
+    private sendYrsUpdate(docId: string, op: WasmEncryptedOp): boolean {
+        return this.send({
+            type: 'yrs_update',
+            doc_id: docId,
+            encrypted: [...op.ciphertext],
+            epoch: Number(op.epoch),
+        });
+    }
+
     /**
      * Encrypt and broadcast a local manifest update (#32) under the manifest MLS
      * group's current epoch. Fails closed (returns false) until that group is
@@ -750,13 +762,7 @@ export class CollabClient {
             return false;
         }
         try {
-            const op = this.manifestDoc.encrypt_bytes(update);
-            return this.send({
-                type: 'yrs_update',
-                doc_id: manifestDocId,
-                encrypted: [...op.ciphertext],
-                epoch: Number(op.epoch),
-            });
+            return this.sendYrsUpdate(manifestDocId, this.manifestDoc.encrypt_bytes(update));
         } catch (error) {
             this.reportError('sync', 'Failed to send manifest update:', error, '', manifestDocId);
             return false;
@@ -863,13 +869,7 @@ export class CollabClient {
             }
 
             // MLS encrypts under the group's current epoch; the op carries both.
-            const op = this.doc.get_encrypted_update();
-            return this.send({
-                type: 'yrs_update',
-                doc_id: this.config.docId,
-                encrypted: [...op.ciphertext],
-                epoch: Number(op.epoch),
-            });
+            return this.sendYrsUpdate(this.config.docId, this.doc.get_encrypted_update());
         } catch (error) {
             this.reportError('sync', 'Failed to send update:', error);
             return false;
@@ -896,6 +896,21 @@ export class CollabClient {
         return this.doc?.get_content() ?? '';
     }
 
+    /**
+     * Free and null out one group slot's doc + pending handles. Shared by
+     * disconnect() for the file group and the manifest group (#32) — same
+     * free/null pattern GroupSlot already abstracts for bootstrap/handshake.
+     *
+     * Do NOT call this after a successful join() — join() consumes the
+     * pending handle by value, so freeing it here too would double-free.
+     */
+    private freeSlot(slot: GroupSlot): void {
+        slot.getDoc()?.free();
+        slot.setDoc(null);
+        slot.getPending()?.free();
+        slot.setPending(null);
+    }
+
     disconnect(): void {
         this.maxReconnectAttempts = 0; // Prevent reconnection
         this.connectPromise = null; // Clear any pending connection promise
@@ -906,18 +921,11 @@ export class CollabClient {
         }
         this.ws?.close();
         this.ws = null;
-        this.doc?.free();
-        this.doc = null;
         // Free a still-unconsumed key package (a joiner that never got its
-        // Welcome). Do NOT free after a successful join — join() consumes the
-        // handle by value, so freeing there would double-free.
-        this.pending?.free();
-        this.pending = null;
+        // Welcome); see freeSlot's doc comment for the double-free hazard.
+        this.freeSlot(this.fileSlot());
         // Same lifecycle for the manifest group (#32).
-        this.manifestDoc?.free();
-        this.manifestDoc = null;
-        this.manifestPending?.free();
-        this.manifestPending = null;
+        this.freeSlot(this.manifestSlot());
         // Allow a future reconnect after an explicit disconnect to re-establish.
         this.groupEstablished = false;
     }
