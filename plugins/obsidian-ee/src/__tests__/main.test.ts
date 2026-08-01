@@ -1,4 +1,5 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { mockObsidianModule } from './helpers/mock-obsidian';
 
 // Mock WebAssembly.compile for WASM loading
 const mockWasmModule = {};
@@ -10,46 +11,7 @@ const mockCompile = jest
     compile: mockCompile,
 };
 
-jest.unstable_mockModule('obsidian', () => ({
-    Plugin: class {
-        app: any;
-        manifest: any;
-        constructor(app: any, manifest: any) {
-            this.app = app;
-            this.manifest = manifest;
-        }
-        addCommand(_cmd: any): void {}
-        addSettingTab(_tab: any): void {}
-        registerEvent(_event: any): void {}
-        loadData(): Promise<any> {
-            // MLS-only: no key input. Relay URL is the only persisted setting.
-            return Promise.resolve({ relayUrl: 'ws://localhost:8080' });
-        }
-        saveData(_data: any): Promise<void> {
-            return Promise.resolve();
-        }
-    },
-    PluginSettingTab: class {
-        app: any;
-        plugin: any;
-        containerEl: any;
-        constructor(app: any, plugin: any) {
-            this.app = app;
-            this.plugin = plugin;
-            this.containerEl = {
-                empty: jest.fn(),
-                createEl: jest.fn(),
-            };
-        }
-    },
-    Setting: jest.fn().mockImplementation(() => ({
-        setName: jest.fn().mockReturnThis(),
-        setDesc: jest.fn().mockReturnThis(),
-        addText: jest.fn().mockReturnThis(),
-    })),
-    Notice: jest.fn(),
-    MarkdownView: class {},
-}));
+jest.unstable_mockModule('obsidian', mockObsidianModule);
 
 // MLS-only: main.ts needs the WASM module initialized (`init`) plus the vault
 // sync surface (#32). The MLS doc classes are driven inside CollabClient, so no
@@ -83,6 +45,10 @@ jest.unstable_mockModule('../collab-client', () => ({
         onDisconnect: jest.fn(),
         onManifestPaths: jest.fn(),
     })),
+    // main.ts imports the real extractErrorMessage (not a CollabClient method),
+    // so the mock must still provide it with the same behavior.
+    extractErrorMessage: (error: unknown): string =>
+        error instanceof Error ? error.message : String(error),
 }));
 
 jest.unstable_mockModule('../editor-sync', () => ({
