@@ -43,6 +43,61 @@ class MockWebSocket {
 // @ts-ignore - Override global WebSocket
 global.WebSocket = MockWebSocket;
 
+interface MockWSInstance {
+    readyState: number;
+    onopen: (() => void) | null;
+    onclose: (() => void) | null;
+    onerror: ((error: any) => void) | null;
+    onmessage: ((event: { data: string }) => void) | null;
+    sentMessages: string[];
+}
+
+// Factory for the one-off WebSocket mocks that drive connect()/reconnect edge
+// cases (immediate close, fail-then-succeed, flaky reconnects, a send() that
+// lies about delivery). Every variant shares the same statics/handlers/
+// readyState/sentMessages shape; only construction-time behavior, send(), the
+// starting readyState, and whether close() fires onclose actually differ
+// between them, so those are the parameters.
+function createMockWebSocket(options: {
+    onConstruct: (self: MockWSInstance) => void;
+    send?: (self: MockWSInstance, data: string) => void;
+    closeFiresOnclose?: boolean;
+    initialReadyState?: number;
+}) {
+    const { onConstruct, send, closeFiresOnclose, initialReadyState = 0 } = options;
+    return class {
+        static OPEN = 1;
+        static CONNECTING = 0;
+        static CLOSING = 2;
+        static CLOSED = 3;
+        readyState = initialReadyState;
+        onopen: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        onerror: ((error: any) => void) | null = null;
+        onmessage: ((event: { data: string }) => void) | null = null;
+        sentMessages: string[] = [];
+
+        constructor() {
+            onConstruct(this);
+        }
+
+        send(data: string) {
+            if (send) {
+                send(this, data);
+            } else {
+                this.sentMessages.push(data);
+            }
+        }
+
+        close() {
+            this.readyState = 3;
+            if (closeFiresOnclose) {
+                this.onclose?.();
+            }
+        }
+    };
+}
+
 // A mock of the MLS document surface the client drives. There is NO
 // set_encryption_key / has_encryption_key / encode_state_encrypted here — the AES
 // CollabCore is gone; MLS derives keys from group membership.
@@ -81,18 +136,36 @@ const { WasmEncryptedDocument, generate_key_package } = await import('../wasm/co
 const { CollabClient, ConfigValidationError } = await import('../collab-client');
 type CollabClient = InstanceType<typeof CollabClient>;
 
+// Shared fixture builder: every describe block below wants the same owner
+// config unless a test overrides a field (role: 'joiner', a bad field for
+// validation, etc).
+function makeDefaultConfig(overrides: Partial<CollabClientConfig> = {}): CollabClientConfig {
+    return {
+        relayUrl: 'ws://localhost:8080',
+        userId: 'user1',
+        docId: 'doc1',
+        role: 'owner',
+        ...overrides,
+    };
+}
+
+// Drive a client through connect() under fake timers and await its settlement.
+// This is the standard "just get me connected" path used by the large majority
+// of tests; a handful of tests instead assert directly on the connect()
+// promise (resolves/rejects) and call connect()/runAllTimers() themselves.
+async function connectClient(client: CollabClient): Promise<void> {
+    const connectPromise = client.connect();
+    jest.runAllTimers();
+    await connectPromise;
+}
+
 describe('CollabClient', () => {
     let client: CollabClient;
     let config: CollabClientConfig;
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -150,9 +223,7 @@ describe('CollabClient', () => {
 
     describe('connect', () => {
         it('should connect and send identify message', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Access the WebSocket through the client (we need to check sent messages)
             // Since WebSocket is a mock, we can check via the global
@@ -169,32 +240,15 @@ describe('CollabClient', () => {
             // Create a mock WebSocket that closes immediately (before onopen)
             const OriginalWebSocket = global.WebSocket;
 
-            (global as any).WebSocket = class ClosingWebSocket {
-                static OPEN = 1;
-                static CONNECTING = 0;
-                static CLOSING = 2;
-                static CLOSED = 3;
-                readyState = 0;
-                onopen: (() => void) | null = null;
-                onclose: (() => void) | null = null;
-                onerror: ((error: any) => void) | null = null;
-                onmessage: ((event: { data: string }) => void) | null = null;
-                sentMessages: string[] = [];
-
-                constructor() {
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
                     // Close immediately during initial connection (before onopen)
                     setTimeout(() => {
-                        this.readyState = 3;
-                        this.onclose?.();
+                        ws.readyState = 3;
+                        ws.onclose?.();
                     }, 0);
-                }
-                send(data: string) {
-                    this.sentMessages.push(data);
-                }
-                close() {
-                    this.readyState = 3;
-                }
-            };
+                },
+            });
 
             const testClient = new CollabClient(config);
             const connectPromise = testClient.connect();
@@ -253,37 +307,20 @@ describe('CollabClient', () => {
             const OriginalWebSocket = global.WebSocket;
 
             let connectionAttempts = 0;
-            (global as any).WebSocket = class FailingWebSocket {
-                static OPEN = 1;
-                static CONNECTING = 0;
-                static CLOSING = 2;
-                static CLOSED = 3;
-                readyState = 0;
-                onopen: (() => void) | null = null;
-                onclose: (() => void) | null = null;
-                onerror: ((error: any) => void) | null = null;
-                onmessage: ((event: { data: string }) => void) | null = null;
-                sentMessages: string[] = [];
-
-                constructor() {
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
                     connectionAttempts++;
                     // Fail first connection, succeed second
                     setTimeout(() => {
                         if (connectionAttempts === 1) {
-                            this.onclose?.();
+                            ws.onclose?.();
                         } else {
-                            this.readyState = 1;
-                            this.onopen?.();
+                            ws.readyState = 1;
+                            ws.onopen?.();
                         }
                     }, 0);
-                }
-                send(data: string) {
-                    this.sentMessages.push(data);
-                }
-                close() {
-                    this.readyState = 3;
-                }
-            };
+                },
+            });
 
             const testClient = new CollabClient(config);
 
@@ -330,9 +367,7 @@ describe('CollabClient', () => {
 
     describe('sendUpdate', () => {
         it('should send an MLS-encrypted update to the relay', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Owner's group is created on connect; drive that document.
             const doc = (client as any).doc;
@@ -347,9 +382,7 @@ describe('CollabClient', () => {
         });
 
         it('should not modify if text is unchanged', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             const doc = (client as any).doc;
             doc.get_content.mockReturnValue('same content');
@@ -362,9 +395,7 @@ describe('CollabClient', () => {
 
     describe('onUpdate', () => {
         it('should call callback when update is received', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             const callback = jest.fn();
             client.onUpdate(callback);
@@ -378,9 +409,7 @@ describe('CollabClient', () => {
 
     describe('getText', () => {
         it('should return current text from the MLS document', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             const doc = (client as any).doc;
             doc.get_content.mockReturnValue('hello world');
@@ -394,9 +423,7 @@ describe('CollabClient', () => {
 
     describe('disconnect', () => {
         it('should close WebSocket and prevent reconnection', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             client.disconnect();
             // Verify reconnection is disabled by checking maxReconnectAttempts is 0
@@ -405,9 +432,7 @@ describe('CollabClient', () => {
 
     describe('reconnection', () => {
         it('should attempt to reconnect with exponential backoff', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // The reconnection logic is tested implicitly through the handleReconnect method
             // which uses exponential backoff
@@ -423,42 +448,25 @@ describe('CollabClient', () => {
             const OriginalWebSocket = global.WebSocket;
 
             let constructions = 0;
-            (global as any).WebSocket = class FlakyWebSocket {
-                static OPEN = 1;
-                static CONNECTING = 0;
-                static CLOSING = 2;
-                static CLOSED = 3;
-                readyState = 0;
-                onopen: (() => void) | null = null;
-                onclose: (() => void) | null = null;
-                onerror: ((error: any) => void) | null = null;
-                onmessage: ((event: { data: string }) => void) | null = null;
-                sentMessages: string[] = [];
-
-                constructor() {
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
                     constructions++;
                     const isFirst = constructions === 1;
                     setTimeout(() => {
                         if (isFirst) {
                             // First socket opens successfully.
-                            this.readyState = 1;
-                            this.onopen?.();
+                            ws.readyState = 1;
+                            ws.onopen?.();
                         } else {
                             // Every reconnect socket fails before opening:
                             // onerror THEN onclose (the normal browser failure order).
-                            this.onerror?.(new Error('connect failed'));
-                            this.readyState = 3;
-                            this.onclose?.();
+                            ws.onerror?.(new Error('connect failed'));
+                            ws.readyState = 3;
+                            ws.onclose?.();
                         }
                     }, 0);
-                }
-                send(data: string) {
-                    this.sentMessages.push(data);
-                }
-                close() {
-                    this.readyState = 3;
-                }
-            };
+                },
+            });
 
             const testClient = new CollabClient(config);
             const disconnectCallback = jest.fn();
@@ -466,9 +474,7 @@ describe('CollabClient', () => {
 
             try {
                 // Initial connect succeeds.
-                const connectPromise = testClient.connect();
-                jest.runAllTimers();
-                await connectPromise;
+                await connectClient(testClient);
 
                 // Drop the live connection to kick off the reconnect/backoff loop.
                 (testClient as any).ws?.onclose?.();
@@ -509,16 +515,9 @@ describe('CollabClient MLS-only crypto surface', () => {
     });
 
     it('has no encryptionKey in config and injects no key (owner creates an MLS group)', async () => {
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        const config: CollabClientConfig = makeDefaultConfig();
         const client = new CollabClient(config);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Owner path creates the MLS group. There is no set_encryption_key call
         // (the mocked surface has no such method) — MLS keys come from the group.
@@ -542,9 +541,7 @@ describe('CollabClient MLS-only crypto surface', () => {
             role: 'joiner',
         };
         const client = new CollabClient(config);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         expect(generate_key_package as unknown as jest.Mock).toHaveBeenCalledWith('bob');
         // No group yet (awaiting the Welcome): the document is null.
@@ -564,9 +561,7 @@ describe('CollabClient MLS-only crypto surface', () => {
             role: 'joiner',
         };
         const client = new CollabClient(config);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const ws = (client as any).ws;
         const sentBefore = ws.sentMessages.length;
@@ -608,16 +603,9 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
 
     it('Finding 1: establishes the MLS group EXACTLY ONCE across a reconnect (owner)', async () => {
         (WasmEncryptedDocument.create as unknown as jest.Mock).mockClear();
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        const config: CollabClientConfig = makeDefaultConfig();
         const client = new CollabClient(config);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const docAfterFirstConnect = (client as any).doc;
         expect(WasmEncryptedDocument.create as unknown as jest.Mock).toHaveBeenCalledTimes(1);
@@ -644,9 +632,7 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
             role: 'joiner',
         };
         const client = new CollabClient(config);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Deliver a Welcome so the joiner joins (doc set, pending consumed).
         (client as any).ws?.onmessage?.({
@@ -686,16 +672,9 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
 
     it('Finding 2: a replayed Welcome does NOT clobber an owner’s established group', async () => {
         (WasmEncryptedDocument.join as unknown as jest.Mock).mockClear();
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        const config: CollabClientConfig = makeDefaultConfig();
         const client = new CollabClient(config);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const originalDoc = (client as any).doc; // owner's created group
         expect(originalDoc).not.toBeNull();
@@ -720,18 +699,11 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
     it('rejects a key_package mls_handshake whose doc_id does not match config.docId', async () => {
         // Defense in depth: the untrusted relay misroutes another document's key
         // package to this owner. The owner must NOT mint a Welcome for it.
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        const config: CollabClientConfig = makeDefaultConfig();
         const client = new CollabClient(config);
         const errorCallback = jest.fn();
         client.onError(errorCallback);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const doc = (client as any).doc;
         const ws = (client as any).ws;
@@ -775,9 +747,7 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
         const client = new CollabClient(config);
         const errorCallback = jest.fn();
         client.onError(errorCallback);
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const pendingBefore = (client as any).pending;
         expect(pendingBefore).not.toBeNull();
@@ -805,6 +775,72 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
 
         client.disconnect();
     });
+
+    it('a malformed Welcome that makes join() throw does not permanently strand the joiner', async () => {
+        // wasm-bindgen's generated glue for join(invite, pending) destroys the
+        // `pending` handle unconditionally on call entry (pending.__destroy_into_raw()),
+        // BEFORE the Rust call runs — so a garbage/malicious Welcome that makes
+        // join() throw still burns the one-time key package. If this.pending were
+        // only cleared on the success line, it would keep referencing that
+        // now-dead handle, and a LATER legitimate Welcome would retry join() with
+        // it and throw again — forever, with no way to recover except a full
+        // session restart. The fix clears this.pending in lockstep with the
+        // (consuming) call to join(), so a failed join fails closed exactly once
+        // instead of wedging every subsequent Welcome.
+        (WasmEncryptedDocument.join as unknown as jest.Mock).mockImplementationOnce(() => {
+            throw new Error('malformed welcome payload');
+        });
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'bob',
+            docId: 'doc1',
+            role: 'joiner',
+        };
+        const client = new CollabClient(config);
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+        await connectClient(client);
+
+        expect((client as any).pending).not.toBeNull();
+
+        // An attacker (or a corrupt relay) delivers a garbage Welcome.
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'welcome',
+                doc_id: 'doc1',
+                payload: [1, 2],
+            }),
+        });
+
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'sync',
+                message: expect.stringContaining('malformed welcome payload'),
+            })
+        );
+        // The dead key package handle must not linger.
+        expect((client as any).pending).toBeNull();
+        expect((client as any).doc).toBeNull();
+
+        // A second, legitimate Welcome arrives. Before the fix this retried
+        // join() with the already-consumed handle and threw again; now the
+        // `!this.pending` guard fails closed silently instead of throwing.
+        errorCallback.mockClear();
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'welcome',
+                doc_id: 'doc1',
+                payload: [3, 4],
+            }),
+        });
+
+        expect(errorCallback).not.toHaveBeenCalled();
+        expect((client as any).doc).toBeNull();
+
+        client.disconnect();
+    });
 });
 
 describe('CollabClient message handling', () => {
@@ -812,12 +848,7 @@ describe('CollabClient message handling', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        const config: CollabClientConfig = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        const config: CollabClientConfig = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -829,9 +860,7 @@ describe('CollabClient message handling', () => {
     it('should handle subscribed message', async () => {
         const consoleSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         consoleSpy.mockRestore();
     });
@@ -839,9 +868,7 @@ describe('CollabClient message handling', () => {
     it('should handle error message from server', async () => {
         const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         consoleErrorSpy.mockRestore();
     });
@@ -853,9 +880,7 @@ describe('CollabClient message handling', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const doc = (client as any).doc;
         (client as any).ws?.onmessage?.({
@@ -879,12 +904,7 @@ describe('CollabClient message queueing', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -926,18 +946,14 @@ describe('CollabClient message queueing', () => {
             expect(client.getQueueLength()).toBe(1);
 
             // Now connect
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Queue should be empty after connection opens
             expect(client.getQueueLength()).toBe(0);
         });
 
         it('should send messages directly when WebSocket is already open', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             client.sendUpdate('direct content');
 
@@ -976,9 +992,7 @@ describe('CollabClient message queueing', () => {
         });
 
         it('should return true when message is sent successfully', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             const result = client.sendUpdate('test content');
 
@@ -993,12 +1007,7 @@ describe('CollabClient disconnect notification', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -1012,9 +1021,7 @@ describe('CollabClient disconnect notification', () => {
             const disconnectCallback = jest.fn();
             client.onDisconnect(disconnectCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Set reconnect attempts to max (5)
             (client as any).reconnectAttempts = 5;
@@ -1029,9 +1036,7 @@ describe('CollabClient disconnect notification', () => {
             const disconnectCallback = jest.fn();
             client.onDisconnect(disconnectCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Set reconnect attempts to max
             (client as any).reconnectAttempts = 5;
@@ -1050,17 +1055,13 @@ describe('CollabClient disconnect notification', () => {
         });
 
         it('should track connection state as connected after successful connection', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             expect(client.getConnectionState()).toBe('connected');
         });
 
         it('should track connection state as reconnecting during reconnect attempts', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Simulate WebSocket close (triggers reconnect)
             (client as any).ws?.onclose?.();
@@ -1069,9 +1070,7 @@ describe('CollabClient disconnect notification', () => {
         });
 
         it('should track connection state as disconnected when max retries exceeded', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Set reconnect attempts to max (5)
             (client as any).reconnectAttempts = 5;
@@ -1090,12 +1089,7 @@ describe('CollabClient error handling', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -1109,28 +1103,15 @@ describe('CollabClient error handling', () => {
             const errorCallback = jest.fn();
             client.onError(errorCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Mock WebSocket to fail on next connect
             const OriginalMockWebSocket = (global as any).WebSocket;
-            (global as any).WebSocket = class FailingWebSocket {
-                static OPEN = 1;
-                static CONNECTING = 0;
-                static CLOSING = 2;
-                static CLOSED = 3;
-                readyState = 0;
-                onopen: (() => void) | null = null;
-                onmessage: ((event: { data: string }) => void) | null = null;
-                onerror: ((error: any) => void) | null = null;
-                onclose: (() => void) | null = null;
-                constructor() {
-                    setTimeout(() => this.onerror?.(new Error('Connection failed')), 0);
-                }
-                send() {}
-                close() {}
-            };
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
+                    setTimeout(() => ws.onerror?.(new Error('Connection failed')), 0);
+                },
+            });
 
             try {
                 // Trigger reconnect by simulating websocket close
@@ -1166,9 +1147,7 @@ describe('CollabClient error handling', () => {
             const errorCallback = jest.fn();
             client.onError(errorCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Simulate WebSocket error after connection established
             (client as any).ws?.onerror?.(new Error('Network error'));
@@ -1184,9 +1163,7 @@ describe('CollabClient error handling', () => {
 
     describe('reconnectTimer cleanup', () => {
         it('should clear reconnectTimer on disconnect', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Trigger reconnect to set up timer
             (client as any).ws?.onclose?.();
@@ -1206,9 +1183,7 @@ describe('CollabClient error handling', () => {
             const errorCallback = jest.fn();
             client.onError(errorCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Simulate server error message
             (client as any).ws?.onmessage?.({
@@ -1226,9 +1201,7 @@ describe('CollabClient error handling', () => {
         it('should log warning for unknown message types', async () => {
             const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Simulate unknown message type
             (client as any).ws?.onmessage?.({
@@ -1246,9 +1219,7 @@ describe('CollabClient error handling', () => {
 
     describe('flushMessageQueue error handling', () => {
         it('should re-queue messages when ws.send fails', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Queue a message first
             (client as any).ws.readyState = 3; // CLOSED
@@ -1274,9 +1245,7 @@ describe('CollabClient error handling', () => {
             const errorCallback = jest.fn();
             client.onError(errorCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Make the MLS document throw
             const doc = (client as any).doc;
@@ -1295,9 +1264,7 @@ describe('CollabClient error handling', () => {
         });
 
         it('should return false when the MLS op fails', async () => {
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             const doc = (client as any).doc;
             doc.get_content.mockImplementation(() => {
@@ -1315,9 +1282,7 @@ describe('CollabClient error handling', () => {
             const errorCallback = jest.fn();
             client.onError(errorCallback);
 
-            const connectPromise = client.connect();
-            jest.runAllTimers();
-            await connectPromise;
+            await connectClient(client);
 
             // Simulate invalid JSON message
             (client as any).ws?.onmessage?.({
@@ -1339,12 +1304,7 @@ describe('CollabClient initialization verification', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
     });
 
     afterEach(() => {
@@ -1355,24 +1315,13 @@ describe('CollabClient initialization verification', () => {
         it('should fail connect() if sendIdentify returns false', async () => {
             // Create a MockWebSocket that has readyState CLOSED when send is called
             const OriginalMockWebSocket = (global as any).WebSocket;
-            (global as any).WebSocket = class FailingSendWebSocket {
-                static OPEN = 1;
-                static CONNECTING = 0;
-                static CLOSING = 2;
-                static CLOSED = 3;
-                readyState = 3; // CLOSED - so send() returns false
-                onopen: (() => void) | null = null;
-                onmessage: ((event: { data: string }) => void) | null = null;
-                onerror: ((error: any) => void) | null = null;
-                onclose: (() => void) | null = null;
-                constructor() {
-                    setTimeout(() => this.onopen?.(), 0);
-                }
-                send() {}
-                close() {
-                    this.onclose?.();
-                }
-            };
+            (global as any).WebSocket = createMockWebSocket({
+                initialReadyState: 3, // CLOSED - so send() returns false
+                closeFiresOnclose: true,
+                onConstruct: (ws) => {
+                    setTimeout(() => ws.onopen?.(), 0);
+                },
+            });
 
             const client = new CollabClient(config);
             const connectPromise = client.connect();
@@ -1388,30 +1337,20 @@ describe('CollabClient initialization verification', () => {
             // Create a MockWebSocket that returns CLOSED after first send
             const OriginalMockWebSocket = (global as any).WebSocket;
             let sendCount = 0;
-            (global as any).WebSocket = class PartialSendWebSocket {
-                static OPEN = 1;
-                static CONNECTING = 0;
-                static CLOSING = 2;
-                static CLOSED = 3;
-                readyState = 1; // OPEN initially
-                onopen: (() => void) | null = null;
-                onmessage: ((event: { data: string }) => void) | null = null;
-                onerror: ((error: any) => void) | null = null;
-                onclose: (() => void) | null = null;
-                constructor() {
-                    setTimeout(() => this.onopen?.(), 0);
-                }
-                send() {
+            (global as any).WebSocket = createMockWebSocket({
+                initialReadyState: 1, // OPEN initially
+                closeFiresOnclose: true,
+                onConstruct: (ws) => {
+                    setTimeout(() => ws.onopen?.(), 0);
+                },
+                send: (ws) => {
                     sendCount++;
                     // After first send (identify), set readyState to CLOSED
                     if (sendCount === 1) {
-                        this.readyState = 3; // CLOSED
+                        ws.readyState = 3; // CLOSED
                     }
-                }
-                close() {
-                    this.onclose?.();
-                }
-            };
+                },
+            });
 
             const client = new CollabClient(config);
             const connectPromise = client.connect();
@@ -1431,12 +1370,7 @@ describe('CollabClient handleReconnect timer cleanup', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -1446,9 +1380,7 @@ describe('CollabClient handleReconnect timer cleanup', () => {
     });
 
     it('should clear reconnectTimer when max retries exceeded', async () => {
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Set a reconnectTimer to simulate pending timer
         (client as any).reconnectTimer = setTimeout(() => {}, 1000);
@@ -1469,12 +1401,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -1487,9 +1414,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Simulate yrs_update message without encrypted field
         (client as any).ws?.onmessage?.({
@@ -1508,9 +1433,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Simulate yrs_update message with non-array encrypted field
         (client as any).ws?.onmessage?.({
@@ -1529,9 +1452,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Simulate yrs_update message with null encrypted field
         (client as any).ws?.onmessage?.({
@@ -1550,9 +1471,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const updateCallback = jest.fn();
         client.onUpdate(updateCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const doc = (client as any).doc;
 
@@ -1575,9 +1494,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         client.onError(errorCallback);
         client.onUpdate(updateCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const doc = (client as any).doc;
 
@@ -1604,9 +1521,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const updateCallback = jest.fn();
         client.onUpdate(updateCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const doc = (client as any).doc;
 
@@ -1626,9 +1541,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         // Mock apply_encrypted_update to throw a WASM-style error object.
         // WASM CollabError returns a plain object with {type, message} fields.
@@ -1665,9 +1578,7 @@ describe('CollabClient handleYrsUpdate validation', () => {
         const errorCallback = jest.fn();
         client.onError(errorCallback);
 
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
 
         const doc = (client as any).doc;
         doc.apply_encrypted_update.mockImplementation(() => {
@@ -1692,12 +1603,7 @@ describe('CollabClient applyTextDiff edge cases', () => {
 
     beforeEach(() => {
         jest.useFakeTimers();
-        config = {
-            relayUrl: 'ws://localhost:8080',
-            userId: 'user1',
-            docId: 'doc1',
-            role: 'owner',
-        };
+        config = makeDefaultConfig();
         client = new CollabClient(config);
     });
 
@@ -1709,9 +1615,7 @@ describe('CollabClient applyTextDiff edge cases', () => {
     // Connect an owner (creating its MLS group) and return the mock document so a
     // test can stage its content before driving sendUpdate through applyTextDiff.
     async function connectAndGetDoc(): Promise<any> {
-        const connectPromise = client.connect();
-        jest.runAllTimers();
-        await connectPromise;
+        await connectClient(client);
         const doc = (client as any).doc;
         doc.insert.mockClear();
         doc.delete.mockClear();
