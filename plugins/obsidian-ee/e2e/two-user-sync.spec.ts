@@ -2,9 +2,23 @@ import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { webcrypto } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { WebSocket as WsWebSocket } from 'ws';
 import { MockRelay } from './mock-relay';
-import { CollabClient, type CollabClientConfig, type CollabRole } from '../src/collab-client';
+import type { CollabClient, CollabClientConfig, CollabRole } from '../src/collab-client';
+
+// CollabClient must NOT be statically imported here. Playwright transpiles this
+// CJS spec's imports into require() calls, and collab-client.ts statically imports
+// the wasm-pack ESM package (src/wasm has "type": "module"), which cannot be
+// require()d — the transpiled chain dies with "exports is not defined in ES module
+// scope" and Playwright collects 0 tests. Instead, beforeAll dynamic-imports the
+// ESM wasm module (the one loader path that works from CJS — see NOTE below),
+// seeds it into the CJS require cache, and only then require()s collab-client so
+// its inner require('./wasm/collab_wasm') resolves to the pre-loaded ESM namespace.
+type CollabClientCtorType = new (config: CollabClientConfig) => CollabClient;
+let CollabClientCtor: CollabClientCtorType;
+
+const nodeRequire = createRequire(__filename);
 
 // This spec drives the REAL MLS behavior entirely in the Playwright runner's Node
 // context: two independently-constructed CollabClients, each with its own real
@@ -38,6 +52,22 @@ async function initWasm(): Promise<void> {
     const bytes = readFileSync(wasmPath);
     const compiled = await WebAssembly.compile(bytes);
     await mod.default({ module_or_path: compiled });
+
+    // Seed the initialized ESM namespace into the CJS module cache under the path
+    // collab-client.ts's transpiled require('./wasm/collab_wasm') resolves to, then
+    // require collab-client. ponytail: require-cache seeding is a contained hack;
+    // upgrade path is running the whole Playwright project in ESM mode once
+    // Playwright treats src/*.ts (CJS package scope) as ESM.
+    const wasmModulePath = nodeRequire.resolve('../src/wasm/collab_wasm.js');
+    nodeRequire.cache[wasmModulePath] = {
+        id: wasmModulePath,
+        filename: wasmModulePath,
+        loaded: true,
+        exports: mod,
+    } as unknown as NodeJS.Module;
+    ({ CollabClient: CollabClientCtor } = nodeRequire('../src/collab-client') as {
+        CollabClient: CollabClientCtorType;
+    });
 }
 
 /**
@@ -115,7 +145,7 @@ function makeClient(userId: string, docId: string, role: CollabRole): CollabClie
         docId,
         role,
     };
-    return new CollabClient(config);
+    return new CollabClientCtor(config);
 }
 
 const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -170,7 +200,7 @@ test.describe('Two User MLS Sync Integration', () => {
         const soloPort = 8084;
         await soloRelay.start(soloPort);
 
-        const joiner = new CollabClient({
+        const joiner = new CollabClientCtor({
             relayUrl: `ws://localhost:${soloPort}`,
             userId: 'lonely-bob',
             docId: 'orphan-doc',
