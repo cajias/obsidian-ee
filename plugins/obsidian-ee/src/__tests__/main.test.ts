@@ -2,6 +2,7 @@ import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals
 import { mockObsidianModule } from './helpers/mock-obsidian';
 import {
     createCollabWasmMock,
+    createMockClientInstance,
     mockCollabClientModule,
     mockEditorSyncModule,
 } from './helpers/mock-collab-modules';
@@ -373,15 +374,14 @@ describe('CollabPlugin', () => {
             const plugin = createReadyPlugin();
             let disconnectCallback: ((reason: string) => void) | null = null;
 
-            // Capture the disconnect callback
+            // Capture the disconnect callback. Start from the full shared mock
+            // surface (every method startSession() calls, incl. #32's
+            // onManifestPaths/sendManifestUpdate) and override only onDisconnect —
+            // a hand-rolled subset here would silently exercise startSession()'s
+            // catch-and-stopSession error path instead of the real connected flow.
             const { CollabClient } = await import('../collab-client');
             (CollabClient as jest.Mock).mockImplementation(() => ({
-                connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
-                disconnect: jest.fn(),
-                getText: jest.fn().mockReturnValue(''),
-                sendUpdate: jest.fn(),
-                onUpdate: jest.fn(),
-                onError: jest.fn(),
+                ...createMockClientInstance(),
                 onDisconnect: jest
                     .fn<(cb: (reason: string) => void) => void>()
                     .mockImplementation((cb) => {
