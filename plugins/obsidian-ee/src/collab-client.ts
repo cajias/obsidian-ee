@@ -7,6 +7,16 @@ import {
 
 export type CollabRole = 'owner' | 'joiner';
 
+// Inbound frames come from an UNTRUSTED relay (zero-knowledge threat model), so
+// network-fed collections are bounded by BYTES before any allocation: a huge
+// frame would otherwise flow JSON.parse -> number[] -> Uint8Array -> Rust
+// Vec<u8> and OOM the Electron renderer. Legit frames are already capped at
+// 1 MiB by the relay itself (MAX_MESSAGE_SIZE in collab-relay/src/relay.rs);
+// 2 MiB here leaves slack for relay-added fields. Measured on the raw JSON
+// text (UTF-16 code units ~= bytes for this ASCII protocol), which strictly
+// bounds every array parsed out of it.
+const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
+
 export interface CollabClientConfig {
     relayUrl: string;
     userId: string;
@@ -327,6 +337,12 @@ export class CollabClient {
 
     private handleMessage(data: string): void {
         try {
+            // Reject oversized frames BEFORE parsing (see MAX_INBOUND_FRAME_BYTES).
+            if (data.length > MAX_INBOUND_FRAME_BYTES) {
+                throw new Error(
+                    `inbound frame exceeds ${MAX_INBOUND_FRAME_BYTES} bytes (got ${data.length})`
+                );
+            }
             const message = JSON.parse(data);
 
             switch (message.type) {
@@ -419,12 +435,30 @@ export class CollabClient {
      * - joiner receives a Welcome → joins the group, consuming its key package.
      * - either side receives a commit → applies it to advance the epoch.
      */
+    /**
+     * Validate an inbound mls_handshake frame at the trust boundary: payload
+     * shape, plus the doc_id early-reject mirroring handleYrsUpdate. The
+     * untrusted relay routing a frame for a different document must be rejected
+     * BEFORE any MLS state is touched — e.g. an owner must not mint a Welcome
+     * for a key package whose frame claims another doc. (The welcome path
+     * additionally binds the LOCAL docId; this rejects misroutes early and
+     * loudly.) Throws on rejection.
+     */
+    private validateHandshakeFrame(message: MlsHandshakeMessage): Uint8Array {
+        if (!message.payload || !Array.isArray(message.payload)) {
+            throw new Error('Invalid mls_handshake message: missing or invalid payload');
+        }
+        if (message.doc_id !== undefined && message.doc_id !== this.config.docId) {
+            throw new Error(
+                `mls_handshake doc_id mismatch: expected ${this.config.docId}, got ${message.doc_id}`
+            );
+        }
+        return new Uint8Array(message.payload);
+    }
+
     private handleMlsHandshake(message: MlsHandshakeMessage): void {
         try {
-            if (!message.payload || !Array.isArray(message.payload)) {
-                throw new Error('Invalid mls_handshake message: missing or invalid payload');
-            }
-            const payload = new Uint8Array(message.payload);
+            const payload = this.validateHandshakeFrame(message);
 
             switch (message.message_type) {
                 case 'key_package': {

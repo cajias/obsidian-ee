@@ -692,6 +692,95 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
 
         client.disconnect();
     });
+
+    it('rejects a key_package mls_handshake whose doc_id does not match config.docId', async () => {
+        // Defense in depth: the untrusted relay misroutes another document's key
+        // package to this owner. The owner must NOT mint a Welcome for it.
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'user1',
+            docId: 'doc1',
+            role: 'owner',
+        };
+        const client = new CollabClient(config);
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        const doc = (client as any).doc;
+        const ws = (client as any).ws;
+        const sentBefore = ws.sentMessages.length;
+
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'key_package',
+                doc_id: 'other-doc',
+                payload: [3, 3, 3],
+            }),
+        });
+
+        expect(doc.create_invite).not.toHaveBeenCalled();
+        const welcomeFrames = ws.sentMessages.slice(sentBefore).filter((m: string) => {
+            const p = JSON.parse(m);
+            return p.type === 'mls_handshake' && p.message_type === 'welcome';
+        });
+        expect(welcomeFrames).toHaveLength(0);
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'sync',
+                message: expect.stringContaining('doc_id mismatch'),
+            })
+        );
+
+        client.disconnect();
+    });
+
+    it('rejects a welcome mls_handshake whose doc_id does not match config.docId', async () => {
+        // Defense in depth: a Welcome misrouted from another document must not
+        // make this joiner join a group.
+        (WasmEncryptedDocument.join as unknown as jest.Mock).mockClear();
+        const config: CollabClientConfig = {
+            relayUrl: 'ws://localhost:8080',
+            userId: 'bob',
+            docId: 'doc1',
+            role: 'joiner',
+        };
+        const client = new CollabClient(config);
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        const pendingBefore = (client as any).pending;
+        expect(pendingBefore).not.toBeNull();
+
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'welcome',
+                doc_id: 'other-doc',
+                payload: [1, 2],
+            }),
+        });
+
+        // The joiner did NOT join, and its pending key package is untouched so a
+        // correctly-routed Welcome can still succeed.
+        expect((client as any).doc).toBeNull();
+        expect((client as any).pending).toBe(pendingBefore);
+        expect(WasmEncryptedDocument.join as unknown as jest.Mock).not.toHaveBeenCalled();
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'sync',
+                message: expect.stringContaining('doc_id mismatch'),
+            })
+        );
+
+        client.disconnect();
+    });
 });
 
 describe('CollabClient message handling', () => {
@@ -730,6 +819,32 @@ describe('CollabClient message handling', () => {
         jest.runAllTimers();
         await connectPromise;
 
+        consoleErrorSpy.mockRestore();
+    });
+
+    it('rejects an inbound frame larger than the byte cap before parsing it', async () => {
+        // The relay is untrusted: an arbitrarily large frame must be rejected
+        // BEFORE JSON.parse allocates unbounded arrays destined for Rust.
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        const connectPromise = client.connect();
+        jest.runAllTimers();
+        await connectPromise;
+
+        const doc = (client as any).doc;
+        (client as any).ws?.onmessage?.({
+            data: `{"type":"yrs_update","encrypted":[${'1,'.repeat(2 * 1024 * 1024)}1]}`,
+        });
+
+        expect(doc.apply_encrypted_update).not.toHaveBeenCalled();
+        expect(errorCallback).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'sync',
+                message: expect.stringContaining('inbound frame exceeds'),
+            })
+        );
         consoleErrorSpy.mockRestore();
     });
 });
