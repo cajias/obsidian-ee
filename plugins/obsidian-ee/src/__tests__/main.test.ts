@@ -208,14 +208,31 @@ describe('CollabPlugin', () => {
                 .mockResolvedValue(undefined);
             (plugin as any).saveData = saveData;
 
+            // loadSettings ALONE must purge the key from disk — nothing else is
+            // guaranteed to call saveSettings before the user edits a setting.
             await plugin.loadSettings();
-            await plugin.saveSettings();
 
             expect(
                 (plugin.settings as unknown as Record<string, unknown>).encryptionKey
             ).toBeUndefined();
             expect(saveData).toHaveBeenCalledTimes(1);
             expect(saveData.mock.calls[0][0]).not.toHaveProperty('encryptionKey');
+            expect(saveData.mock.calls[0][0]).toHaveProperty('relayUrl', 'ws://localhost:8080');
+        });
+
+        it('does not rewrite data.json when it carries only known fields', async () => {
+            const plugin = createMockPlugin();
+            (plugin as any).loadData = jest.fn<() => Promise<unknown>>().mockResolvedValue({
+                relayUrl: 'ws://localhost:8080',
+            });
+            const saveData = jest
+                .fn<(data: unknown) => Promise<void>>()
+                .mockResolvedValue(undefined);
+            (plugin as any).saveData = saveData;
+
+            await plugin.loadSettings();
+
+            expect(saveData).not.toHaveBeenCalled();
         });
     });
 

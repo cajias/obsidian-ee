@@ -58,17 +58,23 @@ export default class CollabPlugin extends Plugin {
 
     async loadSettings(): Promise<void> {
         try {
-            const loadedData = (await this.loadData()) as Partial<CollabPluginSettings> | null;
+            const loadedData = (await this.loadData()) as Record<string, unknown> | null;
             // Copy ONLY known settings fields. A data.json written by an older
             // plugin version can carry legacy fields (including plaintext key
             // material from the removed pre-MLS crypto); picking known fields
-            // drops them so the next saveSettings purges them from disk.
+            // drops them in memory.
             this.settings = {
                 relayUrl:
                     typeof loadedData?.relayUrl === 'string'
                         ? loadedData.relayUrl
                         : DEFAULT_SETTINGS.relayUrl,
             };
+            // Purge legacy fields from DISK immediately: without this rewrite the
+            // old plaintext pre-MLS key would linger in data.json until the user
+            // happened to edit a setting and trigger saveSettings.
+            if (loadedData && Object.keys(loadedData).some((key) => !(key in this.settings))) {
+                await this.saveSettings();
+            }
         } catch (error) {
             console.error('[CollabPlugin] Failed to load settings, using defaults:', error);
             this.settings = { ...DEFAULT_SETTINGS };
