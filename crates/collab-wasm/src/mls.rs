@@ -139,6 +139,22 @@ impl WasmEncryptedDocument {
         self.0.apply_encrypted_update(&op).map_err(js_err)
     }
 
+    /// Encrypt caller-supplied bytes (the vault manifest CRDT) under this doc's
+    /// MLS group WITHOUT touching the internal Yrs text. The manifest rides its
+    /// own group on `manifest_doc_id`; cross-group ciphertext fails
+    /// authentication in `decrypt_bytes`, giving doc-scoping/replay isolation.
+    pub fn encrypt_bytes(&mut self, plaintext: &[u8]) -> Result<WasmEncryptedOp, JsError> {
+        let op = self.0.encrypt_bytes(plaintext).map_err(js_err)?;
+        Ok(WasmEncryptedOp { ciphertext: op.ciphertext, epoch: op.epoch })
+    }
+
+    /// Decrypt bytes produced by a peer's `encrypt_bytes`, returning the
+    /// plaintext manifest update. Fails closed on any authentication error,
+    /// including ciphertext bound to a different MLS group.
+    pub fn decrypt_bytes(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, JsError> {
+        self.0.decrypt_bytes(ciphertext).map_err(js_err)
+    }
+
     #[wasm_bindgen(getter)]
     pub fn epoch(&self) -> u64 {
         self.0.epoch()

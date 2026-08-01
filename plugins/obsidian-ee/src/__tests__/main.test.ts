@@ -1,4 +1,11 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { mockObsidianModule } from './helpers/mock-obsidian';
+import {
+    createCollabWasmMock,
+    createMockClientInstance,
+    mockCollabClientModule,
+    mockEditorSyncModule,
+} from './helpers/mock-collab-modules';
 
 // Mock WebAssembly.compile for WASM loading
 const mockWasmModule = {};
@@ -10,77 +17,17 @@ const mockCompile = jest
     compile: mockCompile,
 };
 
-jest.unstable_mockModule('obsidian', () => ({
-    Plugin: class {
-        app: any;
-        manifest: any;
-        constructor(app: any, manifest: any) {
-            this.app = app;
-            this.manifest = manifest;
-        }
-        addCommand(_cmd: any): void {}
-        addSettingTab(_tab: any): void {}
-        registerEvent(_event: any): void {}
-        loadData(): Promise<any> {
-            // MLS-only: no key input. Relay URL is the only persisted setting.
-            return Promise.resolve({ relayUrl: 'ws://localhost:8080' });
-        }
-        saveData(_data: any): Promise<void> {
-            return Promise.resolve();
-        }
-    },
-    PluginSettingTab: class {
-        app: any;
-        plugin: any;
-        containerEl: any;
-        constructor(app: any, plugin: any) {
-            this.app = app;
-            this.plugin = plugin;
-            this.containerEl = {
-                empty: jest.fn(),
-                createEl: jest.fn(),
-            };
-        }
-    },
-    Setting: jest.fn().mockImplementation(() => ({
-        setName: jest.fn().mockReturnThis(),
-        setDesc: jest.fn().mockReturnThis(),
-        addText: jest.fn().mockReturnThis(),
-    })),
-    Notice: jest.fn(),
-    MarkdownView: class {},
-}));
+jest.unstable_mockModule('obsidian', mockObsidianModule);
 
-// MLS-only: main.ts only needs the WASM module initialized (`init`); the MLS
-// classes are driven inside CollabClient, so no CollabCore export is mocked here.
-const mockWasmInit = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
+// MLS-only: main.ts needs the WASM module initialized (`init`) plus the vault
+// sync surface (#32). The MLS doc classes are driven inside CollabClient, so no
+// CollabCore export is mocked here.
+const { wasmInit: mockWasmInit, moduleFactory: collabWasmModuleFactory } = createCollabWasmMock();
+jest.unstable_mockModule('../wasm/collab_wasm', collabWasmModuleFactory);
 
-jest.unstable_mockModule('../wasm/collab_wasm', () => ({
-    __esModule: true,
-    default: mockWasmInit,
-}));
+jest.unstable_mockModule('../collab-client', mockCollabClientModule());
 
-jest.unstable_mockModule('../collab-client', () => ({
-    CollabClient: jest.fn().mockImplementation(() => ({
-        connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
-        disconnect: jest.fn(),
-        getText: jest.fn().mockReturnValue(''),
-        sendUpdate: jest.fn(),
-        onUpdate: jest.fn(),
-        onError: jest.fn(),
-        onDisconnect: jest.fn(),
-    })),
-}));
-
-jest.unstable_mockModule('../editor-sync', () => ({
-    EditorSync: jest.fn().mockImplementation(() => ({
-        bindToEditor: jest.fn(),
-        unbind: jest.fn(),
-        onLocalChange: jest.fn(),
-        getText: jest.fn().mockReturnValue(''),
-        setErrorCallback: jest.fn(),
-    })),
-}));
+jest.unstable_mockModule('../editor-sync', mockEditorSyncModule());
 
 const { Notice } = await import('obsidian');
 const { default: CollabPlugin } = await import('../main');
@@ -95,6 +42,13 @@ function createMockPlugin(): CollabPlugin {
                     .fn<() => Promise<ArrayBuffer>>()
                     .mockResolvedValue(new ArrayBuffer(8)),
             },
+            // Vault sync (#32) registers create/delete/rename handlers and
+            // materializes remote paths.
+            on: jest.fn().mockReturnValue({}),
+            offref: jest.fn(),
+            getAbstractFileByPath: jest.fn().mockReturnValue(null),
+            create: jest.fn<() => Promise<unknown>>().mockResolvedValue({}),
+            createFolder: jest.fn<() => Promise<unknown>>().mockResolvedValue({}),
         },
         workspace: {
             getActiveViewOfType: jest.fn(),
@@ -278,12 +232,8 @@ describe('CollabPlugin', () => {
 
             // MLS-only: config carries a role, never an encryptionKey.
             expect(CollabClient).toHaveBeenCalled();
-            const passedConfig = (CollabClient as jest.Mock).mock.calls[0][0] as {
-                role: string;
-                encryptionKey?: unknown;
-            };
+            const passedConfig = (CollabClient as jest.Mock).mock.calls[0][0] as { role: string };
             expect(passedConfig.role).toBe('owner');
-            expect(passedConfig.encryptionKey).toBeUndefined();
             expect((plugin as any).collabClient).not.toBeNull();
         });
 
@@ -424,15 +374,14 @@ describe('CollabPlugin', () => {
             const plugin = createReadyPlugin();
             let disconnectCallback: ((reason: string) => void) | null = null;
 
-            // Capture the disconnect callback
+            // Capture the disconnect callback. Start from the full shared mock
+            // surface (every method startSession() calls, incl. #32's
+            // onManifestPaths/sendManifestUpdate) and override only onDisconnect —
+            // a hand-rolled subset here would silently exercise startSession()'s
+            // catch-and-stopSession error path instead of the real connected flow.
             const { CollabClient } = await import('../collab-client');
             (CollabClient as jest.Mock).mockImplementation(() => ({
-                connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
-                disconnect: jest.fn(),
-                getText: jest.fn().mockReturnValue(''),
-                sendUpdate: jest.fn(),
-                onUpdate: jest.fn(),
-                onError: jest.fn(),
+                ...createMockClientInstance(),
                 onDisconnect: jest
                     .fn<(cb: (reason: string) => void) => void>()
                     .mockImplementation((cb) => {

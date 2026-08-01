@@ -4,6 +4,7 @@ import {
     WasmPendingMember,
     generate_key_package,
 } from './wasm/collab_wasm';
+import type { WasmEncryptedOp } from './wasm/collab_wasm';
 
 export type CollabRole = 'owner' | 'joiner';
 
@@ -17,14 +18,31 @@ export type CollabRole = 'owner' | 'joiner';
 // bounds every array parsed out of it.
 const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Narrow view of WasmVaultSync (#32): the client only needs to apply remote
+ * manifest updates; local file-event handling stays with the plugin.
+ */
+export interface VaultSyncLike {
+    apply_remote_manifest(update: Uint8Array): string[];
+}
+
 export interface CollabClientConfig {
     relayUrl: string;
     userId: string;
     docId: string;
     role: CollabRole; // owner creates the MLS group; joiner joins via a Welcome
+    /**
+     * Enables vault-manifest sync when provided (#32). The manifest rides the
+     * same relay connection as its OWN MLS group on `manifestDocId`, established
+     * by the same owner/joiner handshake as the file doc — never a shared key.
+     */
+    vaultSync?: VaultSyncLike;
+    /** The locally-trusted manifest doc id (from wasm `manifest_doc_id()`). */
+    manifestDocId?: string;
 }
 
 export type UpdateCallback = (text: string) => void;
+export type ManifestPathsCallback = (newPaths: string[]) => void | Promise<void>;
 export type DisconnectCallback = (reason: string) => void;
 export type ErrorCallback = (error: CollabError) => void;
 export type ConnectionState = 'connected' | 'connecting' | 'disconnected' | 'reconnecting';
@@ -76,8 +94,9 @@ function isWasmCollabError(error: unknown): error is WasmCollabError {
 /**
  * Extract error message from various error types including WASM errors.
  * WASM errors are plain objects that would produce "[object Object]" with String().
+ * Exported so callers outside this module (e.g. main.ts) don't reimplement it.
  */
-function extractErrorMessage(error: unknown): string {
+export function extractErrorMessage(error: unknown): string {
     if (error instanceof Error) {
         return error.message;
     }
@@ -124,15 +143,58 @@ function validateConfig(config: CollabClientConfig): void {
     if (config.role !== 'owner' && config.role !== 'joiner') {
         throw new ConfigValidationError('role must be "owner" or "joiner"');
     }
+
+    validateVaultSyncConfig(config);
+}
+
+/**
+ * Validate the vault-sync pairing (#32): the manifest doc id names a SEPARATE
+ * MLS group riding the same connection, so it must be present and must differ
+ * from the file doc id — a collision would route file and manifest frames to
+ * the same group and defeat per-group isolation.
+ */
+function validateVaultSyncConfig(config: CollabClientConfig): void {
+    if (!config.vaultSync) {
+        return;
+    }
+    if (!config.manifestDocId || typeof config.manifestDocId !== 'string') {
+        throw new ConfigValidationError(
+            'manifestDocId must be a non-empty string when vaultSync is provided'
+        );
+    }
+    if (config.manifestDocId === config.docId) {
+        throw new ConfigValidationError('manifestDocId must differ from docId');
+    }
+}
+
+/**
+ * A view onto one MLS group's mutable doc/pending slot (#32). The file group
+ * (`doc`/`pending`) and the manifest group (`manifestDoc`/`manifestPending`)
+ * run the exact same owner/joiner bootstrap and key_package/welcome/commit
+ * handshake — a `GroupSlot` lets that logic be written once and run twice,
+ * against the two real field pairs, instead of duplicated per group.
+ */
+interface GroupSlot {
+    docId: string;
+    getDoc: () => WasmEncryptedDocument | null;
+    setDoc: (doc: WasmEncryptedDocument | null) => void;
+    getPending: () => WasmPendingMember | null;
+    setPending: (pending: WasmPendingMember | null) => void;
 }
 
 export class CollabClient {
     private ws: WebSocket | null = null;
     private doc: WasmEncryptedDocument | null = null;
     private pending: WasmPendingMember | null = null;
+    // Second, independent MLS group for the vault manifest (#32). Same lifecycle
+    // as `doc`/`pending`, keyed on config.manifestDocId. null until established
+    // (owner) or until the Welcome arrives (joiner).
+    private manifestDoc: WasmEncryptedDocument | null = null;
+    private manifestPending: WasmPendingMember | null = null;
     private groupEstablished = false;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
+    private onManifestPathsCallback: ManifestPathsCallback | null = null;
     private onDisconnectCallback: DisconnectCallback | null = null;
     private onErrorCallback: ErrorCallback | null = null;
     private reconnectAttempts = 0;
@@ -150,17 +212,66 @@ export class CollabClient {
         this.config = config;
     }
 
+    /** The file-group slot, viewing `this.doc`/`this.pending`. */
+    private fileSlot(): GroupSlot {
+        return {
+            docId: this.config.docId,
+            getDoc: () => this.doc,
+            setDoc: (doc) => {
+                this.doc = doc;
+            },
+            getPending: () => this.pending,
+            setPending: (pending) => {
+                this.pending = pending;
+            },
+        };
+    }
+
+    /** The manifest-group slot (#32), viewing `this.manifestDoc`/`this.manifestPending`. */
+    private manifestSlot(): GroupSlot {
+        return {
+            docId: this.config.manifestDocId!,
+            getDoc: () => this.manifestDoc,
+            setDoc: (doc) => {
+                this.manifestDoc = doc;
+            },
+            getPending: () => this.manifestPending,
+            setPending: (pending) => {
+                this.manifestPending = pending;
+            },
+        };
+    }
+
     /**
-     * Establish the MLS group EXACTLY ONCE, on the first successful connect.
+     * Bootstrap one MLS group `slot` as owner (create immediately) or joiner
+     * (ship a single-use key package as an mls_handshake frame; the slot's doc
+     * stays null until the Welcome arrives). Shared by the file group and the
+     * manifest group (#32) — same roles, same wire shape, only the doc id and
+     * the slot being written differ.
+     */
+    private bootstrapGroup(slot: GroupSlot): void {
+        if (this.config.role === 'owner') {
+            slot.setDoc(WasmEncryptedDocument.create(slot.docId, this.config.userId));
+            return;
+        }
+        const pending = generate_key_package(this.config.userId);
+        slot.setPending(pending);
+        this.send({
+            type: 'mls_handshake',
+            doc_id: slot.docId,
+            payload: [...pending.key_package],
+            message_type: 'key_package',
+        });
+    }
+
+    /**
+     * Establish the MLS group(s) EXACTLY ONCE, on the first successful connect.
      * MLS group state is long-lived and persists across reconnects (only
      * `this.ws` is recreated), so onopen must NOT re-run this on a reconnect:
      * re-creating would spawn a NEW empty solo group at epoch 0 and orphan the
      * real group. This guard satisfies the CLAUDE.md reconnect-lifecycle
      * invariant "guard against a second start that would orphan the prior
      * client/handle."
-     * - owner: creates the group document immediately.
-     * - joiner: generates a single-use key package and ships it as an
-     *   mls_handshake frame; `this.doc` stays null until the Welcome arrives.
      *
      * ponytail: first-cut behavior — a joiner whose socket drops mid-handshake
      * (before the Welcome) stays un-joined and fails closed (no plaintext), which
@@ -172,17 +283,23 @@ export class CollabClient {
             return;
         }
         this.groupEstablished = true;
-        if (this.config.role === 'owner') {
-            this.doc = WasmEncryptedDocument.create(this.config.docId, this.config.userId);
-            return;
+        this.bootstrapGroup(this.fileSlot());
+        // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
+        // established by the same handshake. Same role: whoever owns the file doc
+        // owns the manifest group. Throws here fail the connect() attempt via
+        // tryEstablishGroup, exactly like the file group.
+        if (this.config.vaultSync && this.config.manifestDocId) {
+            this.bootstrapGroup(this.manifestSlot());
         }
-        this.pending = generate_key_package(this.config.userId);
-        this.send({
-            type: 'mls_handshake',
-            doc_id: this.config.docId,
-            payload: [...this.pending.key_package],
-            message_type: 'key_package',
-        });
+    }
+
+    /** True when this frame's doc_id is the configured manifest group. */
+    private isManifestFrame(docId: string | undefined): boolean {
+        return (
+            this.config.vaultSync !== undefined &&
+            this.config.manifestDocId !== undefined &&
+            docId === this.config.manifestDocId
+        );
     }
 
     /**
@@ -325,10 +442,19 @@ export class CollabClient {
     }
 
     private subscribe(): boolean {
-        return this.send({
+        const subscribed = this.send({
             type: 'subscribe',
             doc_id: this.config.docId,
         });
+        // Vault sync rides the same connection: also subscribe to the manifest doc.
+        if (this.config.vaultSync && this.config.manifestDocId) {
+            const manifestSubscribed = this.send({
+                type: 'subscribe',
+                doc_id: this.config.manifestDocId,
+            });
+            return subscribed && manifestSubscribed;
+        }
+        return subscribed;
     }
 
     private send(message: object): boolean {
@@ -423,18 +549,25 @@ export class CollabClient {
         }
     }
 
+    /**
+     * Shape and dispatch a `CollabError` to `onErrorCallback`. Defaults to
+     * tagging the file group's doc id; pass `docId` to tag the manifest
+     * group's instead (#32) — the only thing that ever differed between the
+     * two error-reporting call sites.
+     */
     private reportError(
         type: CollabError['type'],
         label: string,
         error: unknown,
-        messagePrefix = ''
+        messagePrefix = '',
+        docId: string | undefined = this.config.docId
     ): void {
         console.error(label, error);
         if (this.onErrorCallback) {
             const collabError: CollabError = {
                 type,
                 message: `${messagePrefix}${extractErrorMessage(error)}`,
-                docId: this.config.docId,
+                docId,
                 originalError: error instanceof Error ? error : undefined,
             };
             this.onErrorCallback(collabError);
@@ -445,6 +578,13 @@ export class CollabClient {
         try {
             if (!message.encrypted || !Array.isArray(message.encrypted)) {
                 throw new Error('Invalid yrs_update message: missing or invalid encrypted field');
+            }
+            // Manifest updates ride the same channel under their own MLS group:
+            // route them before the file-doc guard, which would reject the
+            // manifest doc_id as a misroute.
+            if (this.isManifestFrame(message.doc_id)) {
+                this.handleManifestUpdate(new Uint8Array(message.encrypted));
+                return;
             }
             this.assertDocId('yrs_update', message.doc_id);
             // Fail closed: an update that arrives before the MLS group is
@@ -466,76 +606,171 @@ export class CollabClient {
     }
 
     /**
-     * Handle the MLS handshake wire protocol (#51):
-     * - owner receives a joiner's key_package → builds and sends a Welcome.
-     * - joiner receives a Welcome → joins the group, consuming its key package.
-     * - either side receives a commit → applies it to advance the epoch.
+     * Apply key_package/welcome/commit to one MLS group `slot` — the shared
+     * core of the file-group and manifest-group (#32) handshakes, which
+     * otherwise differ only in which doc id and which slot they read/write.
+     */
+    private applyGroupHandshake(
+        slot: GroupSlot,
+        messageType: MlsHandshakeMessage['message_type'],
+        payload: Uint8Array
+    ): void {
+        switch (messageType) {
+            case 'key_package': {
+                // Only an owner with an established group answers a key package.
+                const doc = slot.getDoc();
+                if (this.config.role !== 'owner' || !doc) {
+                    return;
+                }
+                const invite = doc.create_invite(payload);
+                this.send({
+                    type: 'mls_handshake',
+                    doc_id: slot.docId,
+                    payload: [...invite.welcome],
+                    message_type: 'welcome',
+                });
+                break;
+            }
+            case 'welcome': {
+                // Only a joiner that has a pending key package and is NOT already
+                // in a group joins. Rejecting when the slot's doc is set prevents
+                // an attacker replaying a Welcome to clobber an established group
+                // (and the join(invite, null!) throw path when there is no pending).
+                const pending = slot.getPending();
+                if (this.config.role !== 'joiner' || !pending || slot.getDoc()) {
+                    return;
+                }
+                // Bind the LOCAL group docId, never message.doc_id.
+                const invite = WasmInvite.from_welcome(slot.docId, payload);
+                // Clear the reference BEFORE calling join(), not after: the
+                // generated wasm-bindgen glue destroys `pending`'s handle
+                // unconditionally on call entry (pending.__destroy_into_raw()),
+                // before the Rust call even runs — so the key package is consumed
+                // whether join() succeeds or throws (e.g. a malformed/malicious
+                // Welcome from the untrusted relay). If we cleared the slot only
+                // on the success line below, a throw here would leave it pointing
+                // at the now-dead handle, and every later Welcome (including a
+                // legitimate one) would retry join() with that dead handle and
+                // throw forever. Clearing in lockstep with the consuming call makes
+                // a failed join fail closed exactly like the documented
+                // socket-drops-mid-handshake case: un-joined, no plaintext, a fresh
+                // session is required to retry.
+                slot.setPending(null);
+                slot.setDoc(WasmEncryptedDocument.join(invite, pending));
+                break;
+            }
+            case 'commit': {
+                slot.getDoc()?.process_commit(payload);
+                break;
+            }
+            default:
+                console.warn(`[CollabClient] Unknown mls_handshake message_type: ${messageType}`);
+                break;
+        }
+    }
+
+    /**
+     * Handle the MLS handshake wire protocol (#51), routing to the file group
+     * or the manifest group (#32) — the two groups share the exact same
+     * key_package/welcome/commit protocol via `applyGroupHandshake`.
      */
     private handleMlsHandshake(message: MlsHandshakeMessage): void {
         try {
             if (!message.payload || !Array.isArray(message.payload)) {
                 throw new Error('Invalid mls_handshake message: missing or invalid payload');
             }
-            this.assertDocId('mls_handshake', message.doc_id);
             const payload = new Uint8Array(message.payload);
-
-            switch (message.message_type) {
-                case 'key_package': {
-                    // Only an owner with an established group answers a key package.
-                    if (this.config.role !== 'owner' || !this.doc) {
-                        return;
-                    }
-                    const invite = this.doc.create_invite(payload);
-                    this.send({
-                        type: 'mls_handshake',
-                        doc_id: this.config.docId,
-                        payload: [...invite.welcome],
-                        message_type: 'welcome',
-                    });
-                    break;
-                }
-                case 'welcome': {
-                    // Only a joiner that has a pending key package and is NOT already
-                    // in a group joins. Rejecting when this.doc is set prevents an
-                    // attacker replaying a Welcome to clobber an established group (and
-                    // the join(invite, null!) throw path when there is no pending).
-                    if (this.config.role !== 'joiner' || !this.pending || this.doc) {
-                        return;
-                    }
-                    // Bind the LOCAL docId, never message.doc_id.
-                    const invite = WasmInvite.from_welcome(this.config.docId, payload);
-                    const pending = this.pending;
-                    // Clear the reference BEFORE calling join(), not after: the
-                    // generated wasm-bindgen glue destroys `pending`'s handle
-                    // unconditionally on call entry (pending.__destroy_into_raw()),
-                    // before the Rust call even runs — so the key package is consumed
-                    // whether join() succeeds or throws (e.g. a malformed/malicious
-                    // Welcome from the untrusted relay). If we nulled this.pending only
-                    // on the success line below, a throw here would leave it pointing
-                    // at the now-dead handle, and every later Welcome (including a
-                    // legitimate one) would retry join() with that dead handle and
-                    // throw forever. Clearing in lockstep with the consuming call makes
-                    // a failed join fail closed exactly like the documented
-                    // socket-drops-mid-handshake case: un-joined, no plaintext, a fresh
-                    // session is required to retry.
-                    this.pending = null;
-                    this.doc = WasmEncryptedDocument.join(invite, pending);
-                    break;
-                }
-                case 'commit': {
-                    this.doc?.process_commit(payload);
-                    break;
-                }
-                default:
-                    console.warn(
-                        `[CollabClient] Unknown mls_handshake message_type: ${message.message_type}`,
-                        message
+            // Manifest-group handshake rides the same channel; route it before the
+            // file-doc guard (which would reject the manifest doc_id as a misroute).
+            if (this.isManifestFrame(message.doc_id)) {
+                try {
+                    this.applyGroupHandshake(this.manifestSlot(), message.message_type, payload);
+                } catch (error) {
+                    this.reportError(
+                        'sync',
+                        'Failed to process manifest handshake:',
+                        error,
+                        '',
+                        this.config.manifestDocId
                     );
-                    break;
+                }
+                return;
             }
+            this.assertDocId('mls_handshake', message.doc_id);
+            this.applyGroupHandshake(this.fileSlot(), message.message_type, payload);
         } catch (error) {
             this.reportError('sync', 'Failed to process MLS handshake:', error);
         }
+    }
+
+    /**
+     * Decrypt and apply a remote manifest update (#32).
+     *
+     * Decryption is authenticated by the manifest MLS group: a ciphertext bound
+     * to any other group (a file doc, a stale group) fails here and never
+     * reaches the manifest. Newly-announced paths are subscribed to and surfaced
+     * via onManifestPaths.
+     */
+    private handleManifestUpdate(encrypted: Uint8Array): void {
+        try {
+            if (this.manifestDoc === null) {
+                // Fail closed: an update before the manifest group is established
+                // cannot be decrypted.
+                throw new Error('no manifest MLS group established');
+            }
+            const plaintext = this.manifestDoc.decrypt_bytes(encrypted);
+            const newPaths = this.config.vaultSync!.apply_remote_manifest(plaintext);
+            for (const path of newPaths) {
+                this.send({ type: 'subscribe', doc_id: path });
+            }
+            if (this.onManifestPathsCallback) {
+                void this.onManifestPathsCallback(newPaths);
+            }
+        } catch (error) {
+            this.reportError(
+                'decryption',
+                'Failed to apply manifest update:',
+                error,
+                '',
+                this.config.manifestDocId
+            );
+        }
+    }
+
+    /** Broadcast an encrypted CRDT op as a `yrs_update` frame for `docId`. */
+    private sendYrsUpdate(docId: string, op: WasmEncryptedOp): boolean {
+        return this.send({
+            type: 'yrs_update',
+            doc_id: docId,
+            encrypted: [...op.ciphertext],
+            epoch: Number(op.epoch),
+        });
+    }
+
+    /**
+     * Encrypt and broadcast a local manifest update (#32) under the manifest MLS
+     * group's current epoch. Fails closed (returns false) until that group is
+     * established. Queues like any other frame when disconnected.
+     */
+    sendManifestUpdate(update: Uint8Array): boolean {
+        const { vaultSync, manifestDocId } = this.config;
+        if (!vaultSync || !manifestDocId) {
+            console.warn('[CollabClient] sendManifestUpdate called without vault sync configured');
+            return false;
+        }
+        if (this.manifestDoc === null) {
+            return false;
+        }
+        try {
+            return this.sendYrsUpdate(manifestDocId, this.manifestDoc.encrypt_bytes(update));
+        } catch (error) {
+            this.reportError('sync', 'Failed to send manifest update:', error, '', manifestDocId);
+            return false;
+        }
+    }
+
+    onManifestPaths(callback: ManifestPathsCallback): void {
+        this.onManifestPathsCallback = callback;
     }
 
     private handleReconnect(): void {
@@ -634,13 +869,7 @@ export class CollabClient {
             }
 
             // MLS encrypts under the group's current epoch; the op carries both.
-            const op = this.doc.get_encrypted_update();
-            return this.send({
-                type: 'yrs_update',
-                doc_id: this.config.docId,
-                encrypted: [...op.ciphertext],
-                epoch: Number(op.epoch),
-            });
+            return this.sendYrsUpdate(this.config.docId, this.doc.get_encrypted_update());
         } catch (error) {
             this.reportError('sync', 'Failed to send update:', error);
             return false;
@@ -667,6 +896,21 @@ export class CollabClient {
         return this.doc?.get_content() ?? '';
     }
 
+    /**
+     * Free and null out one group slot's doc + pending handles. Shared by
+     * disconnect() for the file group and the manifest group (#32) — same
+     * free/null pattern GroupSlot already abstracts for bootstrap/handshake.
+     *
+     * Do NOT call this after a successful join() — join() consumes the
+     * pending handle by value, so freeing it here too would double-free.
+     */
+    private freeSlot(slot: GroupSlot): void {
+        slot.getDoc()?.free();
+        slot.setDoc(null);
+        slot.getPending()?.free();
+        slot.setPending(null);
+    }
+
     disconnect(): void {
         this.maxReconnectAttempts = 0; // Prevent reconnection
         this.connectPromise = null; // Clear any pending connection promise
@@ -677,13 +921,11 @@ export class CollabClient {
         }
         this.ws?.close();
         this.ws = null;
-        this.doc?.free();
-        this.doc = null;
         // Free a still-unconsumed key package (a joiner that never got its
-        // Welcome). Do NOT free after a successful join — join() consumes the
-        // handle by value, so freeing there would double-free.
-        this.pending?.free();
-        this.pending = null;
+        // Welcome); see freeSlot's doc comment for the double-free hazard.
+        this.freeSlot(this.fileSlot());
+        // Same lifecycle for the manifest group (#32).
+        this.freeSlot(this.manifestSlot());
         // Allow a future reconnect after an explicit disconnect to re-establish.
         this.groupEstablished = false;
     }

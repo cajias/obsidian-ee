@@ -7,7 +7,9 @@ import init, {
     WasmPendingMember,
     WasmInvite,
     WasmEncryptedOp,
+    WasmVaultSync,
     generate_key_package,
+    manifest_doc_id,
 } from '../../wasm/collab_wasm';
 
 // getrandom (wasm-pack --target web) calls crypto.getRandomValues, not OS entropy.
@@ -27,7 +29,9 @@ interface RealWasm {
     WasmPendingMember: typeof WasmPendingMember;
     WasmInvite: typeof WasmInvite;
     WasmEncryptedOp: typeof WasmEncryptedOp;
+    WasmVaultSync: typeof WasmVaultSync;
     generate_key_package: typeof generate_key_package;
+    manifest_doc_id: typeof manifest_doc_id;
 }
 
 /** Load + init the REAL committed WASM artifact, mirroring main.ts:87-104. */
@@ -44,6 +48,8 @@ export async function loadRealWasm(): Promise<RealWasm> {
         WasmPendingMember,
         WasmInvite,
         WasmEncryptedOp,
+        WasmVaultSync,
         generate_key_package,
+        manifest_doc_id,
     };
 }

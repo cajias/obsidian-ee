@@ -27,7 +27,10 @@ pub use registry::{
     DocumentEntry, DocumentRegistry, DocumentVariant, EncryptionMetadata, RegistryError,
 };
 pub use vault_manifest::{VaultManifest, MANIFEST_DOC_ID};
-pub use vault_sync::{SyncAction, SyncActionKind, VaultSyncConfig, VaultSyncManager};
+pub use vault_sync::{
+    SyncAction, SyncActionKind, VaultSyncConfig, VaultSyncManager, MAX_MANIFEST_UPDATE_BYTES,
+    MAX_NEW_PATHS_PER_APPLY,
+};
 
 /// Document identifier type.
 pub type DocumentId = String;

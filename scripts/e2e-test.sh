@@ -8,13 +8,17 @@ COMPOSE="docker compose -f docker/docker-compose.yml"
 # ponytail: shared gate invariant with xtask/src/main.rs run_e2e() — gate on the
 # relay healthcheck before running tests, and pass `--include-ignored` so BOTH the
 # in-process and the #[ignore]d wire tests run. Keep this rule in sync across both
-# entry points. The docker-absent case intentionally DIFFERS: this script degrades
-# to the non-ignored tests, whereas xtask requires docker and returns FAILURE.
+# entry points. The docker-absent/daemon-down case intentionally DIFFERS: this
+# script degrades to the non-ignored tests, whereas xtask requires docker and
+# returns FAILURE.
 
 echo "Building release binaries..."
 cargo build --workspace --release
 
-if command -v docker >/dev/null 2>&1; then
+# `command -v docker` only proves the CLI exists, not that the daemon behind it
+# is reachable — `docker compose ps`/`up` would still fail under `set -e` with
+# the daemon stopped. `docker info` is the actual liveness check.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if ! $COMPOSE ps --quiet 2>/dev/null | grep -q .; then
         echo "Starting relay via Docker Compose..."
         $COMPOSE up -d
@@ -41,7 +45,7 @@ if command -v docker >/dev/null 2>&1; then
     echo "Running E2E tests (including Docker-gated wire tests)..."
     cargo test --package e2e-tests -- --include-ignored --test-threads=1
 else
-    echo "SKIP: docker unavailable — wire tests not run"
+    echo "SKIP: docker unavailable or daemon not running — wire tests not run"
     echo "Running Docker-independent E2E tests only..."
     cargo test --package e2e-tests
 fi

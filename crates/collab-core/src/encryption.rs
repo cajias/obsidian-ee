@@ -84,6 +84,34 @@ impl EncryptedDocument {
         self.doc.apply_update(&update)
     }
 
+    /// Encrypt caller-supplied bytes under this document's MLS group, WITHOUT
+    /// touching the internal Yrs doc.
+    ///
+    /// Used for transport that carries its own CRDT (the vault manifest rides a
+    /// dedicated group on `MANIFEST_DOC_ID`): the bytes are the manifest's own
+    /// yrs update, not this doc's text. Doc-scoping/replay isolation comes from
+    /// per-group separation — ciphertext from another group's MLS state fails
+    /// authentication here, exactly like a cross-document splice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MLS encryption fails.
+    pub fn encrypt_bytes(&mut self, plaintext: &[u8]) -> Result<EncryptedOp> {
+        let ciphertext = self.mls.encrypt(plaintext)?;
+        Ok(EncryptedOp { ciphertext, epoch: self.mls.epoch() })
+    }
+
+    /// Decrypt bytes produced by [`Self::encrypt_bytes`] on a peer's group,
+    /// returning the plaintext without applying it to the internal Yrs doc.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MLS decryption/authentication fails (including a
+    /// ciphertext bound to a different MLS group).
+    pub fn decrypt_bytes(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.mls.decrypt(ciphertext)
+    }
+
     /// Create an invite for another user to join.
     ///
     /// Takes the key package bytes from a `PendingMember`.
@@ -184,5 +212,39 @@ mod tests {
 
         // Verify the op was created
         assert!(!encrypted_op.ciphertext.is_empty());
+    }
+
+    /// A two-member group round-trips arbitrary bytes (the manifest transport
+    /// path) without going through the internal Yrs doc.
+    #[test]
+    fn test_encrypt_bytes_roundtrip() {
+        let mut alice = EncryptedDocument::create("__vault_manifest__", "alice").unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let invite = alice.create_invite(bob_pending.key_package()).unwrap();
+        let mut bob = EncryptedDocument::join(&invite, bob_pending).unwrap();
+
+        let manifest = b"a fake manifest CRDT update";
+        let op = alice.encrypt_bytes(manifest).unwrap();
+        assert!(!op.ciphertext.windows(5).any(|w| w == b"fake"), "must be ciphertext");
+        assert_eq!(bob.decrypt_bytes(&op.ciphertext).unwrap(), manifest);
+    }
+
+    /// Cross-group isolation: ciphertext from one MLS group (e.g. a file doc)
+    /// must NOT decrypt under a different group (e.g. the manifest doc), even
+    /// though both are `EncryptedDocument`s. This is the doc-scoping/replay
+    /// defense that per-group separation provides post-MLS.
+    #[test]
+    fn test_encrypt_bytes_rejected_by_other_group() {
+        // Two INDEPENDENT groups (distinct MLS state), each solo.
+        let mut file_doc = EncryptedDocument::create("shared.md", "alice").unwrap();
+        let mut manifest_doc = EncryptedDocument::create("__vault_manifest__", "alice").unwrap();
+
+        let file_op = file_doc.encrypt_bytes(b"file content").unwrap();
+        // The manifest group cannot authenticate a file-group ciphertext.
+        assert!(manifest_doc.decrypt_bytes(&file_op.ciphertext).is_err());
+
+        let manifest_op = manifest_doc.encrypt_bytes(b"manifest content").unwrap();
+        // ...and vice versa.
+        assert!(file_doc.decrypt_bytes(&manifest_op.ciphertext).is_err());
     }
 }

@@ -219,6 +219,29 @@ describe('CollabClient', () => {
                 'role must be "owner" or "joiner"'
             );
         });
+
+        it('should throw ConfigValidationError when vaultSync is set without manifestDocId', () => {
+            const invalidConfig = {
+                ...config,
+                vaultSync: { apply_remote_manifest: (): string[] => [] },
+            };
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
+                'manifestDocId must be a non-empty string when vaultSync is provided'
+            );
+        });
+
+        it('should throw ConfigValidationError when manifestDocId equals docId', () => {
+            const invalidConfig = {
+                ...config,
+                vaultSync: { apply_remote_manifest: (): string[] => [] },
+                manifestDocId: config.docId,
+            };
+            expect(() => new CollabClient(invalidConfig)).toThrow(ConfigValidationError);
+            expect(() => new CollabClient(invalidConfig)).toThrow(
+                'manifestDocId must differ from docId'
+            );
+        });
     });
 
     describe('connect', () => {
