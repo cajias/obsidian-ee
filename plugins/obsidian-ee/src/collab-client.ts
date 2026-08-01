@@ -268,21 +268,19 @@ export class CollabClient {
                 };
 
                 this.ws.onerror = (error) => {
-                    console.error('WebSocket error:', error);
                     if (!hasOpened) {
                         // Socket failed before opening. Reject this attempt's promise so
                         // .finally() clears connectPromise (rejection is delegated to
                         // onclose, which follows onerror, to drive the backoff loop).
+                        console.error('WebSocket error:', error);
                         reject(error);
-                    } else if (this.onErrorCallback) {
+                    } else {
                         // Post-open error on a live connection: surface via error callback.
-                        const collabError: CollabError = {
-                            type: 'connection',
-                            message: error instanceof Error ? error.message : 'WebSocket error',
-                            docId: this.config.docId,
-                            originalError: error instanceof Error ? error : undefined,
-                        };
-                        this.onErrorCallback(collabError);
+                        this.reportError(
+                            'connection',
+                            'WebSocket error:',
+                            error instanceof Error ? error : new Error('WebSocket error')
+                        );
                     }
                 };
 
@@ -399,16 +397,14 @@ export class CollabClient {
                     break;
             }
         } catch (error) {
-            console.error('Failed to parse message:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'sync',
-                    message: `Failed to parse message: ${extractErrorMessage(error)}`,
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
-            }
+            // Prefix preserved so callers can distinguish "the relay sent unparseable
+            // JSON" from other 'sync' errors (message asserted on in tests).
+            this.reportError(
+                'sync',
+                'Failed to parse message:',
+                error,
+                'Failed to parse message: '
+            );
         }
     }
 
@@ -427,12 +423,17 @@ export class CollabClient {
         }
     }
 
-    private reportError(type: CollabError['type'], label: string, error: unknown): void {
+    private reportError(
+        type: CollabError['type'],
+        label: string,
+        error: unknown,
+        messagePrefix = ''
+    ): void {
         console.error(label, error);
         if (this.onErrorCallback) {
             const collabError: CollabError = {
                 type,
-                message: extractErrorMessage(error),
+                message: `${messagePrefix}${extractErrorMessage(error)}`,
                 docId: this.config.docId,
                 originalError: error instanceof Error ? error : undefined,
             };
@@ -555,16 +556,11 @@ export class CollabClient {
                     return;
                 }
                 this.connect().catch((error) => {
-                    console.error('Reconnect failed:', error);
-                    if (this.onErrorCallback) {
-                        const collabError: CollabError = {
-                            type: 'connection',
-                            message: error instanceof Error ? error.message : 'Reconnection failed',
-                            docId: this.config.docId,
-                            originalError: error instanceof Error ? error : undefined,
-                        };
-                        this.onErrorCallback(collabError);
-                    }
+                    this.reportError(
+                        'connection',
+                        'Reconnect failed:',
+                        error instanceof Error ? error : new Error('Reconnection failed')
+                    );
                 });
             }, delay);
         } else {
