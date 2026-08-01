@@ -186,6 +186,20 @@ export class CollabClient {
     }
 
     /**
+     * Shared by every onopen failure branch (identify/subscribe send failure,
+     * establishGroup throwing): close and drop the socket, then reject this
+     * connect() attempt. Without settling here, connectPromise would never
+     * resolve/reject and the dedup guard in connect() would return the same
+     * stale, never-settling promise forever.
+     */
+    private failConnect(reject: (reason?: unknown) => void, error: unknown): void {
+        console.error('[CollabClient]', error);
+        this.ws?.close();
+        this.ws = null;
+        reject(error);
+    }
+
+    /**
      * Run establishGroup(), rejecting this connect() attempt and tearing down the
      * socket if it throws instead of letting the throw abort onopen unhandled.
      * WasmEncryptedDocument.create()/generate_key_package() are wasm-bindgen
@@ -198,10 +212,7 @@ export class CollabClient {
             this.establishGroup();
             return true;
         } catch (error) {
-            console.error('[CollabClient] establishGroup failed:', error);
-            this.ws?.close();
-            this.ws = null;
-            reject(error);
+            this.failConnect(reject, error);
             return false;
         }
     }
@@ -236,11 +247,10 @@ export class CollabClient {
                     const subscribed = this.subscribe();
 
                     if (!identified || !subscribed) {
-                        const error = new Error('Failed to send initialization messages');
-                        console.error('[CollabClient]', error.message);
-                        this.ws?.close();
-                        this.ws = null;
-                        reject(error);
+                        this.failConnect(
+                            reject,
+                            new Error('Failed to send initialization messages')
+                        );
                         return;
                     }
 
@@ -379,15 +389,7 @@ export class CollabClient {
                     console.log('Subscribed to document:', message.doc_id);
                     break;
                 case 'error':
-                    console.error('Server error:', message.message);
-                    if (this.onErrorCallback) {
-                        const collabError: CollabError = {
-                            type: 'sync',
-                            message: message.message || 'Server error',
-                            docId: this.config.docId,
-                        };
-                        this.onErrorCallback(collabError);
-                    }
+                    this.reportError('sync', 'Server error:', message.message || 'Server error');
                     break;
                 default:
                     console.warn(
@@ -501,8 +503,22 @@ export class CollabClient {
                     }
                     // Bind the LOCAL docId, never message.doc_id.
                     const invite = WasmInvite.from_welcome(this.config.docId, payload);
-                    this.doc = WasmEncryptedDocument.join(invite, this.pending);
+                    const pending = this.pending;
+                    // Clear the reference BEFORE calling join(), not after: the
+                    // generated wasm-bindgen glue destroys `pending`'s handle
+                    // unconditionally on call entry (pending.__destroy_into_raw()),
+                    // before the Rust call even runs — so the key package is consumed
+                    // whether join() succeeds or throws (e.g. a malformed/malicious
+                    // Welcome from the untrusted relay). If we nulled this.pending only
+                    // on the success line below, a throw here would leave it pointing
+                    // at the now-dead handle, and every later Welcome (including a
+                    // legitimate one) would retry join() with that dead handle and
+                    // throw forever. Clearing in lockstep with the consuming call makes
+                    // a failed join fail closed exactly like the documented
+                    // socket-drops-mid-handshake case: un-joined, no plaintext, a fresh
+                    // session is required to retry.
                     this.pending = null;
+                    this.doc = WasmEncryptedDocument.join(invite, pending);
                     break;
                 }
                 case 'commit': {
@@ -630,16 +646,7 @@ export class CollabClient {
                 epoch: Number(op.epoch),
             });
         } catch (error) {
-            console.error('Failed to send update:', error);
-            if (this.onErrorCallback) {
-                const collabError: CollabError = {
-                    type: 'sync',
-                    message: extractErrorMessage(error),
-                    docId: this.config.docId,
-                    originalError: error instanceof Error ? error : undefined,
-                };
-                this.onErrorCallback(collabError);
-            }
+            this.reportError('sync', 'Failed to send update:', error);
             return false;
         }
     }
