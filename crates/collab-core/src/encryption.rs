@@ -204,6 +204,36 @@ impl EncryptedDocument {
     pub fn sign_doc_key_proof(&self, doc_id: &str) -> Result<Vec<u8>> {
         self.mls.sign_doc_key_proof(doc_id)
     }
+
+    /// Snapshot + encrypt this document's MLS group state for at-rest
+    /// persistence (issue #30). See [`MlsDocumentGroup::snapshot_encrypted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is all-zeros or AEAD sealing fails.
+    pub fn snapshot_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        self.mls.snapshot_encrypted(key)
+    }
+
+    /// Restore an encrypted document's MLS group from a snapshot, rebuilding a
+    /// fresh (empty) CRDT doc under `doc_id`. Returns `Ok(None)` if the snapshot
+    /// is stale (`epoch < min_epoch`) or holds no group; the caller re-joins.
+    /// See [`MlsDocumentGroup::restore_encrypted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on decrypt/parse/version/epoch-mismatch failure.
+    pub fn restore_encrypted(
+        doc_id: &str,
+        snapshot: &[u8],
+        key: &[u8; 32],
+        min_epoch: u64,
+    ) -> Result<Option<Self>> {
+        let Some(mls) = MlsDocumentGroup::restore_encrypted(snapshot, key, min_epoch)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self { doc: CollabDocument::new(doc_id.to_string()), mls }))
+    }
 }
 
 /// Invite for joining an encrypted document.

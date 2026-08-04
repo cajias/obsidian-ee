@@ -277,6 +277,39 @@ impl MlsDocumentGroup {
         &self.user_id
     }
 
+    // --- accessors for the persistence module (issue #30) ---
+
+    /// The group id as bytes (for snapshotting / reloading via `MlsGroup::load`).
+    pub(crate) fn group_id_bytes(&self) -> &[u8] {
+        self.group.group_id().as_slice()
+    }
+
+    /// The signature scheme of this member's keypair.
+    pub(crate) fn signature_scheme(&self) -> SignatureScheme {
+        self.signature_keys.signature_scheme()
+    }
+
+    /// This member's signature public key (used to reload the keypair on restore).
+    pub(crate) fn signature_public_key(&self) -> &[u8] {
+        self.signature_keys.public()
+    }
+
+    /// The crypto provider, whose `MemoryStorage` is the snapshot surface.
+    pub(crate) const fn crypto_provider(&self) -> &OpenMlsRustCrypto {
+        &self.crypto
+    }
+
+    /// Reassemble a group from restored parts (issue #30 persistence).
+    pub(crate) const fn from_parts(
+        user_id: String,
+        group: MlsGroup,
+        crypto: OpenMlsRustCrypto,
+        signature_keys: SignatureKeyPair,
+        credential_with_key: CredentialWithKey,
+    ) -> Self {
+        Self { user_id, group, crypto, signature_keys, _credential_with_key: credential_with_key }
+    }
+
     /// Add a new member to the group.
     ///
     /// # Errors

@@ -259,7 +259,7 @@ hardening" milestone) and MUST NOT quietly become permanent.
 ### Current MVP Limitations
 
 1. **BasicCredential only**: MLS uses simple string-based credentials. X.509 certificate support would provide stronger identity guarantees.
-2. **No key persistence**: MLS group state is in-memory only. Restarting a client requires re-joining the group.
+2. **Encrypted-at-rest group state (session resumption)**: MLS group state is persisted encrypted at rest with AES-256-GCM (`snapshot_encrypted` / `restore_encrypted` in `collab-core`) and resumed on restart without re-joining, preserving the epoch. The at-rest key's provenance (OS keychain / passphrase) is the client's responsibility — `collab-core` takes a caller-supplied 32-byte key and rejects an all-zeros key (fail-closed). A snapshot whose epoch predates a known rotation (`epoch < min_epoch`) falls back to a clean re-join rather than resuming stale state. Wiring the Obsidian plugin / CLI data-dir storage that calls this surface is follow-up work.
 3. **Member removal is owner-only**: Removal is implemented via MLS Remove (epoch advance + rekey), enforced by an owner-only mint guard and a receive-side owner check (see [Member Removal](#member-removal-issue-31)). Self-leave and owner succession are not yet implemented.
 
 ### Production Requirements
@@ -269,7 +269,7 @@ hardening" milestone) and MUST NOT quietly become permanent.
 - [ ] Add user identity verification (e.g., Obsidian account integration)
 - [ ] Implement rate limiting on the relay server
 - [ ] Add TLS termination at the infrastructure level
-- [ ] Persist MLS group state for session resumption
+- [x] Persist MLS group state for session resumption (encrypted-at-rest via `collab-core::snapshot_encrypted`/`restore_encrypted`; plugin/CLI data-dir wiring is follow-up)
 - [x] Implement member removal and key revocation (owner-removes-member; issue #31)
 - [ ] Implement self-leave and owner succession (issue #31 follow-up)
 - [ ] Add audit logging for security events

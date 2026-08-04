@@ -303,8 +303,10 @@ dependencies = [
 name = "collab-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "collab-proto",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",

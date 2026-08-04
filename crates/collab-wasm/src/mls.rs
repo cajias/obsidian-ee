@@ -170,4 +170,38 @@ impl WasmEncryptedDocument {
     pub fn epoch(&self) -> u64 {
         self.0.epoch()
     }
+
+    /// Snapshot + encrypt this document's MLS group state for at-rest
+    /// persistence (issue #30). `key` MUST be exactly 32 bytes (all-zeros
+    /// rejected). Returns `nonce || ciphertext`. The caller owns key provenance
+    /// (OS keychain / passphrase) and where the blob is stored (plugin data dir).
+    pub fn snapshot_encrypted(&self, key: &[u8]) -> Result<Vec<u8>, JsError> {
+        let key = to_key(key)?;
+        self.0.snapshot_encrypted(&key).map_err(js_err)
+    }
+
+    /// Restore an encrypted document from a snapshot, rebuilding a fresh CRDT doc
+    /// under `doc_id`. `key` MUST be exactly 32 bytes. A stale snapshot
+    /// (`epoch < min_epoch`) or one with no group surfaces as a JsError
+    /// ("stale snapshot; re-join required") since JS cannot easily express
+    /// `Option` — the caller must treat that error as "do a clean re-join".
+    pub fn restore_encrypted(
+        doc_id: &str,
+        snapshot: &[u8],
+        key: &[u8],
+        min_epoch: u64,
+    ) -> Result<WasmEncryptedDocument, JsError> {
+        let key = to_key(key)?;
+        match EncryptedDocument::restore_encrypted(doc_id, snapshot, &key, min_epoch) {
+            Ok(Some(doc)) => Ok(Self(doc)),
+            Ok(None) => Err(JsError::new("stale snapshot; re-join required")),
+            Err(e) => Err(js_err(e)),
+        }
+    }
+}
+
+/// Convert a JS byte slice into a fixed 32-byte AEAD key, rejecting any other
+/// length up front (a short/long key can never be a valid AES-256 key).
+fn to_key(key: &[u8]) -> Result<[u8; 32], JsError> {
+    key.try_into().map_err(|_| JsError::new("key must be exactly 32 bytes"))
 }
