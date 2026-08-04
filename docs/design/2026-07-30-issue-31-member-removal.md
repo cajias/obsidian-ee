@@ -15,8 +15,9 @@ subscribe capability stops working.
 
 ## Who-may-remove-whom policy (PICKED — documented in docs/security.md)
 
-**The group creator (owner) may remove any member; a non-owner may remove no one
-except themselves (leave).** Rationale:
+**The group creator (owner) may remove any member; a non-owner may remove no one.**
+Self-leave (a member removing themselves) and owner-succession are explicitly future
+work — NOT implemented in this PR (matches docs/security.md). Rationale:
 - The codebase uses `BasicCredential` (a `user_id` byte string) with no role
   system and no stored ACL. A full any-member-can-remove-any-member model invites
   removal races and griefing (any member evicts any other); a designated-owner

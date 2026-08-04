@@ -467,6 +467,17 @@ impl MlsDocumentGroup {
         if is_removal && committer != self.owner_id {
             return Err(Error::Mls("removal commit from a non-owner is rejected".to_string()));
         }
+        // The owner (leaf 0) is the anchor of the whole who-may-remove-whom
+        // policy — owner_id is derived from leaf 0 at join. A commit that evicts
+        // leaf 0 would orphan that identity, so it is REJECTED even if its
+        // committer passed the owner check above (BasicCredential identities are
+        // not unique, so a member can commit under the owner's identity string).
+        // owner-succession / self-leave remain future work.
+        if is_removal
+            && staged_commit.remove_proposals().any(|p| p.remove_proposal().removed().u32() == 0)
+        {
+            return Err(Error::Mls("commit removes the group owner; rejected".to_string()));
+        }
 
         // Merge the staged commit to update our group state.
         self.group
@@ -925,6 +936,58 @@ mod tests {
             "a Remove commit from a non-owner must be rejected, got {result:?}"
         );
         assert_eq!(alice.epoch(), epoch_before, "a rejected removal must not advance the epoch");
+    }
+
+    #[test]
+    fn receive_side_rejects_removal_of_the_owner() {
+        // Scenario 6 (defense-in-depth): a commit that REMOVES THE OWNER (leaf 0)
+        // must be rejected even when its committer passes the non-owner check.
+        // openmls forbids removing your own leaf (CannotRemoveSelf), so the real
+        // owner can never mint a self-removal; the reachable threat is a member
+        // that joined under the OWNER'S identity string ("alice") with a fresh
+        // signature key (BasicCredential identities are not unique — only keys
+        // are) and evicts leaf 0. That committer's identity == owner_id, so the
+        // non-owner-committer guard PASSES and ONLY the new owner-target guard
+        // catches it: RED before the guard (owner-eviction merges, epoch
+        // advances), GREEN after.
+        let (mut alice, _kp) = MlsDocumentGroup::create("alice").unwrap();
+
+        // Bob joins as a normal member (leaf 1); he is the processor.
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let (_commit, welcome) = alice.add_member(bob_pending.key_package()).unwrap();
+        let mut bob = bob_pending.join(&welcome).unwrap();
+
+        // A spoofer joins claiming the OWNER'S identity ("alice") at leaf 2.
+        let spoof_pending = MlsDocumentGroup::generate_key_package("alice").unwrap();
+        let (add_commit, spoof_welcome) = alice.add_member(spoof_pending.key_package()).unwrap();
+        bob.process_commit(&add_commit).unwrap();
+        let mut spoofer = spoof_pending.join(&spoof_welcome).unwrap();
+        assert_eq!(bob.owner_id, "alice", "processor's learned owner is the leaf-0 creator");
+
+        // Spoofer crafts a raw Remove commit evicting leaf 0 (the real owner);
+        // leaf 0 is not the spoofer's own leaf, so openmls mints it.
+        let (commit, _welcome, _gi) = spoofer
+            .group
+            .remove_members(&spoofer.crypto, &spoofer.signature_keys, &[LeafNodeIndex::new(0)])
+            .expect("removing a leaf that is not one's own must mint a commit");
+        spoofer.group.clear_pending_commit(spoofer.crypto.storage()).unwrap();
+        let commit_bytes = commit.tls_serialize_detached().unwrap();
+
+        let epoch_before = bob.epoch();
+        let result = bob.process_commit(&commit_bytes);
+        assert!(
+            result.is_err(),
+            "a commit removing the owner (leaf 0) must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            bob.epoch(),
+            epoch_before,
+            "a rejected owner-removal must not advance the epoch"
+        );
+        assert!(
+            bob.group.members().any(|m| m.index == LeafNodeIndex::new(0)),
+            "the owner must remain a member after a rejected owner-removal"
+        );
     }
 
     #[test]
