@@ -75,7 +75,7 @@ async fn identify(client: &mut TestClient, user_id: &str) {
 
 /// Helper to subscribe a client to a document.
 async fn subscribe(client: &mut TestClient, doc_id: &str) {
-    client.send(ClientMessage::Subscribe { doc_id: doc_id.into() }).await;
+    client.send(ClientMessage::Subscribe { doc_id: doc_id.into(), capability: None }).await;
     let response = client.recv().await;
     assert!(matches!(
         response,
@@ -181,7 +181,7 @@ async fn test_error_on_subscribe_without_identify() {
     let mut client = TestClient::connect(&server).await;
 
     // Try to subscribe without identifying first
-    client.send(ClientMessage::Subscribe { doc_id: "doc1".into() }).await;
+    client.send(ClientMessage::Subscribe { doc_id: "doc1".into(), capability: None }).await;
 
     let response = client.recv().await;
     assert!(matches!(response, ServerMessage::Error { code: ErrorCode::NotIdentified, .. }));

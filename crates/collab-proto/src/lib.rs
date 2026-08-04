@@ -20,6 +20,12 @@
 
 use serde::{Deserialize, Serialize};
 
+mod capability;
+pub use capability::{
+    sign_doc_key_proof, sign_subscribe_capability, verify_doc_key_proof,
+    verify_subscribe_capability, CapabilityError, SubscribeCapability,
+};
+
 /// Unique identifier for a document.
 pub type DocumentId = String;
 
@@ -45,7 +51,23 @@ pub enum ClientMessage {
     },
 
     /// Subscribe to document updates.
-    Subscribe { doc_id: DocumentId },
+    ///
+    /// `capability` proves current-epoch membership of the document's group
+    /// (issue #29). It is `Option` for a clean migration: older clients omit it,
+    /// but once subscribe authorization is enabled the relay rejects a `None`
+    /// (fail closed) with [`ErrorCode::Unauthorized`].
+    Subscribe {
+        doc_id: DocumentId,
+        #[serde(default)]
+        capability: Option<SubscribeCapability>,
+    },
+
+    /// Register (or rotate) the per-document verification anchor on the relay.
+    ///
+    /// `proof` is an `Ed25519` self-signature over `(doc_id || epoch || public_key)`
+    /// with the epoch's key, proving the registrant holds the epoch's secret (is a
+    /// member). The relay stores only `public_key` + `epoch` — never a group secret.
+    RegisterDocKey { doc_id: DocumentId, epoch: u64, public_key: Vec<u8>, proof: Vec<u8> },
 
     /// Unsubscribe from document updates.
     Unsubscribe { doc_id: DocumentId },

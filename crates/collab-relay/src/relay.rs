@@ -19,8 +19,9 @@ use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use collab_proto::{ClientMessage, ErrorCode, MlsMessageType, ServerMessage};
+use collab_proto::{ClientMessage, ErrorCode, MlsMessageType, ServerMessage, SubscribeCapability};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify};
@@ -52,6 +53,13 @@ pub struct RelayServer {
     shutdown_tx: broadcast::Sender<()>,
     /// Optional bearer token required in `Identify`. `None` disables auth.
     auth_token: Option<String>,
+    /// When true, `Subscribe` requires a valid current-epoch membership
+    /// capability verified against the doc's registered anchor (issue #29).
+    /// Default off for a clean migration: the MLS-handshake-over-relay bootstrap
+    /// needs an un-gated subscribe to deliver the `Welcome` that makes a joiner a
+    /// member (and able to mint a capability). Turn on where every subscriber is
+    /// already a member by another path.
+    require_subscribe_authz: bool,
     /// Maximum number of concurrent connections.
     max_connections: usize,
     /// Current number of active connections.
@@ -137,6 +145,7 @@ impl RelayServer {
             router: Arc::new(MessageRouter::new()),
             shutdown_tx,
             auth_token: None,
+            require_subscribe_authz: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             active_connections: Arc::new(AtomicUsize::new(0)),
             conn_counter: Arc::new(AtomicU64::new(0)),
@@ -149,6 +158,18 @@ impl RelayServer {
     #[must_use]
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {
         self.auth_token = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// Enable per-document subscribe authorization (issue #29).
+    ///
+    /// When enabled, `Subscribe` is rejected with [`ErrorCode::Unauthorized`]
+    /// unless it carries a [`SubscribeCapability`] that verifies against the
+    /// doc's registered anchor (current epoch + verifying key). Fail closed: no
+    /// anchor or no capability means rejected.
+    #[must_use]
+    pub const fn with_subscribe_authz(mut self, enabled: bool) -> Self {
+        self.require_subscribe_authz = enabled;
         self
     }
 
@@ -302,8 +323,19 @@ impl RelayServer {
             ClientMessage::Identify { user_id: uid, token } => {
                 self.handle_identify(uid, token, tx, conn_id, user_id, session_close).await;
             }
-            ClientMessage::Subscribe { doc_id } => {
-                self.handle_subscribe(user_id.as_ref(), tx, doc_id).await;
+            ClientMessage::Subscribe { doc_id, capability } => {
+                self.handle_subscribe(user_id.as_ref(), tx, doc_id, capability).await;
+            }
+            ClientMessage::RegisterDocKey { doc_id, epoch, public_key, proof } => {
+                self.handle_register_doc_key(
+                    user_id.as_ref(),
+                    tx,
+                    doc_id,
+                    epoch,
+                    public_key,
+                    proof,
+                )
+                .await;
             }
             ClientMessage::Unsubscribe { doc_id } => {
                 self.handle_unsubscribe(user_id.as_ref(), tx, doc_id).await;
@@ -394,17 +426,32 @@ impl RelayServer {
     }
 
     /// Handle the Subscribe message.
+    ///
+    /// When subscribe authorization is enabled (issue #29), the client must
+    /// prove current-epoch membership: the doc must have a registered anchor and
+    /// `capability` must verify against it. The relay binds the LOCAL `doc_id`
+    /// (the subscribe target) and the LOCALLY-stored `anchor.epoch` /
+    /// `anchor.verifying_key` as the expected values — never `cap.epoch` or any
+    /// other inbound frame field. Fail closed: no anchor or no capability =
+    /// rejected.
     async fn handle_subscribe(
         &self,
         user_id: Option<&String>,
         tx: &mpsc::Sender<ServerMessage>,
         doc_id: String,
+        capability: Option<SubscribeCapability>,
     ) {
         let Some(uid) = user_id else {
             send_not_identified_error(tx, "subscribing").await;
             return;
         };
         if !validate_doc_id(tx, &doc_id).await {
+            return;
+        }
+
+        if self.require_subscribe_authz
+            && !self.authorize_subscribe(tx, uid, &doc_id, capability).await
+        {
             return;
         }
 
@@ -420,6 +467,98 @@ impl RelayServer {
             )
             .await;
         }
+    }
+
+    /// Verify a subscribe capability against the doc's anchor. Returns `true`
+    /// (proceed) only if authorized; otherwise sends `Unauthorized` and returns
+    /// `false`. Only called when `require_subscribe_authz` is on.
+    async fn authorize_subscribe(
+        &self,
+        tx: &mpsc::Sender<ServerMessage>,
+        uid: &str,
+        doc_id: &str,
+        capability: Option<SubscribeCapability>,
+    ) -> bool {
+        // No anchor → membership cannot be proven → fail closed.
+        let Some(anchor) = self.router.get_anchor(doc_id).await else {
+            send_unauthorized(tx, "no subscribe anchor registered for this document").await;
+            return false;
+        };
+        let Some(cap) = capability else {
+            send_unauthorized(tx, "subscribe capability required").await;
+            return false;
+        };
+        // Bind the LOCALLY-trusted values as expected: the CONNECTION's identified
+        // `uid`, the subscribe-target `doc_id`, and the LOCALLY-stored anchor
+        // epoch/key — NEVER `cap.user_id`/`cap.epoch` or any inbound frame field
+        // (CLAUDE.md). Passing the connection's uid means a capability minted for
+        // Alice cannot be presented by Eve's connection (UserIdMismatch).
+        if let Err(e) = collab_proto::verify_subscribe_capability(
+            &cap,
+            &anchor.verifying_key,
+            uid,
+            doc_id,
+            anchor.epoch,
+            now_unix(),
+        ) {
+            tracing::warn!(doc_id = %doc_id, error = %e, "Rejecting subscribe: capability failed");
+            send_unauthorized(tx, "subscribe capability verification failed").await;
+            return false;
+        }
+        true
+    }
+
+    /// Handle the `RegisterDocKey` message: (re)anchor a doc's subscribe
+    /// verification key (issue #29).
+    ///
+    /// The `proof` must be an `Ed25519` self-signature over `(doc_id || epoch)`
+    /// verifiable under `public_key` — proving the registrant holds the private
+    /// half of the key being registered. It does NOT prove group membership: the
+    /// relay is a zero-knowledge router with no group state and no identity
+    /// system, so it cannot. Anchor trust is TOFU (first registrant wins), the
+    /// same model as first-Identify-wins for `user_id`. Removal (#31) bites on the
+    /// *subscribe* path, not here: after a rekey a removed member's stale-epoch
+    /// capability no longer matches the rotated anchor. This never runs MLS: it
+    /// stores a public key and does one `Ed25519` verify, then enforces monotonic
+    /// rotation and the anchor resource bounds.
+    async fn handle_register_doc_key(
+        &self,
+        user_id: Option<&String>,
+        tx: &mpsc::Sender<ServerMessage>,
+        doc_id: String,
+        epoch: u64,
+        public_key: Vec<u8>,
+        proof: Vec<u8>,
+    ) {
+        let Some(_uid) = user_id else {
+            send_not_identified_error(tx, "registering a document key").await;
+            return;
+        };
+        if !validate_doc_id(tx, &doc_id).await {
+            return;
+        }
+
+        let Ok(key_bytes): Result<[u8; 32], _> = public_key.try_into() else {
+            send_unauthorized(tx, "public_key must be 32 bytes").await;
+            return;
+        };
+
+        // Verify the registrant holds the private half of the key being
+        // registered. This proves key possession, NOT group membership (the relay
+        // is zero-knowledge and cannot check membership); anchor trust is TOFU.
+        if let Err(e) = collab_proto::verify_doc_key_proof(&doc_id, epoch, &key_bytes, &proof) {
+            tracing::warn!(doc_id = %doc_id, error = %e, "Rejecting RegisterDocKey: bad proof");
+            send_unauthorized(tx, "doc key proof verification failed").await;
+            return;
+        }
+
+        // Monotonic anchor: TOFU or strictly-higher epoch. A stale/equal epoch is
+        // rejected so a captured old-epoch registration cannot roll the anchor back.
+        if !self.router.set_anchor(&doc_id, epoch, key_bytes).await {
+            tracing::warn!(doc_id = %doc_id, epoch, "Rejecting RegisterDocKey: stale epoch");
+            send_unauthorized(tx, "stale or equal epoch for document anchor").await;
+        }
+        // On success: silent (no new ServerMessage variant needed).
     }
 
     /// Handle the Unsubscribe message.
@@ -578,6 +717,26 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Current wall-clock time in whole seconds since the Unix epoch.
+///
+/// Used only for capability expiry checks. Fail CLOSED on a broken clock: a
+/// pre-1970 `SystemTime` maps to `u64::MAX` ("far future"), which makes every
+/// capability compare as expired and be rejected — never accepted. Mapping to 0
+/// would be fail-OPEN (`now > expiry` could never fire → expired capabilities
+/// accepted), a trust-boundary hole.
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(u64::MAX, |d| d.as_secs())
+}
+
+/// Send an [`ErrorCode::Unauthorized`] error with a human-readable message.
+async fn send_unauthorized(tx: &mpsc::Sender<ServerMessage>, message: &str) {
+    send_msg(
+        tx,
+        ServerMessage::Error { code: ErrorCode::Unauthorized, message: message.to_string() },
+    )
+    .await;
+}
+
 /// Send a "not identified" error message.
 async fn send_not_identified_error(tx: &mpsc::Sender<ServerMessage>, action: &str) {
     send_msg(
@@ -710,7 +869,7 @@ mod tests {
         let server = TestServer::start().await;
         let mut client = TestClient::connect(&server).await;
 
-        client.send(ClientMessage::Subscribe { doc_id: "doc1".into() }).await;
+        client.send(ClientMessage::Subscribe { doc_id: "doc1".into(), capability: None }).await;
 
         let response = client.recv().await;
         assert!(matches!(response, ServerMessage::Error { code: ErrorCode::NotIdentified, .. }));
@@ -724,7 +883,7 @@ mod tests {
         client.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
         let _ = client.recv().await; // Identified response
 
-        client.send(ClientMessage::Subscribe { doc_id: "doc1".into() }).await;
+        client.send(ClientMessage::Subscribe { doc_id: "doc1".into(), capability: None }).await;
 
         let response = client.recv().await;
         assert!(matches!(
@@ -848,10 +1007,258 @@ mod tests {
         let _ = client.recv().await;
 
         let long_doc = "d".repeat(MAX_ID_LEN + 1);
-        client.send(ClientMessage::Subscribe { doc_id: long_doc }).await;
+        client.send(ClientMessage::Subscribe { doc_id: long_doc, capability: None }).await;
         assert!(matches!(
             client.recv().await,
             ServerMessage::Error { code: ErrorCode::LimitExceeded, .. }
+        ));
+    }
+
+    // ---- Subscribe authorization (issue #29) --------------------------------
+
+    use collab_proto::{sign_doc_key_proof, sign_subscribe_capability, SubscribeCapability};
+    use ed25519_dalek::SigningKey;
+
+    const AUTHZ_DOC: &str = "authz-doc";
+    const AUTHZ_EPOCH: u64 = 1;
+
+    /// A member's signing key (deterministic seed) standing in for the group's
+    /// per-epoch exporter-derived key.
+    fn member_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Identify `client` and register `signer`'s verifying key as `AUTHZ_DOC`'s
+    /// anchor at `AUTHZ_EPOCH` with a valid self-proof.
+    async fn register_anchor(client: &mut TestClient, signer: &SigningKey) {
+        let public_key = signer.verifying_key().to_bytes().to_vec();
+        let proof = sign_doc_key_proof(signer, AUTHZ_DOC, AUTHZ_EPOCH);
+        client
+            .send(ClientMessage::RegisterDocKey {
+                doc_id: AUTHZ_DOC.into(),
+                epoch: AUTHZ_EPOCH,
+                public_key,
+                proof,
+            })
+            .await;
+    }
+
+    /// A capability naming `user_id` for `AUTHZ_DOC` at `AUTHZ_EPOCH` signed by
+    /// `signer`, expiring far in the future.
+    fn cap_for(signer: &SigningKey, user_id: &str) -> SubscribeCapability {
+        sign_subscribe_capability(signer, user_id, AUTHZ_DOC, AUTHZ_EPOCH, u64::MAX)
+    }
+
+    /// A member (holding the anchor key) can register then subscribe with a
+    /// valid capability.
+    #[tokio::test]
+    async fn test_authz_member_with_valid_capability_subscribes() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &signer).await;
+
+        member
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member")),
+            })
+            .await;
+        assert!(matches!(
+            member.recv().await,
+            ServerMessage::Subscribed { doc_id } if doc_id == AUTHZ_DOC
+        ));
+    }
+
+    /// A capability minted naming one member, presented by a DIFFERENT
+    /// connection's identity, is rejected `UserIdMismatch` — even though it is
+    /// signed by the anchor key (a same-group replay-as-someone-else). The relay
+    /// binds the presenting connection's LOCAL uid as `expected_user_id`.
+    #[tokio::test]
+    async fn test_authz_rejects_capability_replayed_as_other_user() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        // Bob (the minter) registers the anchor.
+        let mut bob = TestClient::connect(&server).await;
+        bob.send(ClientMessage::Identify { user_id: "bob".into(), token: None }).await;
+        assert!(matches!(bob.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut bob, &signer).await;
+
+        // Alice presents a capability minted for BOB (same valid anchor key), but
+        // her connection is identified as "alice" → UserIdMismatch, rejected.
+        let mut alice = TestClient::connect(&server).await;
+        alice.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
+        assert!(matches!(alice.recv().await, ServerMessage::Identified { .. }));
+        alice
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "bob")),
+            })
+            .await;
+        assert!(matches!(
+            alice.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+    }
+
+    /// With authz on, a subscribe carrying NO capability is rejected and the
+    /// client is not added to the subscription set.
+    #[tokio::test]
+    async fn test_authz_rejects_missing_capability() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        // Register the anchor (via a member) so the failure is due to the missing
+        // capability, not a missing anchor.
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &signer).await;
+
+        let mut intruder = TestClient::connect(&server).await;
+        intruder.send(ClientMessage::Identify { user_id: "intruder".into(), token: None }).await;
+        assert!(matches!(intruder.recv().await, ServerMessage::Identified { .. }));
+        intruder
+            .send(ClientMessage::Subscribe { doc_id: AUTHZ_DOC.into(), capability: None })
+            .await;
+        assert!(matches!(
+            intruder.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+    }
+
+    /// A capability signed by a NON-anchor key (a non-member) is rejected.
+    #[tokio::test]
+    async fn test_authz_rejects_non_member_capability() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &signer).await;
+
+        // Eve mints a capability with her OWN (non-anchor) key.
+        let eve_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut eve = TestClient::connect(&server).await;
+        eve.send(ClientMessage::Identify { user_id: "eve".into(), token: None }).await;
+        assert!(matches!(eve.recv().await, ServerMessage::Identified { .. }));
+        eve.send(ClientMessage::Subscribe {
+            doc_id: AUTHZ_DOC.into(),
+            capability: Some(cap_for(&eve_key, "eve")),
+        })
+        .await;
+        assert!(matches!(
+            eve.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+    }
+
+    /// A capability minted for a DIFFERENT doc is rejected on this doc (the
+    /// capability's own doc_id does not match the subscribe target).
+    #[tokio::test]
+    async fn test_authz_rejects_capability_for_other_doc() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &signer).await;
+
+        // Capability for "other-doc" signed by the anchor key — wrong target.
+        let other_cap =
+            sign_subscribe_capability(&signer, "member", "other-doc", AUTHZ_EPOCH, u64::MAX);
+        member
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(other_cap),
+            })
+            .await;
+        assert!(matches!(
+            member.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+    }
+
+    /// With authz on but NO anchor registered, even a valid-looking capability is
+    /// rejected: membership cannot be proven, so subscribe fails closed.
+    #[tokio::test]
+    async fn test_authz_rejects_when_no_anchor() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut client = TestClient::connect(&server).await;
+        client.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(client.recv().await, ServerMessage::Identified { .. }));
+        client
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member")),
+            })
+            .await;
+        assert!(matches!(
+            client.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+    }
+
+    /// A `RegisterDocKey` whose proof does not verify under `public_key` is
+    /// rejected, so no anchor is set.
+    #[tokio::test]
+    async fn test_register_doc_key_rejects_bad_proof() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+
+        // Proof signed by a DIFFERENT key than public_key → verification fails.
+        let wrong_signer = SigningKey::from_bytes(&[3u8; 32]);
+        member
+            .send(ClientMessage::RegisterDocKey {
+                doc_id: AUTHZ_DOC.into(),
+                epoch: AUTHZ_EPOCH,
+                public_key: signer.verifying_key().to_bytes().to_vec(),
+                proof: sign_doc_key_proof(&wrong_signer, AUTHZ_DOC, AUTHZ_EPOCH),
+            })
+            .await;
+        assert!(matches!(
+            member.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+
+        // And the anchor was never set: a later valid capability still fails
+        // closed (no anchor).
+        member
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member")),
+            })
+            .await;
+        assert!(matches!(
+            member.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+    }
+
+    /// Authz OFF (the default) preserves the legacy un-gated subscribe so the
+    /// MLS-handshake bootstrap keeps working.
+    #[tokio::test]
+    async fn test_authz_off_allows_ungated_subscribe() {
+        let server = TestServer::start().await;
+        let mut client = TestClient::connect(&server).await;
+        client.send(ClientMessage::Identify { user_id: "alice".into(), token: None }).await;
+        assert!(matches!(client.recv().await, ServerMessage::Identified { .. }));
+        client.send(ClientMessage::Subscribe { doc_id: "doc1".into(), capability: None }).await;
+        assert!(matches!(
+            client.recv().await,
+            ServerMessage::Subscribed { doc_id } if doc_id == "doc1"
         ));
     }
 }

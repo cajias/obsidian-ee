@@ -13,6 +13,8 @@ rust-version.workspace = true
 wasm-clock = ["openmls/js"]
 
 [dependencies]
+collab-proto = { path = "../collab-proto" }
+ed25519-dalek.workspace = true
 yrs.workspace = true
 openmls.workspace = true
 openmls_rust_crypto.workspace = true

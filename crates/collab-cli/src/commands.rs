@@ -316,7 +316,12 @@ impl Peer {
             other => return Err(anyhow::anyhow!("expected Identified, got {other:?}")),
         }
 
-        peer.send(ClientMessage::Subscribe { doc_id: doc_id.to_string() }).await?;
+        // capability: None — the CLI targets the default (un-gated) relay, where
+        // subscribe authorization (issue #29) is off. The relay accepts None when
+        // authz is disabled; a member mints a real capability only against an
+        // authz-enabled relay.
+        peer.send(ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability: None })
+            .await?;
         match peer.recv().await? {
             ServerMessage::Subscribed { .. } => {}
             other => return Err(anyhow::anyhow!("expected Subscribed, got {other:?}")),
@@ -553,7 +558,9 @@ async fn run_ws_session(
     let identify = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
     write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 
-    let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string() };
+    // capability: None — see `Peer::connect`; the CLI's default relay has
+    // subscribe authorization (issue #29) disabled.
+    let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability: None };
     write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 
     println!("Connected as {user_id}, subscribed to {doc_id}");

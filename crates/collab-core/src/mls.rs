@@ -10,6 +10,15 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 /// The ciphersuite to use for MLS operations.
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+/// MLS exporter label (RFC 9420 §8.5) that domain-separates the per-epoch secret
+/// from which the subscribe-capability signing key is derived (issue #29).
+///
+/// This is the *exporter* label, distinct from `collab-proto`'s `LABEL_MSG` which
+/// domain-separates the signed *message*. They intentionally share the
+/// `obsidian-ee/subscribe-capability/v1` string but sit on opposite sides of the
+/// derive/sign boundary — do not conflate the two.
+const SUBSCRIBE_EXPORTER_LABEL: &str = "obsidian-ee/subscribe-capability/v1";
+
 /// Maps a `process_message` failure to a crate [`Error`], distinguishing a
 /// replayed message from other decryption failures.
 ///
@@ -360,6 +369,74 @@ impl MlsDocumentGroup {
             _ => Err(Error::Mls("Expected commit message".to_string())),
         }
     }
+
+    /// Derive the per-epoch `Ed25519` signing key for subscribe capabilities.
+    ///
+    /// Every current group member derives the SAME key from the MLS exporter
+    /// secret (RFC 9420 §8.5); a non-member cannot. The secret — and therefore
+    /// the key — changes every epoch, so a capability minted at an old epoch no
+    /// longer matches the rotated anchor.
+    fn derive_subscribe_keypair(&self) -> Result<ed25519_dalek::SigningKey> {
+        let seed = self
+            .group
+            .export_secret(self.crypto.crypto(), SUBSCRIBE_EXPORTER_LABEL, b"", 32)
+            .map_err(|e| Error::Mls(format!("Failed to export subscribe secret: {e:?}")))?;
+        let seed32: [u8; 32] = seed
+            .try_into()
+            .map_err(|_| Error::Mls("Exported subscribe secret was not 32 bytes".to_string()))?;
+        Ok(ed25519_dalek::SigningKey::from_bytes(&seed32))
+    }
+
+    /// `Ed25519` verifying key for THIS epoch, to register as the relay anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if exporting the MLS secret fails.
+    pub fn subscribe_verifying_key(&self) -> Result<[u8; 32]> {
+        Ok(self.derive_subscribe_keypair()?.verifying_key().to_bytes())
+    }
+
+    /// Mint a capability naming `user_id` for `doc_id` at the current epoch, valid
+    /// until `now + ttl`.
+    ///
+    /// `user_id` binds the capability to WHO may present it: it must be the same
+    /// identity the minting member uses to `Identify` at the relay, because the
+    /// relay verifies `cap.user_id` against the presenting connection's identified
+    /// user id (a relay-layer identity, distinct from the MLS credential). This
+    /// stops a capability minted for one member being replayed by another.
+    ///
+    /// `now_unix` is injected so the caller controls the clock (collab-core stays
+    /// clock-agnostic for wasm and deterministic in tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if exporting the MLS secret fails.
+    pub fn mint_subscribe_capability(
+        &self,
+        user_id: &str,
+        doc_id: &str,
+        now_unix: u64,
+        ttl_secs: u64,
+    ) -> Result<collab_proto::SubscribeCapability> {
+        let keypair = self.derive_subscribe_keypair()?;
+        let expiry = now_unix.saturating_add(ttl_secs);
+        Ok(collab_proto::sign_subscribe_capability(&keypair, user_id, doc_id, self.epoch(), expiry))
+    }
+
+    /// Sign a `RegisterDocKey` self-proof for `doc_id` at the current epoch.
+    ///
+    /// The relay verifies this proof under [`Self::subscribe_verifying_key`] to
+    /// confirm the registrant holds the current epoch's key (is a member) before
+    /// anchoring the doc. Requiring the *current* epoch's own key is what lets a
+    /// removal (#31) revoke a member's ability to rotate the anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if exporting the MLS secret fails.
+    pub fn sign_doc_key_proof(&self, doc_id: &str) -> Result<Vec<u8>> {
+        let keypair = self.derive_subscribe_keypair()?;
+        Ok(collab_proto::sign_doc_key_proof(&keypair, doc_id, self.epoch()))
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +576,131 @@ mod tests {
         // But Bob can still decrypt (sanity check)
         let decrypted = bob.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// Build a real 2-member group (Alice + Bob) both settled at epoch 1.
+    fn two_member_group() -> (MlsDocumentGroup, MlsDocumentGroup) {
+        let (mut alice, _) = MlsDocumentGroup::create("alice").unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let bob_kp = bob_pending.key_package().to_vec();
+        let (_commit, welcome) = alice.add_member(&bob_kp).unwrap();
+        let bob = bob_pending.join(&welcome).unwrap();
+        assert_eq!(alice.epoch(), 1);
+        assert_eq!(bob.epoch(), 1);
+        (alice, bob)
+    }
+
+    const DOC_A: &str = "notes/alpha.md";
+    const NOW: u64 = 1_000;
+    const TTL: u64 = 300;
+
+    #[test]
+    fn mint_then_verify_round_trip_ok() {
+        // GIVEN a 2-member group, WHEN Alice mints a capability for DOC_A at the
+        // current epoch with now < expiry, THEN verify with her key returns Ok.
+        let (alice, _bob) = two_member_group();
+        let cap = alice.mint_subscribe_capability("alice", DOC_A, NOW, TTL).unwrap();
+
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &alice.subscribe_verifying_key().unwrap(),
+                "alice",
+                DOC_A,
+                alice.epoch(),
+                NOW,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn group_members_share_the_same_subscribe_key() {
+        // Both members of the SAME group at the SAME epoch derive the SAME key
+        // (they share the exporter secret) → any member can mint, any member can
+        // verify another's capability.
+        let (alice, bob) = two_member_group();
+
+        assert_eq!(
+            alice.subscribe_verifying_key().unwrap(),
+            bob.subscribe_verifying_key().unwrap(),
+            "co-members at the same epoch must derive the same capability key"
+        );
+
+        // Bob verifies Alice's capability (minted naming "alice") using his own
+        // (identical) key and Alice's identity as the expected user.
+        let cap = alice.mint_subscribe_capability("alice", DOC_A, NOW, TTL).unwrap();
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &bob.subscribe_verifying_key().unwrap(),
+                "alice",
+                DOC_A,
+                bob.epoch(),
+                NOW,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn non_member_key_rejects_capability() {
+        // Trust boundary: a separate group's member (Carol) derives a DIFFERENT
+        // key, so verifying Alice's capability against Carol's key fails.
+        let (alice, _bob) = two_member_group();
+        let (carol, _) = MlsDocumentGroup::create("carol").unwrap();
+
+        assert_ne!(
+            alice.subscribe_verifying_key().unwrap(),
+            carol.subscribe_verifying_key().unwrap(),
+            "a non-member must not share the capability key"
+        );
+
+        let cap = alice.mint_subscribe_capability("alice", DOC_A, NOW, TTL).unwrap();
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &carol.subscribe_verifying_key().unwrap(),
+                "alice",
+                DOC_A,
+                alice.epoch(),
+                NOW,
+            ),
+            Err(collab_proto::CapabilityError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn epoch_change_rotates_key_and_invalidates_old_capability() {
+        // After Alice adds a member the epoch advances → new exporter secret →
+        // new capability key. A capability minted at the old epoch no longer
+        // verifies against the new epoch. (This is what makes #31 removal bite.)
+        let (mut alice, _bob) = two_member_group();
+        let key_before = alice.subscribe_verifying_key().unwrap();
+        let cap_old = alice.mint_subscribe_capability("alice", DOC_A, NOW, TTL).unwrap();
+        assert_eq!(cap_old.epoch, 1);
+
+        // Add a third member → epoch 1 -> 2, exporter secret rotates.
+        let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
+        let carol_kp = carol_pending.key_package().to_vec();
+        let (_commit, _welcome) = alice.add_member(&carol_kp).unwrap();
+        assert_eq!(alice.epoch(), 2);
+
+        let key_after = alice.subscribe_verifying_key().unwrap();
+        assert_ne!(key_before, key_after, "epoch change must rotate the capability key");
+
+        // The old-epoch capability fails against the new anchor epoch.
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &cap_old,
+                &key_after,
+                "alice",
+                DOC_A,
+                alice.epoch(),
+                NOW,
+            ),
+            Err(collab_proto::CapabilityError::EpochMismatch)
+        );
     }
 
     #[test]
