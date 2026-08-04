@@ -117,6 +117,17 @@ impl WasmEncryptedDocument {
         self.0.process_commit(commit).map_err(js_err)
     }
 
+    /// Owner-only: remove `member_user_id`, returning the commit existing members
+    /// must `process_commit` (issue #31). Rejected if this client is not the owner.
+    pub fn remove_member(&mut self, member_user_id: &str) -> Result<Vec<u8>, JsError> {
+        self.0.remove_member(member_user_id).map_err(js_err)
+    }
+
+    /// True iff this client created the document's group (is the owner).
+    pub fn is_owner(&self) -> bool {
+        self.0.is_owner()
+    }
+
     pub fn insert(&mut self, index: u32, text: &str) {
         self.0.insert(index, text);
     }

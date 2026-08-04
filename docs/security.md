@@ -117,6 +117,41 @@ Bob wants to join:
      - All members synchronized at epoch N+1
 ```
 
+### Member Removal (issue #31)
+
+```
+Alice (owner) removes Carol:
+  1. Alice calls remove_member("carol")
+     - MLS produces a Remove commit; epoch increments to N+1
+     - Alice rekeys; Carol is evicted from the ratchet tree
+  2. Remaining members call process_commit(commit_bytes)
+     - All remaining members synchronized at epoch N+1
+  3. Carol calls process_commit(commit_bytes) on her own removal
+     - Her group becomes inactive; she can no longer decrypt subsequent
+       messages (surfaced as an error, never a panic)
+```
+
+**Who-may-remove-whom policy.** The group creator (owner) may remove any member;
+a non-owner may remove no one. Enforced at two layers:
+
+- **Mint side:** `remove_member` guards `is_owner()` — a non-owner's client
+  cannot mint a removal commit.
+- **Receive side (the enforceable half):** `process_commit` inspects every commit
+  for Remove proposals; a removal commit whose committer is not the owner is
+  **rejected, not merged**. MLS does not enforce authorization itself, so this
+  receive-side check is the durable guard and does not rely on a well-behaved
+  client.
+
+"Owner" is the `user_id` that created the group. A joiner learns it at `join` from
+the member at leaf index 0 (openmls always assigns the creator leaf 0), so no
+extra field is threaded through the Welcome/Invite. Self-leave (a member removing
+themselves) and owner succession / owner-removes-owner are **future work**.
+
+A removed member's issue-#29 subscribe capability also stops working: removal
+advances the epoch, rotating the exporter secret and therefore the per-epoch
+subscribe key. After the owner re-registers the doc anchor at the new epoch, the
+removed member's stale-epoch capability no longer verifies.
+
 ### Epoch Advancement
 
 Each membership change (add/remove) creates a new epoch. Forward secrecy is maintained because:
@@ -225,7 +260,7 @@ hardening" milestone) and MUST NOT quietly become permanent.
 
 1. **BasicCredential only**: MLS uses simple string-based credentials. X.509 certificate support would provide stronger identity guarantees.
 2. **No key persistence**: MLS group state is in-memory only. Restarting a client requires re-joining the group.
-3. **No revocation**: Member removal and key revocation are not yet implemented.
+3. **Member removal is owner-only**: Removal is implemented via MLS Remove (epoch advance + rekey), enforced by an owner-only mint guard and a receive-side owner check (see [Member Removal](#member-removal-issue-31)). Self-leave and owner succession are not yet implemented.
 
 ### Production Requirements
 
@@ -235,7 +270,8 @@ hardening" milestone) and MUST NOT quietly become permanent.
 - [ ] Implement rate limiting on the relay server
 - [ ] Add TLS termination at the infrastructure level
 - [ ] Persist MLS group state for session resumption
-- [ ] Implement member removal and key revocation
+- [x] Implement member removal and key revocation (owner-removes-member; issue #31)
+- [ ] Implement self-leave and owner succession (issue #31 follow-up)
 - [ ] Add audit logging for security events
 
 ## Verified Security Properties (E2E Tests)

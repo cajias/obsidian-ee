@@ -131,12 +131,32 @@ impl EncryptedDocument {
     ///
     /// This is needed when other members add new participants to the group.
     /// Existing members must process the commit to update their group state.
+    /// A removal commit is only merged if its committer is the group owner
+    /// (issue #31); a non-owner's removal is rejected.
     ///
     /// # Errors
     ///
     /// Returns an error if processing the commit fails.
     pub fn process_commit(&mut self, commit: &[u8]) -> Result<()> {
         self.mls.process_commit(commit)
+    }
+
+    /// Owner-only: remove the member identified by `member_user_id`, advancing
+    /// the epoch and rekeying (issue #31). Returns the serialized commit that
+    /// existing members must `process_commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this member is not the owner, the target is not a
+    /// current member (or is the owner), or the MLS operation fails.
+    pub fn remove_member(&mut self, member_user_id: &str) -> Result<Vec<u8>> {
+        self.mls.remove_member(member_user_id)
+    }
+
+    /// True iff this member created the document's group (is the owner).
+    #[must_use]
+    pub fn is_owner(&self) -> bool {
+        self.mls.is_owner()
     }
 
     /// Get the current MLS epoch.
