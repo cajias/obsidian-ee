@@ -107,6 +107,8 @@ async fn test_non_member_subscribe_rejected_over_relay() {
             epoch: alice_doc.epoch(),
             public_key: alice_doc.subscribe_verifying_key().unwrap().to_vec(),
             proof: alice_doc.sign_doc_key_proof(&doc_id).unwrap(),
+            // First (TOFU) registration for this doc: no rotation continuity proof.
+            rotation_proof: Vec::new(),
         })
         .await
         .unwrap();

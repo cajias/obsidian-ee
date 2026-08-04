@@ -102,9 +102,13 @@ tests are deterministic and wasm stays clock-agnostic.
 ```rust
 ClientMessage::Subscribe { doc_id, capability: Option<SubscribeCapability> }
 // New: a member registers/rotates the doc's verify anchor.
-ClientMessage::RegisterDocKey { doc_id, epoch, public_key: Vec<u8>, proof: Vec<u8> }
-// proof = Ed25519 self-signature over (doc_id||epoch||public_key) with the
-// epoch's key — proves the registrant holds the epoch's secret (is a member).
+ClientMessage::RegisterDocKey { doc_id, epoch, public_key: Vec<u8>, proof: Vec<u8>, rotation_proof: Vec<u8> }
+// proof = Ed25519 self-signature over (doc_id||epoch) verifiable under public_key
+// — proves KEY POSSESSION of the epoch keypair being registered, NOT membership
+// (the zero-knowledge relay cannot verify membership; anchor trust is TOFU).
+// rotation_proof = Ed25519 signature over (doc_id||epoch||public_key) under the
+// CURRENT stored anchor key; required only when an anchor already exists (a
+// rotation), empty for a first (TOFU) registration. See "rotation continuity".
 ErrorCode::Unauthorized reused for a rejected Subscribe/RegisterDocKey.
 ```
 `Subscribe.capability` is `Option` for a clean migration, BUT the relay REJECTS a
@@ -115,13 +119,21 @@ avoids a hard proto break and lets the negative test send `None`.)
 
 - `MessageRouter` gains `anchors: Arc<RwLock<HashMap<DocumentId, DocAnchor>>>` where
   `DocAnchor { epoch: u64, verifying_key: [u8;32] }`. Public data, not a secret.
-- `handle_register_doc_key(uid, doc_id, epoch, public_key, proof)`:
+- `handle_register_doc_key(uid, doc_id, epoch, public_key, proof, rotation_proof)`:
   - Verify `proof` is a valid self-signature of `(doc_id||epoch)` under
     `public_key`. This proves only **possession of the keypair being registered**
     — NOT group membership. The zero-knowledge relay has no group state and no
     identity system, so it *cannot* verify membership. Anchor trust is **TOFU**.
+  - **Rotation continuity (PR #73 review):** if an anchor ALREADY exists for
+    `doc_id`, additionally verify `rotation_proof` — an Ed25519 signature over
+    `(doc_id||epoch||public_key)` under the CURRENT stored `anchor.verifying_key`.
+    This ties a rotation to possession of the current anchor key, so an identified
+    client can no longer overwrite an anchor merely by choosing an arbitrary key at
+    a higher epoch (a metadata-access escalation / subscribe-authz DoS). A first
+    (TOFU) registration ignores `rotation_proof`.
   - Accept iff no anchor yet (TOFU — like first-Identify-wins for user_id), OR
-    `epoch > current.epoch` (strictly monotonic forward rotation). Store/replace.
+    `epoch > current.epoch` (strictly monotonic forward rotation) AND the
+    continuity proof verifies. Store/replace.
   - A first (TOFU) registration is additionally bounded: rejected if the anchor
     map is at `max_documents` (resource bound — `handle_register_doc_key` runs
     regardless of the authz toggle, so an unbounded map would OOM) or if
@@ -189,6 +201,14 @@ avoids a hard proto break and lets the negative test send `None`.)
   escalation requiring a race, inherent to a zero-knowledge relay that has no other
   crypto anchor; documented, hardening deferred. (Option B — doc_id commits to the
   key — was rejected for blast radius.)
+- **Rotation continuity (PR #73 review, implemented):** ROTATING an existing anchor
+  now requires a `rotation_proof` signed by the CURRENT anchor key over the new
+  `{epoch, public_key}`. This closes the "any identified client can overwrite an
+  anchor by picking an arbitrary key at a higher epoch" gap — the bar is now
+  "someone who holds a prior anchor key". It is NOT full membership proof: a member
+  present at epoch N holds key_N and could forge a rotation to N+1 until the group
+  naturally rekeys past their knowledge. The FIRST (TOFU) registration is unchanged
+  (the race above still applies to first-registration only).
 - **Live subscriptions are checked at subscribe time only.** A removed member with
   an already-open subscription keeps receiving ciphertext (can't decrypt) until they
   disconnect; dropping live subscriptions on anchor rotation is #31 scope.

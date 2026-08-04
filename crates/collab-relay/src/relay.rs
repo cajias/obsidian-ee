@@ -326,7 +326,7 @@ impl RelayServer {
             ClientMessage::Subscribe { doc_id, capability } => {
                 self.handle_subscribe(user_id.as_ref(), tx, doc_id, capability).await;
             }
-            ClientMessage::RegisterDocKey { doc_id, epoch, public_key, proof } => {
+            ClientMessage::RegisterDocKey { doc_id, epoch, public_key, proof, rotation_proof } => {
                 self.handle_register_doc_key(
                     user_id.as_ref(),
                     tx,
@@ -334,6 +334,7 @@ impl RelayServer {
                     epoch,
                     public_key,
                     proof,
+                    rotation_proof,
                 )
                 .await;
             }
@@ -516,11 +517,23 @@ impl RelayServer {
     /// half of the key being registered. It does NOT prove group membership: the
     /// relay is a zero-knowledge router with no group state and no identity
     /// system, so it cannot. Anchor trust is TOFU (first registrant wins), the
-    /// same model as first-Identify-wins for `user_id`. Removal (#31) bites on the
-    /// *subscribe* path, not here: after a rekey a removed member's stale-epoch
-    /// capability no longer matches the rotated anchor. This never runs MLS: it
-    /// stores a public key and does one `Ed25519` verify, then enforces monotonic
-    /// rotation and the anchor resource bounds.
+    /// same model as first-Identify-wins for `user_id`.
+    ///
+    /// A **rotation** (an anchor already exists for `doc_id`) additionally requires
+    /// `rotation_proof`: an `Ed25519` signature over `(doc_id || epoch ||
+    /// public_key)` verifiable under the CURRENT stored anchor key. This ties the
+    /// rotation to possession of the current anchor key, so an identified client
+    /// cannot overwrite an existing anchor merely by picking an arbitrary key at a
+    /// higher epoch (metadata escalation / subscribe-authz `DoS`). It RAISES the bar
+    /// but is not full membership proof: a member holding `key_N` can still forge a
+    /// rotation to N+1 until the group rekeys past their knowledge (PR #73 review).
+    /// A FIRST (TOFU) registration ignores `rotation_proof`.
+    ///
+    /// Removal (#31) bites on the *subscribe* path, not here: after a rekey a
+    /// removed member's stale-epoch capability no longer matches the rotated
+    /// anchor. This never runs MLS: it stores a public key and does `Ed25519`
+    /// verifies, then enforces monotonic rotation and the anchor resource bounds.
+    #[allow(clippy::too_many_arguments)] // one field per RegisterDocKey wire field
     async fn handle_register_doc_key(
         &self,
         user_id: Option<&String>,
@@ -529,6 +542,7 @@ impl RelayServer {
         epoch: u64,
         public_key: Vec<u8>,
         proof: Vec<u8>,
+        rotation_proof: Vec<u8>,
     ) {
         let Some(_uid) = user_id else {
             send_not_identified_error(tx, "registering a document key").await;
@@ -549,6 +563,25 @@ impl RelayServer {
         if let Err(e) = collab_proto::verify_doc_key_proof(&doc_id, epoch, &key_bytes, &proof) {
             tracing::warn!(doc_id = %doc_id, error = %e, "Rejecting RegisterDocKey: bad proof");
             send_unauthorized(tx, "doc key proof verification failed").await;
+            return;
+        }
+
+        // Rotation continuity: if an anchor already exists, the new registration
+        // must be authorized by the CURRENT anchor key, not just a higher epoch.
+        // Without this any identified client could overwrite an anchor with an
+        // arbitrary key at a higher epoch (metadata escalation / subscribe DoS).
+        let rotation_check = self.router.get_anchor(&doc_id).await.map(|current| {
+            collab_proto::verify_anchor_rotation(
+                &doc_id,
+                epoch,
+                &key_bytes,
+                &current.verifying_key,
+                &rotation_proof,
+            )
+        });
+        if let Some(Err(e)) = rotation_check {
+            tracing::warn!(doc_id = %doc_id, error = %e, "Rejecting RegisterDocKey: bad rotation continuity proof");
+            send_unauthorized(tx, "anchor rotation continuity proof verification failed").await;
             return;
         }
 
@@ -1016,7 +1049,9 @@ mod tests {
 
     // ---- Subscribe authorization (issue #29) --------------------------------
 
-    use collab_proto::{sign_doc_key_proof, sign_subscribe_capability, SubscribeCapability};
+    use collab_proto::{
+        sign_anchor_rotation, sign_doc_key_proof, sign_subscribe_capability, SubscribeCapability,
+    };
     use ed25519_dalek::SigningKey;
 
     const AUTHZ_DOC: &str = "authz-doc";
@@ -1029,7 +1064,8 @@ mod tests {
     }
 
     /// Identify `client` and register `signer`'s verifying key as `AUTHZ_DOC`'s
-    /// anchor at `AUTHZ_EPOCH` with a valid self-proof.
+    /// anchor at `AUTHZ_EPOCH` with a valid self-proof. First (TOFU) registration,
+    /// so `rotation_proof` is empty.
     async fn register_anchor(client: &mut TestClient, signer: &SigningKey) {
         let public_key = signer.verifying_key().to_bytes().to_vec();
         let proof = sign_doc_key_proof(signer, AUTHZ_DOC, AUTHZ_EPOCH);
@@ -1039,6 +1075,7 @@ mod tests {
                 epoch: AUTHZ_EPOCH,
                 public_key,
                 proof,
+                rotation_proof: Vec::new(),
             })
             .await;
     }
@@ -1226,6 +1263,7 @@ mod tests {
                 epoch: AUTHZ_EPOCH,
                 public_key: signer.verifying_key().to_bytes().to_vec(),
                 proof: sign_doc_key_proof(&wrong_signer, AUTHZ_DOC, AUTHZ_EPOCH),
+                rotation_proof: Vec::new(),
             })
             .await;
         assert!(matches!(
@@ -1260,5 +1298,108 @@ mod tests {
             client.recv().await,
             ServerMessage::Subscribed { doc_id } if doc_id == "doc1"
         ));
+    }
+
+    /// Rotation continuity NEGATIVE (PR #73 review): once an anchor exists, an
+    /// attacker who does NOT hold the current anchor key cannot overwrite it —
+    /// even with a valid self-proof under a NEW key at a strictly-higher epoch —
+    /// because the continuity proof does not verify under the stored anchor key.
+    /// The anchor is left unchanged.
+    #[tokio::test]
+    async fn test_register_doc_key_rejects_rotation_without_current_key() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let member_signer = member_key();
+
+        // A member registers the first anchor (TOFU) at epoch 1.
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &member_signer).await;
+
+        // An attacker holding their OWN key tries to rotate to epoch 2. The
+        // self-proof is valid (under the attacker's new key), and the epoch is
+        // strictly higher, but the continuity proof is signed by the ATTACKER's
+        // key, not the current anchor key → rejected.
+        let attacker_signer = SigningKey::from_bytes(&[11u8; 32]);
+        let attacker_key = attacker_signer.verifying_key().to_bytes();
+        let mut attacker = TestClient::connect(&server).await;
+        attacker.send(ClientMessage::Identify { user_id: "attacker".into(), token: None }).await;
+        assert!(matches!(attacker.recv().await, ServerMessage::Identified { .. }));
+        attacker
+            .send(ClientMessage::RegisterDocKey {
+                doc_id: AUTHZ_DOC.into(),
+                epoch: AUTHZ_EPOCH + 1,
+                public_key: attacker_key.to_vec(),
+                proof: sign_doc_key_proof(&attacker_signer, AUTHZ_DOC, AUTHZ_EPOCH + 1),
+                // Continuity proof signed by the attacker's own key, not the
+                // current anchor key: the realistic forgery attempt.
+                rotation_proof: sign_anchor_rotation(
+                    &attacker_signer,
+                    AUTHZ_DOC,
+                    AUTHZ_EPOCH + 1,
+                    &attacker_key,
+                ),
+            })
+            .await;
+        assert!(matches!(
+            attacker.recv().await,
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ));
+
+        // The anchor is unchanged: still the ORIGINAL member key at epoch 1, so a
+        // capability under the original key at epoch 1 still subscribes.
+        member
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&member_signer, "member")),
+            })
+            .await;
+        assert!(matches!(member.recv().await, ServerMessage::Subscribed { .. }));
+    }
+
+    /// Rotation continuity POSITIVE (PR #73 review): a rotation authorized by the
+    /// CURRENT anchor key succeeds. The new anchor (new key + higher epoch) then
+    /// governs subscribe.
+    #[tokio::test]
+    async fn test_register_doc_key_accepts_rotation_signed_by_current_key() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let member_signer = member_key();
+
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &member_signer).await;
+
+        // Rekey: the member now holds the epoch-2 exporter key and rotates to it,
+        // authorizing the rotation with a continuity proof under the CURRENT
+        // (epoch-1) anchor key. Silent on success.
+        let next_signer = SigningKey::from_bytes(&[12u8; 32]);
+        let next_key = next_signer.verifying_key().to_bytes();
+        member
+            .send(ClientMessage::RegisterDocKey {
+                doc_id: AUTHZ_DOC.into(),
+                epoch: AUTHZ_EPOCH + 1,
+                public_key: next_key.to_vec(),
+                proof: sign_doc_key_proof(&next_signer, AUTHZ_DOC, AUTHZ_EPOCH + 1),
+                rotation_proof: sign_anchor_rotation(
+                    &member_signer,
+                    AUTHZ_DOC,
+                    AUTHZ_EPOCH + 1,
+                    &next_key,
+                ),
+            })
+            .await;
+
+        // The anchor now governs epoch 2 under the new key: a capability under the
+        // new key at epoch 2 subscribes.
+        let new_epoch_cap =
+            sign_subscribe_capability(&next_signer, "member", AUTHZ_DOC, AUTHZ_EPOCH + 1, u64::MAX);
+        member
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(new_epoch_cap),
+            })
+            .await;
+        assert!(matches!(member.recv().await, ServerMessage::Subscribed { .. }));
     }
 }

@@ -22,6 +22,12 @@ const LABEL_MSG: &[u8] = b"obsidian-ee/subscribe-capability/v1";
 /// `(doc_id, epoch)`.
 const REGISTER_LABEL: &[u8] = b"obsidian-ee/register-doc-key/v1";
 
+/// Domain-separation prefix for an anchor-rotation continuity proof (issue #29,
+/// PR #73 review). A rotation proof is signed by the CURRENT anchor key over the
+/// NEW `{epoch, public_key}`; a distinct label keeps it from ever doubling as a
+/// self-proof ([`REGISTER_LABEL`]) or a capability ([`LABEL_MSG`]).
+const ROTATE_LABEL: &[u8] = b"obsidian-ee/anchor-rotation/v1";
+
 /// A subscription capability: proves current-epoch membership of `doc_id`'s
 /// group AND names the subscriber it authorizes.
 ///
@@ -255,6 +261,84 @@ pub fn verify_doc_key_proof(
     let sig_bytes: [u8; 64] = proof.try_into().map_err(|_| CapabilityError::MalformedSignature)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
     key.verify_strict(&register_proof_bytes(doc_id, epoch), &signature)
+        .map_err(|_| CapabilityError::SignatureVerificationFailed)
+}
+
+/// Canonical bytes an anchor-rotation continuity proof covers:
+///
+/// ```text
+/// ROTATE_LABEL || (doc_id.len() as u32 le) || doc_id bytes
+///              || new_epoch (u64 le) || new_public_key (32 bytes)
+/// ```
+///
+/// Unlike [`register_proof_bytes`], the NEW `public_key` IS mixed in: the proof
+/// is verified under the CURRENT (stored) anchor key, so binding the new key is
+/// what ties the current key holder to the specific key they are rotating to.
+fn rotation_proof_bytes(doc_id: &str, new_epoch: u64, new_public_key: &[u8; 32]) -> Vec<u8> {
+    let doc = doc_id.as_bytes();
+    let doc_len = u32::try_from(doc.len()).expect("doc_id length exceeds u32::MAX");
+    let mut out = Vec::with_capacity(ROTATE_LABEL.len() + 4 + doc.len() + 8 + 32);
+    out.extend_from_slice(ROTATE_LABEL);
+    out.extend_from_slice(&doc_len.to_le_bytes());
+    out.extend_from_slice(doc);
+    out.extend_from_slice(&new_epoch.to_le_bytes());
+    out.extend_from_slice(new_public_key);
+    out
+}
+
+/// Sign an anchor-rotation continuity proof with the CURRENT anchor's signing key
+/// (issue #29, PR #73 review).
+///
+/// A rotation (an anchor already exists for the doc) must carry this proof so the
+/// relay can verify it against the stored `anchor.verifying_key`, tying the
+/// rotation to possession of the CURRENT anchor key — not just a monotonically
+/// higher epoch. `new_epoch`/`new_public_key` are the anchor being rotated TO.
+///
+/// This RAISES the bar from "any identified client can overwrite an anchor by
+/// picking a higher epoch" to "only a holder of the current anchor key can". It
+/// is NOT full membership proof: a member present at epoch N holds `key_N` and can
+/// forge a rotation to N+1 until the group naturally rekeys past their knowledge.
+#[must_use]
+pub fn sign_anchor_rotation(
+    current_signing_key: &ed25519_dalek::SigningKey,
+    doc_id: &str,
+    new_epoch: u64,
+    new_public_key: &[u8; 32],
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    current_signing_key
+        .sign(&rotation_proof_bytes(doc_id, new_epoch, new_public_key))
+        .to_bytes()
+        .to_vec()
+}
+
+/// Verify an anchor-rotation continuity proof under the CURRENT anchor key. Pure
+/// `Ed25519`.
+///
+/// Returns `Ok(())` iff `proof` is a valid `Ed25519` signature of
+/// [`rotation_proof_bytes`] under `current_verifying_key` (the relay's STORED
+/// anchor key for the doc). This proves the rotation was authorized by a holder
+/// of the current anchor key. See [`sign_anchor_rotation`] for the honest limits
+/// of what this proves (not membership).
+///
+/// # Errors
+///
+/// [`CapabilityError::InvalidVerifyingKey`] if `current_verifying_key` is not a
+/// valid `Ed25519` point, [`CapabilityError::MalformedSignature`] if `proof` is
+/// not 64 bytes, or [`CapabilityError::SignatureVerificationFailed`] if it does
+/// not verify.
+pub fn verify_anchor_rotation(
+    doc_id: &str,
+    new_epoch: u64,
+    new_public_key: &[u8; 32],
+    current_verifying_key: &[u8; 32],
+    proof: &[u8],
+) -> Result<(), CapabilityError> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(current_verifying_key)
+        .map_err(|_| CapabilityError::InvalidVerifyingKey)?;
+    let sig_bytes: [u8; 64] = proof.try_into().map_err(|_| CapabilityError::MalformedSignature)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    key.verify_strict(&rotation_proof_bytes(doc_id, new_epoch, new_public_key), &signature)
         .map_err(|_| CapabilityError::SignatureVerificationFailed)
 }
 
@@ -502,6 +586,86 @@ mod tests {
                 EXPIRY - 1
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn anchor_rotation_round_trip_ok() {
+        // The current anchor key signs a rotation to a NEW epoch + key; verifying
+        // under the current key succeeds.
+        let current = key(1);
+        let new_key = vk_bytes(&key(2));
+        let proof = sign_anchor_rotation(&current, DOC_A, EPOCH + 1, &new_key);
+        assert_eq!(
+            verify_anchor_rotation(DOC_A, EPOCH + 1, &new_key, &vk_bytes(&current), &proof),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn anchor_rotation_wrong_current_key_rejected() {
+        // A rotation proof signed by an ATTACKER key (not the current anchor key)
+        // must not verify under the current anchor key — this is the teeth of the
+        // continuity check: you cannot rotate without holding the current key.
+        let current = key(1);
+        let attacker = key(9);
+        let new_key = vk_bytes(&key(2));
+        let proof = sign_anchor_rotation(&attacker, DOC_A, EPOCH + 1, &new_key);
+        assert_eq!(
+            verify_anchor_rotation(DOC_A, EPOCH + 1, &new_key, &vk_bytes(&current), &proof),
+            Err(CapabilityError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn anchor_rotation_tampered_new_epoch_rejected() {
+        // The new_epoch is bound into the signed bytes: verifying against a
+        // different epoch than signed fails.
+        let current = key(1);
+        let new_key = vk_bytes(&key(2));
+        let proof = sign_anchor_rotation(&current, DOC_A, EPOCH + 1, &new_key);
+        assert_eq!(
+            verify_anchor_rotation(DOC_A, EPOCH + 2, &new_key, &vk_bytes(&current), &proof),
+            Err(CapabilityError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn anchor_rotation_tampered_new_key_rejected() {
+        // The new_public_key is bound in: a proof authorizing rotation to key A
+        // cannot be reused to rotate to attacker key B.
+        let current = key(1);
+        let key_a = vk_bytes(&key(2));
+        let key_b = vk_bytes(&key(3));
+        let proof = sign_anchor_rotation(&current, DOC_A, EPOCH + 1, &key_a);
+        assert_eq!(
+            verify_anchor_rotation(DOC_A, EPOCH + 1, &key_b, &vk_bytes(&current), &proof),
+            Err(CapabilityError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn anchor_rotation_malformed_length_rejected() {
+        let current = key(1);
+        let new_key = vk_bytes(&key(2));
+        let mut proof = sign_anchor_rotation(&current, DOC_A, EPOCH + 1, &new_key);
+        proof.truncate(10);
+        assert_eq!(
+            verify_anchor_rotation(DOC_A, EPOCH + 1, &new_key, &vk_bytes(&current), &proof),
+            Err(CapabilityError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn register_proof_is_not_a_valid_rotation_proof() {
+        // Domain separation: a RegisterDocKey self-proof (REGISTER_LABEL) must not
+        // double as an anchor-rotation proof (ROTATE_LABEL) for the same key.
+        let current = key(1);
+        let new_key = vk_bytes(&key(2));
+        let self_proof = sign_doc_key_proof(&current, DOC_A, EPOCH + 1);
+        assert_eq!(
+            verify_anchor_rotation(DOC_A, EPOCH + 1, &new_key, &vk_bytes(&current), &self_proof),
+            Err(CapabilityError::SignatureVerificationFailed)
         );
     }
 }
