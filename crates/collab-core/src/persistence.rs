@@ -25,6 +25,11 @@ pub const SNAPSHOT_VERSION: u8 = 1;
 /// AES-GCM nonce length in bytes.
 const NONCE_LEN: usize = 12;
 
+/// Upper bound on the entry count a decoded snapshot may declare. An MLS group's
+/// storage has far fewer entries; a larger declared count is a corrupt or hostile
+/// snapshot and is rejected before the decode loop allocates.
+const MAX_STORAGE_ENTRIES: u64 = 100_000;
+
 fn corrupt<T: Into<String>>(msg: T) -> Error {
     Error::Encryption(format!("corrupt snapshot: {}", msg.into()))
 }
@@ -92,7 +97,9 @@ impl<'a> Reader<'a> {
 /// gated, so it is unavailable in a normal build. Layout:
 /// `count(u64) || (klen(u64) || k || vlen(u64) || v)*`.
 fn encode_storage(crypto: &OpenMlsRustCrypto) -> Vec<u8> {
-    let values = crypto.storage().values.read().expect("storage lock poisoned");
+    // A poisoned lock still holds valid data; recover it rather than crash — a
+    // snapshot may be taken during error recovery, so this path must be fail-soft.
+    let values = crypto.storage().values.read().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut out = Vec::new();
     out.extend_from_slice(&(values.len() as u64).to_le_bytes());
     for (k, v) in values.iter() {
@@ -109,6 +116,11 @@ fn encode_storage(crypto: &OpenMlsRustCrypto) -> Vec<u8> {
 /// and write it into `crypto`'s storage.
 fn decode_storage_into(reader: &mut Reader, crypto: &OpenMlsRustCrypto) -> Result<()> {
     let count = reader.u64()?;
+    if count > MAX_STORAGE_ENTRIES {
+        return Err(corrupt(format!(
+            "storage entry count {count} exceeds cap {MAX_STORAGE_ENTRIES}"
+        )));
+    }
     let mut map = std::collections::HashMap::new();
     for _ in 0..count {
         let klen = usize::try_from(reader.u64()?).map_err(|_| corrupt("key too large"))?;
@@ -117,7 +129,9 @@ fn decode_storage_into(reader: &mut Reader, crypto: &OpenMlsRustCrypto) -> Resul
         let v = reader.take(vlen)?.to_vec();
         map.insert(k, v);
     }
-    let mut values = crypto.storage().values.write().expect("storage lock poisoned");
+    // Recover a poisoned lock rather than crash (see `encode_storage`).
+    let mut values =
+        crypto.storage().values.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     *values = map;
     drop(values);
     Ok(())
@@ -449,19 +463,73 @@ mod tests {
     #[test]
     fn test_corrupt_inner_storage_rejected() {
         // Valid header up to the storage blob, then a lying storage encoding:
-        // count = u64::MAX but zero entries follow -> first entry read is EOF.
+        // a small count but zero entries follow -> the first entry read hits EOF
+        // in the *inner* parser. The header must parse fully (a REAL signature
+        // scheme, not a rejected placeholder) so header parsing succeeds and the
+        // inner storage parser is what triggers the Err.
         let mut plaintext = Vec::new();
         plaintext.push(SNAPSHOT_VERSION);
         put_bytes(&mut plaintext, b"group-id"); // group_id
         put_bytes(&mut plaintext, b"alice"); // user_id
-        plaintext.extend_from_slice(&0u16.to_le_bytes()); // sig scheme
+        plaintext.extend_from_slice(&(SignatureScheme::ED25519 as u16).to_le_bytes()); // sig scheme
         put_bytes(&mut plaintext, b"pubkey"); // sig public key
         plaintext.extend_from_slice(&0u64.to_le_bytes()); // epoch
-                                                          // storage count = huge, but no entries follow: parser must fail on EOF.
-        plaintext.extend_from_slice(&u64::MAX.to_le_bytes());
+        plaintext.extend_from_slice(&3u64.to_le_bytes()); // storage count, no entries follow
 
         let blob = seal_with_key(&plaintext, &KEY);
-        let result = MlsDocumentGroup::restore_encrypted(&blob, &KEY, 0);
-        assert!(result.is_err(), "corrupt inner storage encoding must be Err (not panic/OOM)");
+        let Err(err) = MlsDocumentGroup::restore_encrypted(&blob, &KEY, 0) else {
+            panic!("corrupt inner storage encoding must be Err (not panic/OOM)");
+        };
+        assert!(
+            err.to_string().contains("unexpected end"),
+            "must fail inside the inner storage parser, not at header/scheme parse; got: {err}"
+        );
+    }
+
+    // Scenario 9: resource bound — a snapshot whose declared storage `count`
+    // exceeds MAX_STORAGE_ENTRIES is rejected BEFORE the decode loop allocates,
+    // even though it AEAD-decrypts under the real key. Defense-in-depth
+    // (CLAUDE.md resource-bounds): a huge count is a corrupt/hostile snapshot.
+    #[test]
+    fn test_storage_count_over_cap_rejected() {
+        let mut plaintext = Vec::new();
+        plaintext.push(SNAPSHOT_VERSION);
+        put_bytes(&mut plaintext, b"group-id");
+        put_bytes(&mut plaintext, b"alice");
+        plaintext.extend_from_slice(&(SignatureScheme::ED25519 as u16).to_le_bytes());
+        put_bytes(&mut plaintext, b"pubkey");
+        plaintext.extend_from_slice(&0u64.to_le_bytes()); // epoch
+                                                          // count just over the cap, with NO entries following: pre-cap this errors
+                                                          // on take() EOF ("unexpected end"); post-cap it errors on the count check.
+        plaintext.extend_from_slice(&(MAX_STORAGE_ENTRIES + 1).to_le_bytes());
+
+        let blob = seal_with_key(&plaintext, &KEY);
+        let Err(err) = MlsDocumentGroup::restore_encrypted(&blob, &KEY, 0) else {
+            panic!("over-cap storage count must be Err (not OOM/hang)");
+        };
+        assert!(
+            err.to_string().contains("exceeds cap"),
+            "must be rejected by the entry-count cap, not a generic EOF; got: {err}"
+        );
+    }
+
+    // Scenario 10: a poisoned storage RwLock must NOT crash snapshot/restore.
+    // A snapshot may be taken during error recovery, so poison-recovery keeps it
+    // fail-soft. Poison the lock, then exercise both the read (encode) and write
+    // (decode) paths: with `.expect(...)` these panic; with poison-recovery they
+    // return normally.
+    #[test]
+    fn test_poisoned_storage_lock_recovers_not_panics() {
+        let crypto = OpenMlsRustCrypto::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crypto.storage().values.write().unwrap();
+            panic!("poison the lock");
+        }));
+        // Read path (encode_storage): must recover the guard, not panic.
+        let _ = encode_storage(&crypto);
+        // Write path (decode_storage_into): a valid empty map (count = 0).
+        let buf = 0u64.to_le_bytes();
+        let mut reader = Reader::new(&buf);
+        decode_storage_into(&mut reader, &crypto).expect("empty map must decode after poison");
     }
 }
