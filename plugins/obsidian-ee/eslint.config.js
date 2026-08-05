@@ -140,9 +140,65 @@ module.exports = [
         },
     },
 
-    // Test files - relaxed rules
+    // Jest unit tests - relaxed rules
     {
-        files: ['src/__tests__/**/*.ts', '**/*.test.ts', '**/*.spec.ts'],
+        files: ['src/__tests__/**/*.ts', 'src/**/*.test.ts'],
+        languageOptions: {
+            parser: typescriptParser,
+            parserOptions: {
+                ecmaVersion: 'latest',
+                sourceType: 'module',
+                project: './tsconfig.json',
+            },
+            globals: {
+                console: 'readonly',
+                setTimeout: 'readonly',
+                clearTimeout: 'readonly',
+                NodeJS: 'readonly',
+                WebSocket: 'readonly',
+                document: 'readonly',
+                HTMLElement: 'readonly',
+            },
+        },
+        plugins: {
+            '@typescript-eslint': typescriptEslint,
+            'no-only-tests': noOnlyTestsPlugin,
+        },
+        rules: {
+            '@typescript-eslint/no-explicit-any': 'off',
+            'max-lines-per-function': 'off',
+            'sonarjs/no-duplicate-string': 'off',
+            'sonarjs/cognitive-complexity': 'off',
+            'unicorn/no-null': 'off',
+            'security/detect-object-injection': 'off',
+            'no-only-tests/no-only-tests': 'error',
+        },
+    },
+
+    // Playwright E2E tests - relaxed rules with e2e tsconfig
+    {
+        files: ['e2e/**/*.spec.ts'],
+        languageOptions: {
+            parser: typescriptParser,
+            parserOptions: {
+                ecmaVersion: 'latest',
+                sourceType: 'module',
+                project: './tsconfig.e2e.json',
+            },
+            globals: {
+                console: 'readonly',
+                setTimeout: 'readonly',
+                clearTimeout: 'readonly',
+                NodeJS: 'readonly',
+                WebSocket: 'readonly',
+                document: 'readonly',
+                HTMLElement: 'readonly',
+            },
+        },
+        plugins: {
+            '@typescript-eslint': typescriptEslint,
+            'no-only-tests': noOnlyTestsPlugin,
+        },
         rules: {
             '@typescript-eslint/no-explicit-any': 'off',
             'max-lines-per-function': 'off',
