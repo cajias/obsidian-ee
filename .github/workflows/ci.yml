@@ -116,8 +116,9 @@ jobs:
       - name: Run wire tests (--ignored)
         run: cargo test -p e2e-tests -- --ignored --test-threads=1
 
-      # No teardown step: GitHub-hosted runners are ephemeral, so `compose down`
-      # here is ritual — and omitting it keeps the job free of continue-on-error.
+      # No teardown step: GitHub-hosted runners are ephemeral VMs, so
+      # `compose down` at job end is pure ritual — omitting it keeps every
+      # step in this job a real gate with no masking flags.
 
   # Timing-sensitive filesystem-watcher integration tests have flaked in the
   # past (debouncer does not deliver a 1:1 action->event mapping). Run them
