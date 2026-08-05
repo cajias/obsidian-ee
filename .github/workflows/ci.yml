@@ -116,12 +116,8 @@ jobs:
       - name: Run wire tests (--ignored)
         run: cargo test -p e2e-tests -- --ignored --test-threads=1
 
-      # Teardown may keep continue-on-error: a teardown failure should not fail an
-      # otherwise-green run.
-      - name: Stop relay (docker compose)
-        if: always()
-        run: docker compose -f docker/docker-compose.yml down
-        continue-on-error: true
+      # No teardown step: GitHub-hosted runners are ephemeral, so `compose down`
+      # here is ritual — and omitting it keeps the job free of continue-on-error.
 
   # Timing-sensitive filesystem-watcher integration tests have flaked in the
   # past (debouncer does not deliver a 1:1 action->event mapping). Run them
