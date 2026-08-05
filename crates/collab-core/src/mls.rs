@@ -300,14 +300,31 @@ impl MlsDocumentGroup {
     }
 
     /// Reassemble a group from restored parts (issue #30 persistence).
-    pub(crate) const fn from_parts(
+    ///
+    /// `owner_id` is re-derived from the restored group's leaf-0 member, exactly
+    /// as `join` does (issue #31): the creator holds leaf 0, and the owner cannot
+    /// be removed, so leaf 0 == owner for the group's whole lifecycle. This keeps
+    /// the removal policy sound across a snapshot/restore round-trip.
+    pub(crate) fn from_parts(
         user_id: String,
         group: MlsGroup,
         crypto: OpenMlsRustCrypto,
         signature_keys: SignatureKeyPair,
         credential_with_key: CredentialWithKey,
-    ) -> Self {
-        Self { user_id, group, crypto, signature_keys, _credential_with_key: credential_with_key }
+    ) -> Result<Self> {
+        let owner_id = group
+            .members()
+            .find(|m| m.index == LeafNodeIndex::new(0))
+            .ok_or_else(|| Error::Mls("Restored group has no leaf-0 member (owner)".to_string()))
+            .and_then(|m| credential_identity(&m.credential))?;
+        Ok(Self {
+            user_id,
+            owner_id,
+            group,
+            crypto,
+            signature_keys,
+            _credential_with_key: credential_with_key,
+        })
     }
 
     /// Add a new member to the group.

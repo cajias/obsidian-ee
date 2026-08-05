@@ -269,7 +269,7 @@ impl MlsDocumentGroup {
             )));
         }
 
-        Ok(Some(Self::from_parts(user_id, group, crypto, signature_keys, credential_with_key)))
+        Ok(Some(Self::from_parts(user_id, group, crypto, signature_keys, credential_with_key)?))
     }
 }
 
