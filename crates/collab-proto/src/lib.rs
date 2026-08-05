@@ -20,6 +20,12 @@
 
 use serde::{Deserialize, Serialize};
 
+mod capability;
+pub use capability::{
+    sign_anchor_rotation, sign_doc_key_proof, sign_subscribe_capability, verify_anchor_rotation,
+    verify_doc_key_proof, verify_subscribe_capability, CapabilityError, SubscribeCapability,
+};
+
 /// Unique identifier for a document.
 pub type DocumentId = String;
 
@@ -45,7 +51,42 @@ pub enum ClientMessage {
     },
 
     /// Subscribe to document updates.
-    Subscribe { doc_id: DocumentId },
+    ///
+    /// `capability` proves current-epoch membership of the document's group
+    /// (issue #29). It is `Option` for a clean migration: older clients omit it,
+    /// but once subscribe authorization is enabled the relay rejects a `None`
+    /// (fail closed) with [`ErrorCode::Unauthorized`].
+    Subscribe {
+        doc_id: DocumentId,
+        #[serde(default)]
+        capability: Option<SubscribeCapability>,
+    },
+
+    /// Register (or rotate) the per-document verification anchor on the relay.
+    ///
+    /// `proof` is an `Ed25519` self-signature over the canonical
+    /// `(REGISTER_LABEL || doc_id || epoch)` bytes, verifiable under `public_key`.
+    /// It proves the registrant holds the private half of the epoch keypair being
+    /// registered — i.e. **key possession**, NOT group membership: the relay is a
+    /// zero-knowledge router with no group state or identity system and cannot
+    /// verify membership. Anchor trust is therefore TOFU (first registrant wins).
+    /// The relay stores only `public_key` + `epoch` — never a group secret.
+    ///
+    /// `rotation_proof` provides rotation continuity: when an anchor ALREADY
+    /// exists for `doc_id`, the relay additionally requires an `Ed25519` signature
+    /// over `(ROTATE_LABEL || doc_id || epoch || public_key)` verifiable under the
+    /// CURRENT stored anchor key, tying the rotation to possession of the current
+    /// anchor key rather than a merely-higher epoch. It is unused (empty) for a
+    /// FIRST (TOFU) registration. `#[serde(default)]` keeps older single-proof
+    /// clients decodable (their rotations then fail closed once an anchor exists).
+    RegisterDocKey {
+        doc_id: DocumentId,
+        epoch: u64,
+        public_key: Vec<u8>,
+        proof: Vec<u8>,
+        #[serde(default)]
+        rotation_proof: Vec<u8>,
+    },
 
     /// Unsubscribe from document updates.
     Unsubscribe { doc_id: DocumentId },

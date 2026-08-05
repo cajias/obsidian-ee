@@ -120,7 +120,7 @@ async fn send_subscribe(
     >,
     doc_id: &str,
 ) {
-    let msg = ClientMessage::Subscribe { doc_id: doc_id.to_string() };
+    let msg = ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability: None };
     let json = serde_json::to_string(&msg)
         .unwrap_or_else(|e| panic!("Failed to serialize Subscribe message for {doc_id}: {e}"));
 

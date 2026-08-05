@@ -21,11 +21,28 @@ use tokio::sync::RwLock;
 use crate::relay::ClientHandle;
 use crate::storage::OfflineQueue;
 
+/// A per-document subscribe-authorization anchor (issue #29).
+///
+/// Public, non-secret data: the current MLS `epoch` and the `Ed25519`
+/// verifying key derived from that epoch's exporter secret. The relay stores
+/// this to verify [`SubscribeCapability`](collab_proto::SubscribeCapability)s
+/// without ever running MLS or holding a group secret.
+#[derive(Debug, Clone, Copy)]
+pub struct DocAnchor {
+    /// MLS epoch this anchor is bound to; capabilities must match it exactly.
+    pub epoch: u64,
+    /// `Ed25519` verifying key for this epoch (public, non-secret).
+    pub verifying_key: [u8; 32],
+}
+
 /// Routes messages to the appropriate subscribers.
 pub struct MessageRouter {
     /// Document subscriptions: `doc_id` -> set of `user_id`s. Retained across
     /// disconnect so offline subscribers can be queued for.
     subscriptions: Arc<RwLock<HashMap<DocumentId, HashSet<UserId>>>>,
+    /// Per-document subscribe-authorization anchors (issue #29). Public
+    /// verification data — never a group secret.
+    anchors: Arc<RwLock<HashMap<DocumentId, DocAnchor>>>,
     /// Live client handles by user ID.
     clients: Arc<RwLock<HashMap<UserId, ClientHandle>>>,
     /// Buffer for messages to subscribed-but-disconnected users.
@@ -43,16 +60,90 @@ impl MessageRouter {
     /// Default maximum number of subscribers per document.
     pub const DEFAULT_MAX_SUBSCRIBERS_PER_DOC: usize = 1_000;
 
+    /// Largest epoch accepted for a FIRST (TOFU) anchor registration.
+    ///
+    /// A real MLS group starts at epoch 1 and advances by exactly 1 per commit,
+    /// so a first-seen anchor claiming a huge epoch is bogus. Capping it blunts
+    /// the `u64::MAX` pre-emption lockout: without this an attacker who won the
+    /// TOFU race with `epoch == u64::MAX` would permanently reject every real
+    /// (strictly-higher) rotation. A real group won't have rekeyed a million
+    /// times, so this ceiling never bites a legitimate registrant.
+    pub const MAX_INITIAL_ANCHOR_EPOCH: u64 = 1_000_000;
+
     /// Create a new message router with default limits.
     #[must_use]
     pub fn new() -> Self {
         Self {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            anchors: Arc::new(RwLock::new(HashMap::new())),
             clients: Arc::new(RwLock::new(HashMap::new())),
             offline: OfflineQueue::new(),
             max_documents: Self::DEFAULT_MAX_DOCUMENTS,
             max_subscribers_per_doc: Self::DEFAULT_MAX_SUBSCRIBERS_PER_DOC,
         }
+    }
+
+    /// Get the subscribe-authorization anchor for a document, if one is set.
+    pub async fn get_anchor(&self, doc_id: &str) -> Option<DocAnchor> {
+        self.anchors.read().await.get(doc_id).copied()
+    }
+
+    /// Set (or rotate) a document's subscribe-authorization anchor (issue #29).
+    ///
+    /// Accepts iff either:
+    /// - **Rotation** of an existing anchor: `epoch` is strictly greater than the
+    ///   current anchor's epoch (monotonic forward rotation). This reuses the
+    ///   existing map slot, so it is always allowed regardless of the cap.
+    /// - **First registration** (TOFU — first registration wins, like the relay's
+    ///   first-Identify-wins for `user_id`): allowed only if the anchor map is
+    ///   below `max_documents` AND `epoch <= MAX_INITIAL_ANCHOR_EPOCH`.
+    ///
+    /// Returns `false` on a stale/equal epoch, an implausibly large first epoch,
+    /// or when the document cap is reached — leaving any existing anchor
+    /// untouched. O(1). The caller MUST have already verified the registrant's
+    /// self-proof under `verifying_key`; this method enforces monotonicity and
+    /// the resource bounds only.
+    ///
+    /// Bounding the map by document count matters: `handle_register_doc_key` runs
+    /// regardless of the subscribe-authz toggle, so without this cap any
+    /// identified client could flood `RegisterDocKey` for unbounded distinct
+    /// `doc_id`s and OOM the relay (CLAUDE.md resource-bounds rule).
+    pub async fn set_anchor(&self, doc_id: &str, epoch: u64, verifying_key: [u8; 32]) -> bool {
+        let mut anchors = self.anchors.write().await;
+        let current_len = anchors.len();
+        let accept = anchors.get(doc_id).map_or_else(
+            // First (TOFU) registration: a NEW map entry — enforce the bounds.
+            || self.accept_first_anchor(doc_id, epoch, current_len),
+            // Rotation of an existing anchor: strictly-higher epoch only. Reuses
+            // the existing map slot, so the document-count bound does not apply.
+            |existing| epoch > existing.epoch,
+        );
+        if !accept {
+            return false;
+        }
+        anchors.insert(doc_id.to_string(), DocAnchor { epoch, verifying_key });
+        true
+    }
+
+    /// Whether a FIRST (TOFU) anchor for `doc_id` at `epoch` is acceptable given
+    /// the current anchor-map size. Rejects when the document cap is reached (a
+    /// resource bound — `handle_register_doc_key` runs regardless of the authz
+    /// toggle, so an unbounded map would OOM) or when the first-seen epoch is
+    /// implausibly large (blunts the `u64::MAX` pre-emption lockout).
+    fn accept_first_anchor(&self, doc_id: &str, epoch: u64, current_len: usize) -> bool {
+        if current_len >= self.max_documents {
+            tracing::warn!(doc_id = %doc_id, "Rejecting RegisterDocKey: anchor document cap reached");
+            return false;
+        }
+        if epoch > Self::MAX_INITIAL_ANCHOR_EPOCH {
+            tracing::warn!(
+                doc_id = %doc_id,
+                epoch,
+                "Rejecting RegisterDocKey: implausible first-anchor epoch"
+            );
+            return false;
+        }
+        true
     }
 
     /// Register a client for message routing.
@@ -553,6 +644,7 @@ mod tests {
     async fn test_subscribe_respects_per_doc_cap() {
         let router = MessageRouter {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            anchors: Arc::new(RwLock::new(HashMap::new())),
             clients: Arc::new(RwLock::new(HashMap::new())),
             offline: OfflineQueue::new(),
             max_documents: 100,
@@ -573,6 +665,7 @@ mod tests {
         // first, whose subscriptions must then be dropped.
         let router = MessageRouter {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            anchors: Arc::new(RwLock::new(HashMap::new())),
             clients: Arc::new(RwLock::new(HashMap::new())),
             offline: OfflineQueue::with_limits(10, 1),
             max_documents: 100,
@@ -650,9 +743,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_anchor_tofu_then_monotonic_rotation() {
+        // TOFU: the first registration for a doc wins.
+        let router = MessageRouter::new();
+        assert!(router.get_anchor("doc1").await.is_none());
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+        let a = router.get_anchor("doc1").await.unwrap();
+        assert_eq!(a.epoch, 1);
+        assert_eq!(a.verifying_key, [1u8; 32]);
+
+        // A strictly-higher epoch rotates the anchor.
+        assert!(router.set_anchor("doc1", 2, [2u8; 32]).await);
+        let a = router.get_anchor("doc1").await.unwrap();
+        assert_eq!(a.epoch, 2);
+        assert_eq!(a.verifying_key, [2u8; 32]);
+
+        // A stale (lower) or equal epoch is rejected; the anchor is untouched.
+        assert!(!router.set_anchor("doc1", 2, [3u8; 32]).await);
+        assert!(!router.set_anchor("doc1", 1, [4u8; 32]).await);
+        let a = router.get_anchor("doc1").await.unwrap();
+        assert_eq!(a.epoch, 2);
+        assert_eq!(a.verifying_key, [2u8; 32], "stale rotation must not overwrite the key");
+    }
+
+    #[tokio::test]
+    async fn test_anchor_bounded_by_document_cap() {
+        // The anchor map must be bounded like the subscription map, or any
+        // identified client could flood RegisterDocKey for distinct doc_ids and
+        // OOM the relay (handle_register_doc_key runs regardless of the toggle).
+        let router = MessageRouter {
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            anchors: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            offline: OfflineQueue::new(),
+            max_documents: 2,
+            max_subscribers_per_doc: 100,
+        };
+
+        // Two distinct first-anchors fill the map to the cap.
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+        assert!(router.set_anchor("doc2", 1, [2u8; 32]).await);
+        // A third distinct doc's first anchor exceeds the document cap.
+        assert!(!router.set_anchor("doc3", 1, [3u8; 32]).await);
+        assert!(router.get_anchor("doc3").await.is_none());
+
+        // Rotating an EXISTING anchor at the cap still succeeds (no new entry).
+        assert!(router.set_anchor("doc1", 2, [9u8; 32]).await);
+        let a = router.get_anchor("doc1").await.unwrap();
+        assert_eq!(a.epoch, 2);
+        assert_eq!(a.verifying_key, [9u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_anchor_first_registration_epoch_is_capped() {
+        // A first-seen anchor claiming an implausibly large epoch is rejected:
+        // this blunts the u64::MAX pre-emption lockout (an attacker who won the
+        // TOFU race at u64::MAX would otherwise reject every real rotation).
+        let router = MessageRouter::new();
+        assert!(
+            !router.set_anchor("doc1", u64::MAX, [1u8; 32]).await,
+            "a first anchor at u64::MAX must be rejected"
+        );
+        assert!(
+            !router
+                .set_anchor("doc1", MessageRouter::MAX_INITIAL_ANCHOR_EPOCH + 1, [1u8; 32])
+                .await,
+            "a first anchor just past the cap must be rejected"
+        );
+        assert!(router.get_anchor("doc1").await.is_none());
+
+        // A first anchor exactly at the cap is accepted, and monotonic rotation
+        // beyond the cap is still allowed (the ceiling gates only first-seen).
+        assert!(
+            router.set_anchor("doc1", MessageRouter::MAX_INITIAL_ANCHOR_EPOCH, [2u8; 32]).await
+        );
+        assert!(
+            router.set_anchor("doc1", MessageRouter::MAX_INITIAL_ANCHOR_EPOCH + 1, [3u8; 32]).await,
+            "monotonic rotation past the cap is still allowed for an existing anchor"
+        );
+        let a = router.get_anchor("doc1").await.unwrap();
+        assert_eq!(a.epoch, MessageRouter::MAX_INITIAL_ANCHOR_EPOCH + 1);
+    }
+
+    #[tokio::test]
     async fn test_subscribe_respects_document_cap() {
         let router = MessageRouter {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            anchors: Arc::new(RwLock::new(HashMap::new())),
             clients: Arc::new(RwLock::new(HashMap::new())),
             offline: OfflineQueue::new(),
             max_documents: 2,

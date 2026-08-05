@@ -709,7 +709,7 @@ async fn test_offline_message_delivery() {
     // arrive before or after the Subscribe confirmation; re-subscribing is
     // idempotent. Drain messages until Bob's content matches Alice's.
     let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
-    bob.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await.unwrap();
+    bob.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await.unwrap();
 
     let expected = alice_doc.get_content();
     let idle = std::time::Duration::from_secs(2);

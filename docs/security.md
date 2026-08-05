@@ -42,8 +42,8 @@ The AES-128-GCM AEAD in the ciphersuite is internal to MLS; there is no standalo
 | **Metadata analysis** | Document IDs, user IDs, message sizes, and timing are visible to the relay |
 | **Compromised client device** | If a client is compromised, its current session keys are exposed |
 | **Denial of service** | No rate limiting on the relay server currently |
-| **Document access control** | Subscription-based only; no cryptographic access control beyond MLS group membership |
-| **User authentication** | User IDs are self-asserted; no identity verification system |
+| **Document access control** | MLS group membership gates *decryption* always. *Subscription* (metadata) access is optionally gated by per-document subscribe authorization (issue #29, opt-in via `RELAY_SUBSCRIBE_AUTHZ`); see [Per-Document Subscribe Authorization](#per-document-subscribe-authorization-issue-29) |
+| **User authentication** | User IDs are self-asserted; no identity verification system. A subscribe capability binds a `user_id`, but that is the same self-asserted relay identity — it stops replay-as-another-subscriber, not impersonation of a fabricated identity |
 | **Group admission control** | The owner auto-invites ANY key package arriving on the document channel; see below |
 
 #### Open admission (current model)
@@ -153,6 +153,71 @@ The WASM/browser client (`collab-wasm`) uses this same MLS flow: it wraps `colla
 | **MLS** | Group Authentication | Ed25519 signatures |
 | **CRDT** | Consistency | Yrs conflict-free convergence |
 | **CRDT** | Availability | Offline-first with update queuing |
+
+## Per-Document Subscribe Authorization (issue #29)
+
+By default any identified client may `Subscribe` to any `doc_id`. The payload
+stays MLS-encrypted, but a non-member still observes metadata (epochs, sender
+ids, message sizes, timing). Issue #29 adds an **opt-in** gate that requires a
+subscriber to prove current-epoch group membership before the relay adds it to a
+document's subscriber set.
+
+### How it works
+
+- Every current member derives the same per-epoch `Ed25519` keypair from the MLS
+  exporter secret (RFC 9420 §8.5). A non-member cannot derive it; the secret
+  rotates every epoch.
+- A member registers the doc's **public** verifying key as a relay *anchor*
+  (`RegisterDocKey`), and mints a short-lived **capability** (`SubscribeCapability`,
+  TTL 300s) that the relay verifies with `Ed25519` alone. The relay never holds a
+  group secret — it stores a public key + an epoch counter (zero-knowledge
+  preserved).
+- The capability's signed bytes bind `user_id || doc_id || epoch || expiry`. The
+  relay verifies against the **presenting connection's** identified `user_id`, the
+  subscribe-target `doc_id`, and the **locally-stored** anchor epoch/key — never a
+  value taken from the inbound frame. Binding `user_id` means a capability minted
+  for one member cannot be replayed by another subscriber within its TTL.
+
+### Enabling it (`RELAY_SUBSCRIBE_AUTHZ`)
+
+Subscribe authorization is **off by default** and enabled per relay via the
+`RELAY_SUBSCRIBE_AUTHZ` environment variable (truthy: `1`/`true`/`yes`/`on`),
+mirroring `RELAY_AUTH_TOKEN`. The relay logs whether it is on or off at startup.
+Enable it for a deployment where every subscriber becomes a group member through
+some out-of-band path (i.e. not the MLS-handshake-over-relay bootstrap below).
+
+### Why not on by default (tracked, not permanent)
+
+On-by-default currently **deadlocks the join**: the MLS handshake runs over the
+relay, so a joiner must `Subscribe` to *receive* its `Welcome`, but it can only
+mint a capability *after* joining. An always-on subscribe gate would reject the
+one subscribe that bootstraps membership.
+
+The endgame is **content-gating**: leave the handshake subscription open (so a
+non-member can subscribe to receive its `Welcome`) but gate `YrsUpdate` fan-out
+on a valid capability, so a non-member subscribes for the handshake yet receives
+no document content. This is tracked as follow-up work (issue **D3.1**, "MLS
+hardening" milestone) and MUST NOT quietly become permanent.
+
+### Documented residuals
+
+- **Anchor trust is TOFU.** The first `RegisterDocKey` for a `doc_id` wins, like
+  first-Identify-wins for `user_id`. The self-proof proves only *possession of the
+  epoch keypair being registered* — the zero-knowledge relay has no group state
+  and no identity system, so it **cannot verify group membership**. An attacker
+  who races the real owner to register a doc's anchor could grant subscribe
+  (metadata) access to holders of a key they chose — but still **cannot decrypt**
+  (MLS gates that). This is a metadata escalation requiring a race, inherent to a
+  zero-knowledge relay.
+- **Where #31 (removal) bites:** the *subscribe* path, not the register path.
+  After a rekey a removed member's stale-epoch capability no longer matches the
+  rotated anchor, so it stops verifying. The relay cannot prevent a non-member
+  from registering an anchor for a doc no one has claimed yet.
+- **Live subscriptions are checked at subscribe time only.** A removed member with
+  an already-open subscription keeps receiving (undecryptable) ciphertext until it
+  disconnects; dropping live subscriptions on anchor rotation is #31 scope.
+- **Capability TTL (300s)** bounds replay of a captured capability within an
+  epoch; `wss://` protects it in transit.
 
 ## Known Limitations and Future Work
 

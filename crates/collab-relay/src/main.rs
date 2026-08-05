@@ -3,6 +3,15 @@
 use collab_relay::RelayServer;
 use tracing_subscriber::EnvFilter;
 
+/// Interpret an env-var value as a boolean flag. Truthy: `1`, `true`, `yes`, `on`
+/// (case-insensitive). Anything else (including unset) is false.
+fn is_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -20,9 +29,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Client authentication is DISABLED (RELAY_AUTH_TOKEN not set)");
     }
 
+    // Optional per-document subscribe authorization (issue #29). Opt-in because
+    // on-by-default deadlocks the MLS-handshake-over-relay bootstrap (a joiner
+    // must subscribe to receive its Welcome, but can only mint a capability after
+    // joining). Enable it where every subscriber becomes a member out-of-band.
+    let subscribe_authz = is_truthy(std::env::var("RELAY_SUBSCRIBE_AUTHZ").ok().as_deref());
+    if subscribe_authz {
+        tracing::info!(
+            "Per-document subscribe authorization is ENABLED (RELAY_SUBSCRIBE_AUTHZ set)"
+        );
+    } else {
+        tracing::warn!(
+            "Per-document subscribe authorization is DISABLED (RELAY_SUBSCRIBE_AUTHZ not set)"
+        );
+    }
+
     tracing::info!("Starting relay server on {}", addr);
 
-    let mut server = RelayServer::new().with_auth_token(auth_token);
+    let mut server =
+        RelayServer::new().with_auth_token(auth_token).with_subscribe_authz(subscribe_authz);
     if let Some(max) = std::env::var("RELAY_MAX_CONNECTIONS").ok().and_then(|v| v.parse().ok()) {
         server = server.with_max_connections(max);
     }

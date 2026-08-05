@@ -144,6 +144,46 @@ impl EncryptedDocument {
     pub fn epoch(&self) -> u64 {
         self.mls.epoch()
     }
+
+    /// `Ed25519` verifying key for this document's current epoch, to register as
+    /// the relay's subscribe anchor (issue #29).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deriving the key from the MLS exporter secret fails.
+    pub fn subscribe_verifying_key(&self) -> Result<[u8; 32]> {
+        self.mls.subscribe_verifying_key()
+    }
+
+    /// Mint a subscribe capability naming `user_id` for this document at the
+    /// current epoch, valid until `now_unix + ttl_secs` (issue #29).
+    ///
+    /// `user_id` must match the identity the caller uses to `Identify` at the
+    /// relay: the relay checks it against the presenting connection so the
+    /// capability cannot be replayed by another subscriber.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deriving the key from the MLS exporter secret fails.
+    pub fn mint_subscribe_capability(
+        &self,
+        user_id: &str,
+        doc_id: &str,
+        now_unix: u64,
+        ttl_secs: u64,
+    ) -> Result<collab_proto::SubscribeCapability> {
+        self.mls.mint_subscribe_capability(user_id, doc_id, now_unix, ttl_secs)
+    }
+
+    /// Sign a `RegisterDocKey` self-proof for this document at the current epoch,
+    /// to register the relay's subscribe anchor (issue #29).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deriving the key from the MLS exporter secret fails.
+    pub fn sign_doc_key_proof(&self, doc_id: &str) -> Result<Vec<u8>> {
+        self.mls.sign_doc_key_proof(doc_id)
+    }
 }
 
 /// Invite for joining an encrypted document.

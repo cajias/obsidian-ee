@@ -25,6 +25,11 @@ rust-version = "1.87"
 # CRDT
 yrs = "0.21"
 
+# Ed25519 signatures (subscribe-authorization capabilities, issue #29).
+# Already in the locked tree transitively via openmls; default features cover
+# SigningKey/VerifyingKey/Signature sign+verify.
+ed25519-dalek = "2"
+
 # MLS (Messaging Layer Security)
 # Note: default-features = false is required because:
 # 1. The default "backtrace" feature requires std::backtrace which is unstable

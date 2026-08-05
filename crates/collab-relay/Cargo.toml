@@ -25,6 +25,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio-test.workspace = true
+ed25519-dalek.workspace = true
 
 [lints]
 workspace = true

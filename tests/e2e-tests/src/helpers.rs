@@ -38,7 +38,16 @@ impl TestServer {
     ///
     /// Panics if the server fails to bind to a free port.
     pub async fn start() -> Self {
-        let server = RelayServer::new();
+        Self::start_with(RelayServer::new()).await
+    }
+
+    /// Start a test server from a pre-configured [`RelayServer`] (e.g. one with
+    /// subscribe authorization enabled) on a random port.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the server fails to bind to a free port.
+    pub async fn start_with(server: RelayServer) -> Self {
         let bound = server.bind("127.0.0.1:0").await.expect("Failed to bind test server");
         let url = format!("ws://{}", bound.addr);
         Self { url, handle: bound.handle }
@@ -168,7 +177,10 @@ impl TestClient {
     ///
     /// Returns an error if subscription fails.
     pub async fn subscribe(&mut self, doc_id: &DocumentId) -> anyhow::Result<()> {
-        self.send(&ClientMessage::Subscribe { doc_id: doc_id.clone() }).await?;
+        // capability: None — these helpers exercise the default (un-gated) relay
+        // where subscribe authorization (issue #29) is off; the MLS-handshake
+        // bootstrap needs an un-gated subscribe to deliver the Welcome.
+        self.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await?;
         let response = self.recv().await?;
         if !matches!(response, ServerMessage::Subscribed { .. }) {
             anyhow::bail!("Expected Subscribed response, got {response:?}");

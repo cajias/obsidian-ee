@@ -303,6 +303,8 @@ dependencies = [
 name = "collab-core"
 version = "0.1.0"
 dependencies = [
+ "collab-proto",
+ "ed25519-dalek",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
@@ -318,7 +320,10 @@ dependencies = [
 name = "collab-proto"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -326,6 +331,7 @@ name = "collab-relay"
 version = "0.1.0"
 dependencies = [
  "collab-proto",
+ "ed25519-dalek",
  "futures",
  "pretty_assertions",
  "serde",
