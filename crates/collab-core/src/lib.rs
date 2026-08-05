@@ -13,6 +13,7 @@ mod connection;
 mod document;
 mod encryption;
 mod mls;
+mod persistence;
 mod registry;
 mod vault_manifest;
 mod vault_sync;

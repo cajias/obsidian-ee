@@ -277,6 +277,56 @@ impl MlsDocumentGroup {
         &self.user_id
     }
 
+    // --- accessors for the persistence module (issue #30) ---
+
+    /// The group id as bytes (for snapshotting / reloading via `MlsGroup::load`).
+    pub(crate) fn group_id_bytes(&self) -> &[u8] {
+        self.group.group_id().as_slice()
+    }
+
+    /// The signature scheme of this member's keypair.
+    pub(crate) fn signature_scheme(&self) -> SignatureScheme {
+        self.signature_keys.signature_scheme()
+    }
+
+    /// This member's signature public key (used to reload the keypair on restore).
+    pub(crate) fn signature_public_key(&self) -> &[u8] {
+        self.signature_keys.public()
+    }
+
+    /// The crypto provider, whose `MemoryStorage` is the snapshot surface.
+    pub(crate) const fn crypto_provider(&self) -> &OpenMlsRustCrypto {
+        &self.crypto
+    }
+
+    /// Reassemble a group from restored parts (issue #30 persistence).
+    ///
+    /// `owner_id` is re-derived from the restored group's leaf-0 member, exactly
+    /// as `join` does (issue #31): the creator holds leaf 0, and the owner cannot
+    /// be removed, so leaf 0 == owner for the group's whole lifecycle. This keeps
+    /// the removal policy sound across a snapshot/restore round-trip.
+    pub(crate) fn from_parts(
+        user_id: String,
+        group: MlsGroup,
+        crypto: OpenMlsRustCrypto,
+        signature_keys: SignatureKeyPair,
+        credential_with_key: CredentialWithKey,
+    ) -> Result<Self> {
+        let owner_id = group
+            .members()
+            .find(|m| m.index == LeafNodeIndex::new(0))
+            .ok_or_else(|| Error::Mls("Restored group has no leaf-0 member (owner)".to_string()))
+            .and_then(|m| credential_identity(&m.credential))?;
+        Ok(Self {
+            user_id,
+            owner_id,
+            group,
+            crypto,
+            signature_keys,
+            _credential_with_key: credential_with_key,
+        })
+    }
+
     /// Add a new member to the group.
     ///
     /// # Errors
