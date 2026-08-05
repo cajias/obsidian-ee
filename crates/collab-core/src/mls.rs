@@ -45,6 +45,10 @@ fn map_process_message_error<S: std::fmt::Debug>(err: &ProcessMessageError<S>) -
 pub struct MlsDocumentGroup {
     /// User identifier for this group member.
     user_id: String,
+    /// User identifier of the group creator (the owner). Set to `user_id` at
+    /// `create`; learned from leaf 0 at `join`. The owner is the only member
+    /// allowed to remove others (issue #31).
+    owner_id: String,
     /// The MLS group.
     group: MlsGroup,
     /// The crypto provider.
@@ -53,6 +57,18 @@ pub struct MlsDocumentGroup {
     signature_keys: SignatureKeyPair,
     /// The credential with key.
     _credential_with_key: CredentialWithKey,
+}
+
+/// Extract the UTF-8 `user_id` from a member's `BasicCredential`.
+///
+/// Every credential in this project is a [`BasicCredential`] wrapping the
+/// `user_id` bytes (see `create` / `PendingMember::new`). Anything else is a
+/// protocol violation and surfaces as an error rather than a panic.
+fn credential_identity(credential: &Credential) -> Result<String> {
+    let basic = BasicCredential::try_from(credential.clone())
+        .map_err(|e| Error::Mls(format!("Expected a basic credential: {e:?}")))?;
+    String::from_utf8(basic.identity().to_vec())
+        .map_err(|e| Error::Mls(format!("Credential identity is not valid UTF-8: {e:?}")))
 }
 
 /// A pending member waiting to join a group.
@@ -150,8 +166,19 @@ impl PendingMember {
             .into_group(&self.crypto)
             .map_err(|e| Error::Mls(format!("Failed to join group: {e:?}")))?;
 
+        // The group creator (owner) always holds leaf index 0 in openmls, and
+        // owner-removal is out of scope for #31, so leaf 0 == owner for the
+        // whole supported lifecycle. Reading it here avoids threading owner_id
+        // through the Invite/Welcome proto. (See design doc for the choice.)
+        let owner_id = group
+            .members()
+            .find(|m| m.index == LeafNodeIndex::new(0))
+            .ok_or_else(|| Error::Mls("Group has no leaf-0 member (owner)".to_string()))
+            .and_then(|m| credential_identity(&m.credential))?;
+
         Ok(MlsDocumentGroup {
             user_id: self.user_id,
+            owner_id,
             group,
             crypto: self.crypto,
             signature_keys: self.signature_keys,
@@ -205,6 +232,7 @@ impl MlsDocumentGroup {
         Ok((
             Self {
                 user_id: user_id.to_string(),
+                owner_id: user_id.to_string(),
                 group,
                 crypto,
                 signature_keys,
@@ -286,6 +314,70 @@ impl MlsDocumentGroup {
         Ok((commit_bytes, welcome_bytes))
     }
 
+    /// True iff this member created the group (is the owner).
+    #[must_use]
+    pub fn is_owner(&self) -> bool {
+        self.user_id == self.owner_id
+    }
+
+    /// Find the leaf index of the member whose credential identity is `user_id`,
+    /// or `None` if no current member matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any member's credential is not a valid UTF-8
+    /// `BasicCredential`.
+    fn find_member_leaf(&self, user_id: &str) -> Result<Option<LeafNodeIndex>> {
+        // Materialize (identity, leaf) pairs first so a malformed credential
+        // surfaces as an error, then locate the match. Flat iterator style keeps
+        // nesting within the linter's limit.
+        let members = self
+            .group
+            .members()
+            .map(|m| credential_identity(&m.credential).map(|id| (id, m.index)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(members.into_iter().find(|(id, _)| id == user_id).map(|(_, index)| index))
+    }
+
+    /// Owner-only: remove the member whose credential identity == `member_user_id`.
+    ///
+    /// Advances the epoch and rekeys the group, cutting the removed member off
+    /// from subsequent messages (issue #31). Returns the serialized commit that
+    /// existing members must `process_commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Mls`] if this member is not the owner, if `member_user_id`
+    /// is the owner (the owner cannot remove themselves — future work), if no
+    /// current member has that identity, or if the MLS operation fails.
+    pub fn remove_member(&mut self, member_user_id: &str) -> Result<Vec<u8>> {
+        // Mint-side policy: only the owner's client may remove a member.
+        if !self.is_owner() {
+            return Err(Error::Mls("only the group owner may remove members".to_string()));
+        }
+        // The owner cannot remove themselves (self-leave / succession is future work).
+        if member_user_id == self.owner_id {
+            return Err(Error::Mls("the owner cannot be removed".to_string()));
+        }
+
+        let leaf = self
+            .find_member_leaf(member_user_id)?
+            .ok_or_else(|| Error::Mls(format!("{member_user_id} is not a member")))?;
+
+        let (commit, _welcome, _group_info) = self
+            .group
+            .remove_members(&self.crypto, &self.signature_keys, &[leaf])
+            .map_err(|e| Error::Mls(format!("Failed to remove member: {e:?}")))?;
+
+        self.group
+            .merge_pending_commit(&self.crypto)
+            .map_err(|e| Error::Mls(format!("Failed to merge removal commit: {e:?}")))?;
+
+        commit
+            .tls_serialize_detached()
+            .map_err(|e| Error::Mls(format!("Failed to serialize commit: {e:?}")))
+    }
+
     /// Encrypt a message for the group.
     ///
     /// # Errors
@@ -358,16 +450,39 @@ impl MlsDocumentGroup {
             )
             .map_err(|e| Error::Mls(format!("Failed to process commit: {e:?}")))?;
 
-        match processed.into_content() {
-            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                // Merge the staged commit to update our group state
-                self.group
-                    .merge_staged_commit(&self.crypto, *staged_commit)
-                    .map_err(|e| Error::Mls(format!("Failed to merge staged commit: {e:?}")))?;
-                Ok(())
-            }
-            _ => Err(Error::Mls("Expected commit message".to_string())),
+        // Capture the committer identity BEFORE into_content() consumes the
+        // processed message — needed to enforce the removal policy below.
+        let committer = credential_identity(processed.credential())?;
+
+        let ProcessedMessageContent::StagedCommitMessage(staged_commit) = processed.into_content()
+        else {
+            return Err(Error::Mls("Expected commit message".to_string()));
+        };
+
+        // Receive-side policy (issue #31, the enforceable half): a commit that
+        // removes any member is only honored if its committer is the group owner.
+        // MLS itself does not enforce authorization, so a non-owner's Remove
+        // commit is REJECTED here — not merged.
+        let is_removal = staged_commit.remove_proposals().next().is_some();
+        if is_removal && committer != self.owner_id {
+            return Err(Error::Mls("removal commit from a non-owner is rejected".to_string()));
         }
+        // The owner (leaf 0) is the anchor of the whole who-may-remove-whom
+        // policy — owner_id is derived from leaf 0 at join. A commit that evicts
+        // leaf 0 would orphan that identity, so it is REJECTED even if its
+        // committer passed the owner check above (BasicCredential identities are
+        // not unique, so a member can commit under the owner's identity string).
+        // owner-succession / self-leave remain future work.
+        if is_removal
+            && staged_commit.remove_proposals().any(|p| p.remove_proposal().removed().u32() == 0)
+        {
+            return Err(Error::Mls("commit removes the group owner; rejected".to_string()));
+        }
+
+        // Merge the staged commit to update our group state.
+        self.group
+            .merge_staged_commit(&self.crypto, *staged_commit)
+            .map_err(|e| Error::Mls(format!("Failed to merge staged commit: {e:?}")))
     }
 
     /// Derive the per-epoch `Ed25519` signing key for subscribe capabilities.
@@ -700,6 +815,222 @@ mod tests {
                 NOW,
             ),
             Err(collab_proto::CapabilityError::EpochMismatch)
+        );
+    }
+
+    /// Build a real 3-member group: Alice (owner, leaf 0), Bob, Carol, all
+    /// settled at epoch 2. Returns them in that order.
+    fn three_member_group() -> (MlsDocumentGroup, MlsDocumentGroup, MlsDocumentGroup) {
+        let (mut alice, _) = MlsDocumentGroup::create("alice").unwrap();
+
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let (_c, welcome) = alice.add_member(bob_pending.key_package()).unwrap();
+        let mut bob = bob_pending.join(&welcome).unwrap();
+
+        let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
+        let (commit, welcome) = alice.add_member(carol_pending.key_package()).unwrap();
+        // Bob must process the add commit to reach epoch 2 alongside Alice.
+        bob.process_commit(&commit).unwrap();
+        let carol = carol_pending.join(&welcome).unwrap();
+
+        assert_eq!(alice.epoch(), 2);
+        assert_eq!(bob.epoch(), 2);
+        assert_eq!(carol.epoch(), 2);
+        (alice, bob, carol)
+    }
+
+    #[test]
+    fn owner_flag_reflects_creator() {
+        // Alice created the group → owner; Bob joined → not owner.
+        let (alice, bob, carol) = three_member_group();
+        assert!(alice.is_owner(), "creator must be the owner");
+        assert!(!bob.is_owner(), "a joiner must not be the owner");
+        assert!(!carol.is_owner(), "a joiner must not be the owner");
+    }
+
+    #[test]
+    fn owner_removes_member_advances_epoch_and_rekeys() {
+        // Scenario 1 (positive): Alice removes Carol; Bob processes the commit;
+        // Alice & Bob advance to epoch 3 and can still message each other.
+        let (mut alice, mut bob, _carol) = three_member_group();
+
+        let commit = alice.remove_member("carol").unwrap();
+        bob.process_commit(&commit).unwrap();
+
+        assert_eq!(alice.epoch(), 3, "owner's epoch advances after removal");
+        assert_eq!(bob.epoch(), 3, "remaining member's epoch advances after removal");
+
+        // Alice -> Bob app message still round-trips at the new epoch.
+        let msg = b"post-removal secret";
+        let ct = alice.encrypt(msg).unwrap();
+        assert_eq!(bob.decrypt(&ct).unwrap(), msg);
+    }
+
+    #[test]
+    fn removed_member_cannot_decrypt_post_removal() {
+        // Scenario 2 (THE acceptance test): after Carol processes the removal
+        // commit (evicting herself), she cannot decrypt a message Alice sends at
+        // the new epoch. Mutation-check: if remove_member were a no-op, Carol
+        // would still share the epoch key and decrypt → this test goes RED.
+        let (mut alice, mut bob, mut carol) = three_member_group();
+
+        let commit = alice.remove_member("carol").unwrap();
+        bob.process_commit(&commit).unwrap();
+        // Carol processes her own removal; openmls evicts her (group inactive).
+        // Our wrapper must surface this as Ok(()) or Err — never a panic.
+        let _ = carol.process_commit(&commit);
+
+        // Alice sends at the new epoch. Bob (still a member) decrypts fine.
+        let msg = b"members-only after removal";
+        let ct = alice.encrypt(msg).unwrap();
+        assert_eq!(bob.decrypt(&ct).unwrap(), msg);
+
+        // Carol must NOT be able to decrypt it.
+        let carol_result = carol.decrypt(&ct);
+        assert!(
+            carol_result.is_err(),
+            "removed member must not decrypt a post-removal message, got {carol_result:?}"
+        );
+    }
+
+    #[test]
+    fn non_owner_cannot_mint_removal() {
+        // Scenario 3 (policy, mint side): Bob is not the owner, so his
+        // remove_member is rejected before any commit is produced.
+        let (_alice, mut bob, _carol) = three_member_group();
+        let result = bob.remove_member("carol");
+        assert!(result.is_err(), "a non-owner must not be able to remove a member");
+    }
+
+    #[test]
+    fn receive_side_rejects_non_owner_removal() {
+        // Scenario 4 (policy, receive side — the enforceable half): a Remove
+        // commit whose committer is NOT the owner must be REJECTED by
+        // process_commit (not merged), even though MLS itself would accept it.
+        //
+        // The safe API's mint guard makes a non-owner removal unmintable via
+        // remove_member, so we reach past it to the raw group to hand-craft a
+        // non-owner Remove commit, then assert the receive guard rejects it.
+        let (mut alice, mut bob, _carol) = three_member_group();
+
+        // Bob (non-owner) crafts a Remove commit evicting Carol via the raw group.
+        let carol_leaf = bob
+            .group
+            .members()
+            .find(|m| credential_identity(&m.credential).unwrap() == "carol")
+            .map(|m| m.index)
+            .expect("carol is a member");
+        let (commit, _welcome, _gi) = bob
+            .group
+            .remove_members(&bob.crypto, &bob.signature_keys, &[carol_leaf])
+            .expect("raw remove_members should mint a commit regardless of policy");
+        // Bob does NOT merge; he just ships the commit. (openmls has no pending
+        // commit lingering that would block Alice's processing.)
+        bob.group.clear_pending_commit(bob.crypto.storage()).unwrap();
+        let commit_bytes = commit.tls_serialize_detached().unwrap();
+
+        let epoch_before = alice.epoch();
+        let result = alice.process_commit(&commit_bytes);
+        assert!(
+            result.is_err(),
+            "a Remove commit from a non-owner must be rejected, got {result:?}"
+        );
+        assert_eq!(alice.epoch(), epoch_before, "a rejected removal must not advance the epoch");
+    }
+
+    #[test]
+    fn receive_side_rejects_removal_of_the_owner() {
+        // Scenario 6 (defense-in-depth): a commit that REMOVES THE OWNER (leaf 0)
+        // must be rejected even when its committer passes the non-owner check.
+        // openmls forbids removing your own leaf (CannotRemoveSelf), so the real
+        // owner can never mint a self-removal; the reachable threat is a member
+        // that joined under the OWNER'S identity string ("alice") with a fresh
+        // signature key (BasicCredential identities are not unique — only keys
+        // are) and evicts leaf 0. That committer's identity == owner_id, so the
+        // non-owner-committer guard PASSES and ONLY the new owner-target guard
+        // catches it: RED before the guard (owner-eviction merges, epoch
+        // advances), GREEN after.
+        let (mut alice, _kp) = MlsDocumentGroup::create("alice").unwrap();
+
+        // Bob joins as a normal member (leaf 1); he is the processor.
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let (_commit, welcome) = alice.add_member(bob_pending.key_package()).unwrap();
+        let mut bob = bob_pending.join(&welcome).unwrap();
+
+        // A spoofer joins claiming the OWNER'S identity ("alice") at leaf 2.
+        let spoof_pending = MlsDocumentGroup::generate_key_package("alice").unwrap();
+        let (add_commit, spoof_welcome) = alice.add_member(spoof_pending.key_package()).unwrap();
+        bob.process_commit(&add_commit).unwrap();
+        let mut spoofer = spoof_pending.join(&spoof_welcome).unwrap();
+        assert_eq!(bob.owner_id, "alice", "processor's learned owner is the leaf-0 creator");
+
+        // Spoofer crafts a raw Remove commit evicting leaf 0 (the real owner);
+        // leaf 0 is not the spoofer's own leaf, so openmls mints it.
+        let (commit, _welcome, _gi) = spoofer
+            .group
+            .remove_members(&spoofer.crypto, &spoofer.signature_keys, &[LeafNodeIndex::new(0)])
+            .expect("removing a leaf that is not one's own must mint a commit");
+        spoofer.group.clear_pending_commit(spoofer.crypto.storage()).unwrap();
+        let commit_bytes = commit.tls_serialize_detached().unwrap();
+
+        let epoch_before = bob.epoch();
+        let result = bob.process_commit(&commit_bytes);
+        assert!(
+            result.is_err(),
+            "a commit removing the owner (leaf 0) must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            bob.epoch(),
+            epoch_before,
+            "a rejected owner-removal must not advance the epoch"
+        );
+        assert!(
+            bob.group.members().any(|m| m.index == LeafNodeIndex::new(0)),
+            "the owner must remain a member after a rejected owner-removal"
+        );
+    }
+
+    #[test]
+    fn removed_member_subscribe_capability_dies_after_removal() {
+        // Scenario 5 (#29 cross-cut): after Alice removes Carol the epoch
+        // advances and the exporter secret rotates, so subscribe_verifying_key
+        // changes. A capability Carol mints (at her last-known epoch/key) fails
+        // verification against the new anchor; a capability Alice mints at the
+        // new epoch verifies.
+        let (mut alice, mut bob, mut carol) = three_member_group();
+
+        let key_before = alice.subscribe_verifying_key().unwrap();
+        // Carol mints a capability at the pre-removal epoch (epoch 2).
+        let carol_cap = carol.mint_subscribe_capability("carol", DOC_A, NOW, TTL).unwrap();
+        assert_eq!(carol_cap.epoch, 2);
+
+        // Alice removes Carol; Bob & Carol process it.
+        let commit = alice.remove_member("carol").unwrap();
+        bob.process_commit(&commit).unwrap();
+        let _ = carol.process_commit(&commit);
+
+        // New epoch → rotated anchor key (owner re-registers it, same as add).
+        let key_after = alice.subscribe_verifying_key().unwrap();
+        assert_ne!(key_before, key_after, "removal must rotate the subscribe anchor key");
+        let new_epoch = alice.epoch();
+
+        // Carol's old-epoch capability fails against the new epoch/key.
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &carol_cap, &key_after, "carol", DOC_A, new_epoch, NOW,
+            ),
+            Err(collab_proto::CapabilityError::EpochMismatch),
+            "a removed member's stale-epoch capability must not verify against the new anchor"
+        );
+
+        // A remaining member (Bob) mints at the new epoch → verifies.
+        let bob_cap = bob.mint_subscribe_capability("bob", DOC_A, NOW, TTL).unwrap();
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &bob_cap, &key_after, "bob", DOC_A, new_epoch, NOW,
+            ),
+            Ok(()),
+            "a remaining member's new-epoch capability must verify"
         );
     }
 
