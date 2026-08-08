@@ -38,6 +38,8 @@ grep -q '^STOPSIGNAL SIGINT' docker/Dockerfile.relay && docker build -f docker/D
 
 **Human-only halt steps** — none. This milestone is fully executable by the agent.
 
+**Plan change (recorded during M1 execution)** — the build prompt's definition of done requires 04's Integration tier to run in CI, but this tree freezes `ci.yml`. Resolution: a new `.github/workflows/integration.yml` carries the tier, seeded with M1's image-build check; M2 and M3 append their synth-assertion and actionlint jobs. `tests/features/` (BDD feature files + step runners, assumed by the build prompt) is likewise new. `ci.yml` remains untouched.
+
 ## M2 — CDK infra + bootstrap runbook
 
 **Depends on:** none.

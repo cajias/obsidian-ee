@@ -16,6 +16,7 @@ obsidian-ee/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                                       # existing CI (build, lint, test under --locked)
+│       ├── integration.yml              (new)           # wires the M1 gate into CI; ci.yml unchanged (plan change recorded in 03, M1 section)
 │       ├── release.yml                  (new)           # release-please on push to main (PAT-authenticated)
 │       └── deploy.yml                   (new)           # build → promote → deploy lane, all envs
 ├── crates/                                              # existing workspace crates: collab-cli · collab-core ·
@@ -45,7 +46,7 @@ obsidian-ee/
 │       ├── docker-compose.yml           (new)           # on-instance compose unit: caddy + relay
 │       ├── Caddyfile.tpl                (new)           # env-templated Caddy site block
 │       └── deploy.sh.tpl                (new)           # template of /opt/relay/deploy.sh
-├── plugins/ · scripts/ · tests/ · xtask/                # existing workspace dirs
+├── plugins/ · scripts/ · tests/ · xtask/                # existing workspace dirs (tests/features/ added during M1: BDD feature + step runner)
 └── README.md · CLAUDE.md                                # existing top-level docs
 ```
 

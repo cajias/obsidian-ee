@@ -1,0 +1,21 @@
+name: integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay-image:
+    name: relay-container-stops-on-sigint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run M1 integration check
+        run: bash tests/features/run-m1.sh

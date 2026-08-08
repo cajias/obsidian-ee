@@ -1,0 +1,5 @@
+# Bounds the docker build context to what images actually need.
+target/
+plugins/obsidian-ee/node_modules/
+.git/
+tests/features/
