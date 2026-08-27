@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-ee-infra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CDK app for the collab-relay deployment (RelayShared + Relay-{dev,staging,prod})",
+  "bin": {
+    "app": "bin/app.ts"
+  },
+  "scripts": {
+    "synth": "cdk synth",
+    "list": "cdk list",
+    "deploy": "cdk deploy",
+    "test": "node -r ts-node/register/transpile-only --test test/*.test.ts",
+    "regen-goldens": "node -r ts-node/register test/regen-template-goldens.ts"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.263.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "aws-cdk": "2.1135.1",
+    "ts-node": "10.9.2",
+    "typescript": "~5.9.0"
+  }
+}

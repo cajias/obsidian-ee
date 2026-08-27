@@ -19,3 +19,32 @@ jobs:
 
       - name: Run M1 integration check
         run: bash tests/features/run-m1.sh
+
+  cdk-assertions:
+    name: cdk-synth-emits-four-stacks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Run M2 integration check
+        run: bash tests/features/run-m2.sh
+
+      # `cdk.json` and `npm test` both run ts-node in --transpile-only mode, so
+      # this is the ONLY type check in the pipeline. Without it a type error
+      # ships green. run-m2.sh above has already installed infra/node_modules.
+      - name: Type-check the CDK app
+        run: |
+          cd infra
+          npx --no-install tsc --noEmit
+
+      - name: Run CDK assertion tests
+        run: |
+          cd infra
+          npm test

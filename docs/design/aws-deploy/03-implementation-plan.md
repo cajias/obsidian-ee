@@ -47,7 +47,7 @@ grep -q '^STOPSIGNAL SIGINT' docker/Dockerfile.relay && docker build -f docker/D
 **Exit criterion** — the behavior scenario `cdk-synth-emits-four-stacks` in `04 — BDD Test Plan` runs green. Gate commands (the first must print `3`; the second must list `RelayShared`, `Relay-dev`, `Relay-staging`, `Relay-prod` — the stack names the deployment plan's Bootstrap runbook deploys):
 
 ```bash
-cd infra && npm ci && npx cdk synth 2>/dev/null | grep -c 'AWS::EC2::Instance'
+cd infra && npm ci && npx cdk synth --quiet && cat cdk.out/*.template.json | grep -c 'AWS::EC2::Instance'
 npx cdk list
 ```
 
@@ -58,7 +58,8 @@ npx cdk list
 - `docs/design/aws-deploy/02-structural-design.md` — the `infra/` portion of the canonical tree and its Module boundaries rows.
 - `docs/design/aws-deploy/03-implementation-plan.md` (this document) and the `cdk-synth-emits-four-stacks` scenario in `04 — BDD Test Plan`.
 - `docs/aws-deployment-plan.md` — Files to create/edit item 4, and the entire Bootstrap runbook section.
-- `infra/package.json`, `infra/tsconfig.json`, `infra/cdk.json`, `infra/bin/app.ts`, `infra/lib/shared-stack.ts`, `infra/lib/relay-stack.ts`, `infra/assets/docker-compose.yml`, `infra/assets/Caddyfile.tpl` (the env-templated Caddy site block), `infra/assets/deploy.sh.tpl` — the files to create.
+- `infra/package.json`, `infra/package-lock.json`, `infra/tsconfig.json`, `infra/cdk.json`, `infra/bin/app.ts`, `infra/lib/shared-stack.ts`, `infra/lib/relay-stack.ts`, `infra/assets/docker-compose.yml`, `infra/assets/Caddyfile.tpl` (the env-templated Caddy site block), `infra/assets/deploy.sh.tpl`, `infra/test/*.ts` (new — the specs plus the non-`.test.ts` support modules they import: the `helpers.ts` fixture and the `user-data-golden.ts` / `asset-goldens.ts` golden literals) — the files to create.
+- `.github/workflows/integration.yml` (edit) — the M2 CDK-assertions job, per the M1 plan change below.
 
 **Deliverable** — the complete `infra/` CDK TypeScript app: `RelayShared` (ECR, OIDC provider, hosted zone, ECR push role, three env-scoped deploy roles) plus the three `Relay-<env>` stacks (instance, security group, EIP, DNS record, user-data writing the compose unit, Caddy site block, and deploy script from the templated assets), synthesizing clean with explicit account and region.
 
@@ -66,11 +67,15 @@ npx cdk list
 
 1. Runbook item 1 — prereqs: Node 20+, AWS CLI, `gh`; pick the region.
 2. Runbook item 2 — `cd infra && npm install && npx cdk bootstrap aws://<ACCT>/<REGION>`.
-3. Runbook item 3 — set the domain constant in `bin/app.ts`; `npx cdk deploy RelayShared`; record NS records, ECR URI, role ARNs.
+3. Runbook item 3 — set the placeholder constants in `bin/app.ts`: domain, account, region, VPC id, and subnet id (via `aws ec2 describe-vpcs` / `describe-subnets`; availability zone derives from region). The subnet id chosen must live in availability zone `${REGION}a`, or the `AVAILABILITY_ZONE` constant must be set to that subnet's actual AZ. Then `npx cdk deploy RelayShared`; record NS records, ECR URI, role ARNs.
 4. Runbook item 4 — at the registrar, add the NS records delegating `collab.<domain>`; verify with `dig NS collab.<domain> +short`.
 5. Runbook item 5 — per env: `aws ssm put-parameter --name /relay/<env>/auth-token --type SecureString --value "$(openssl rand -base64 32)"`; save the values, clients need them.
 6. Runbook item 6 — `npx cdk deploy Relay-dev Relay-staging Relay-prod`; record instance IDs and hostnames.
-7. Runbook item 7 — `gh api` create the dev/staging/prod GitHub environments; add the named required reviewer on staging only.
+7. Runbook item 7 — `gh api` create the dev/staging/prod GitHub environments by the `PUT` that sets each one's deployment branch/tag policy (prod restricted to `v*` tags, staging and dev restricted to `main`) so the per-env deploy-role OIDC trust binds to the intended lane; the named required reviewer on staging only rides in that same `PUT` body, never as a separate later call — that `PUT` replaces the environment, so a body missing a rule clears it.
+
+**Plan change (recorded during M2 execution)** — the ratified gate piped `cdk synth` stdout to `grep -c`, but with multiple stacks and no stack id the CDK CLI (verified on 2.1135.1) writes templates only to `cdk.out/` and prints nothing to stdout, so that pipeline structurally returns 0. The gate now greps the synthesized templates in `cdk.out/` after a `--quiet` synth. The assertion is unchanged: three `AWS::EC2::Instance` resources across the synthesized stack set, and the four stack names from `cdk list`.
+
+**Plan change 2 (recorded during M2 execution)** — the single exit-criterion gate command above doesn't reach 04's Integration- and Unit-tier CDK-assertion rows (SG ports, deploy-role trust scoping, ECR immutability, instance-role token scope), which back R5's and R6's closing checks; M1's plan change already anticipated this ("M2 and M3 append their synth-assertion and actionlint jobs" to `integration.yml`). Scope addition: `infra/test/*.test.ts` (`node:test` + `aws-cdk-lib/assertions`, run via `npm test`) plus a `cdk-assertions` job appended to `.github/workflows/integration.yml`, both folded into the Context to load and files-to-create list above.
 
 ## M3 — release-please + deploy workflow
 

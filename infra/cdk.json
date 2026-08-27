@@ -1,0 +1,12 @@
+{
+  "app": "npx --no-install ts-node --transpile-only --prefer-ts-exts bin/app.ts",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["README.md", "cdk*.json", "**/*.d.ts", "**/*.js", "node_modules", "test", "cdk.out"]
+  },
+  "context": {
+    "@aws-cdk/core:newStyleStackSynthesis": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true
+  }
+}
