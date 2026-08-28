@@ -80,12 +80,14 @@ jobs:
       # shape as the docker-compose plugin download in infra/lib/relay-stack.ts.
       # Fetch and lint are ONE step so there is no "installed but never ran"
       # seam between them.
-      # The guard scripts are security-relevant, so lint them too. shellcheck is
-      # preinstalled on ubuntu-latest. Scoped to the three M3 scripts: run-m1.sh
-      # and run-m2.sh belong to already-committed milestones and are out of this
-      # milestone's diff.
-      - name: Shellcheck the M3 scripts
-        run: shellcheck tests/features/run-m3.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh
+      # The gate runners and guard scripts are security-relevant, so lint them
+      # too. shellcheck is preinstalled on ubuntu-latest. This list is
+      # hand-maintained and has already fallen behind once (run-m4.sh shipped
+      # unlinted), so APPEND EVERY NEW tests/features/*.sh HERE. It is not a
+      # glob only because run-m1.sh and run-m2.sh predate the step and have
+      # never been linted — widening it to *.sh is a separate, deliberate change.
+      - name: Shellcheck the gate and guard scripts
+        run: shellcheck tests/features/run-m3.sh tests/features/run-m4.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh
 
       # integration.yml lints ITSELF as well: a semantic error here (unknown
       # runner label, bad context reference) does not stop the workflow running,

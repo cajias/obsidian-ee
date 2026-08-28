@@ -91,6 +91,10 @@ jobs:
       # different role, so it cannot log in to ECR itself; login runs here
       # unconditionally, so this is populated even when the build is skipped.
       registry: ${{ steps.login-ecr.outputs.registry }}
+      # Resolve the deployed image reference ONCE, here, rather than
+      # reassembling registry/repository:tag in the deploy job as well — a
+      # change to the join format would otherwise have to be made twice.
+      image: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.meta.outputs.deploy_tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -200,7 +204,7 @@ jobs:
       - name: Deploy via SSM run-command
         env:
           RELAY_INSTANCE_ID: ${{ vars.RELAY_INSTANCE_ID }}
-          IMAGE: ${{ needs.build.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.meta.outputs.deploy_tag }}
+          IMAGE: ${{ needs.build.outputs.image }}
         run: |
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$RELAY_INSTANCE_ID" \

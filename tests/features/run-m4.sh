@@ -79,9 +79,11 @@ if ! digests=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
       --output text 2>"$log"); then
   err=$(cat "$log")
   if printf '%s' "$err" | grep -q 'RepositoryNotFoundException'; then
-    echo "BLOCKED: ECR repository '$ECR_REPOSITORY' does not exist."
-    echo "Outstanding human step: deploy RelayShared (bootstrap runbook), or export"
-    echo "ECR_REPOSITORY=<RelayShared's RepositoryName output> and re-run."
+    cat <<EOF
+BLOCKED: ECR repository '$ECR_REPOSITORY' does not exist.
+Outstanding human step: deploy RelayShared (bootstrap runbook), or export
+ECR_REPOSITORY=<RelayShared's RepositoryName output> and re-run.
+EOF
     exit 2
   fi
   printf '%s\n' "$err" >&2
@@ -99,7 +101,7 @@ EOF
   exit 2
 fi
 
-echo "$digests" | tee "$log"
+echo "$digests"
 
 # A tag is unique within an ECR repository, so $RELEASE_TAG already names exactly
 # ONE digest by construction; what still has to be proved is that the SAME image
