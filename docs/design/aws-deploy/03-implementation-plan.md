@@ -84,10 +84,12 @@ npx cdk list
 **Exit criterion** — the behavior scenario `dev-deploys-without-gate` in `04 — BDD Test Plan` runs green: after the maintainer approves and runs the first dev dispatch (a human-only halt step below), the deployment plan's WS-upgrade check against `relay-dev` returns HTTP `101`. Gate command:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}' \
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --http1.1 \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  https://relay-dev.collab.<domain>/
+  https://relay-dev.collab.<domain>/) || true
+[ -z "$CODE" ] && CODE=000
+echo "$CODE"
 ```
 
 Expected output: `101` (retry within the ~2-minute budget the deploy workflow allows for first-deploy DNS propagation and certificate issuance).
@@ -102,6 +104,7 @@ Expected output: `101` (retry within the ~2-minute budget the deploy workflow al
 - `docs/design/aws-deploy/03-implementation-plan.md` (this document) and the `dev-deploys-without-gate` and `staging-waits-for-review` scenarios in `04 — BDD Test Plan`.
 - `docs/aws-deployment-plan.md` — Files to create/edit items 1–2, Architecture, and Image strategy.
 - `version.txt`, `release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release.yml`, `.github/workflows/deploy.yml` — the files to create.
+- `infra/lib/shared-stack.ts`, `infra/test/template-goldens.ts` (edit) — the `RepositoryName` CfnOutput and its regenerated golden, per Plan change 4 below.
 
 **Deliverable** — the versioned release process and the delivery lane: release-please with the `simple` strategy (version file, changelog, tag), `release.yml` on push to main authenticated with the `RELEASE_PLEASE_TOKEN` fine-grained PAT so published releases fire release-triggered workflows, and `deploy.yml` (meta, build with skip-if-exists and same-digest retag, deploy via env-scoped OIDC role and SSM run-command, 101 verify) — merged, with the first dev deploy green and a staging dispatch observed pausing at its required reviewer.
 
@@ -110,6 +113,14 @@ Expected output: `101` (retry within the ~2-minute budget the deploy workflow al
 1. Runbook item 9 — mint the fine-grained PAT (contents rw + pull-requests rw, this repo only); `gh secret set RELEASE_PLEASE_TOKEN`.
 2. Runbook item 8 — `gh variable set` repo-level (`AWS_REGION`, `ECR_REPOSITORY`, `ECR_PUSH_ROLE_ARN`) and per-env (`AWS_DEPLOY_ROLE_ARN`, `RELAY_INSTANCE_ID`, `RELAY_HOSTNAME`).
 3. Runbook item 10 — merge the repo changes; approve and run the first dev dispatch: `gh workflow run deploy.yml -f environment=dev`; then the gate command above verifies.
+
+**Plan change (recorded during M3 execution)** — the ratified probe omitted `--http1.1`. curl defaults to HTTP/2 for `https://` (`CURL_HTTP_VERSION_2TLS`) and Caddy 2 negotiates h2 via ALPN, where `Connection:` and `Upgrade:` are forbidden connection-specific fields that curl silently drops — Caddy then sees a plain GET and the relay answers non-101, so the ratified command could never return `101` (verified against a real WS endpoint: `200 http/2` without the flag, `101 http/1.1` with it). The assertion is unchanged — an unauthenticated WS handshake returns `101` — the flag only pins the protocol version that handshake requires. The same correction applies to M4's per-env `for env in dev staging prod` probe loop below.
+
+**Plan change 2 (recorded during M3 execution)** — `github.event.release.tag_name` reaches the SSM `AWS-RunShellScript` `commands` string, which the instance re-parses as a shell script as root, and prod carries no required reviewer; step-level `env:` does not survive that hop. The `meta` job now rejects any release tag outside `^v[0-9]+\.[0-9]+\.[0-9]+$` before it becomes an output (rollback dispatches are unaffected — they take the `workflow_dispatch` branch and deploy the `sha-` tag). `id-token: write` moved from workflow level to job-level `permissions` on `build` and `deploy` only, so `meta` — the job handling the untrusted tag — cannot mint an OIDC token. Scope addition: `tests/features/deploy-tag-guard.sh` (the negative-path regression test this repo's engineering rules require for a confirmed trust-boundary fix) plus a step running it in `.github/workflows/integration.yml`'s existing `workflow-lint` job. A second guard script joined the same job for a different failure class that bit M3 twice — a step whose ACTION DEFAULTS silently invalidate a later step's assumption (`setup-buildx-action` leaving a container-driver builder current under `docker build`; `imagetools` defaulting to `--prefer-index`). Scope addition: `tests/features/deploy-buildx-guard.sh` plus its step in the same `workflow-lint` job. Both scripts are registered in 04's Integration tier table.
+
+**Plan change 3 (recorded during M3 execution)** — the probe's success path was unreachable even with `--http1.1`. curl enters its WebSocket 101 path only when curl itself drives a `ws://`|`wss://` URL (`upgr101 = UPGR101_WS` is set exclusively in `Curl_ws_request`); with an `https://` URL plus hand-written `Upgrade:` headers it takes the "not switching protocols" branch, accepts the 101 as the FINAL response and reads the BODY to EOF — but a 101 carries neither `Content-Length` nor chunked framing, so the body ends only when the peer closes. Against a relay that holds the connection open after the handshake (the normal case — it is waiting for the client's first frame) the probe hangs until an external timeout; against a peer that closes immediately, curl printed `101` but exited 52 and the old `|| CODE=000` error path then DESTROYED that captured reading, reporting `000` and burning every retry. Fix: `--max-time 5` per attempt (a handshake against a live relay settles in well under a second, so 5s is generous; a failed attempt now costs at most ~10s including the 5s sleep, so the deploy workflow's 24 attempts stay inside ~4 minutes against a ~2-minute nominal budget, hard-capped by the new `timeout-minutes: 15` on the deploy job), and substitute the `000` sentinel only when the capture is EMPTY — `-w` still emits the code on the timeout path, so a successful 101 survives curl's nonzero exit. The assertion is unchanged: an unauthenticated WS handshake returns `101`; the change only makes that reading observable and bounded. Verified against a local server that completes the RFC 6455 handshake: holding the connection open now yields `exit=28 CODE=101` in ~5s instead of hanging, and closing immediately after the 101 yields `exit=52 CODE=101` instead of `000`. The same correction applies to M4's per-env `for env in dev staging prod` probe loop below, and to `tests/features/run-m3.sh`.
+
+**Plan change 4 (recorded during M3 execution)** — `deploy.yml` consumes `vars.ECR_REPOSITORY` as the bare repository name in two places (`aws ecr describe-images --repository-name` and the image path segment), but RelayShared exported only `EcrRepositoryUri` (the full registry URI) — pasting that value would break `describe-images` and produce a doubled-registry image reference, from which `deploy.sh.tpl`'s `${IMAGE%%/*}` derives the wrong login host. M3 consuming M2's exports is what revealed the missing export, so the `RepositoryName` output was added to the committed M2 stack (`infra/lib/shared-stack.ts`) and the whole-template golden (`infra/test/template-goldens.ts`) regenerated (`npm run regen-goldens`; the golden caught the change on its own — 65 pass / 1 fail before regenerating — and the suite is 66/66 after). Runbook item 8 also now names the literal value. Both files land in M3's commit.
 
 ## M4 — Verified rollout
 
@@ -129,10 +140,12 @@ gh workflow run deploy.yml -f environment=prod --ref v0.1.0
 
 # Per env: WS-upgrade probe returns 101
 for env in dev staging prod; do
-  curl -s -o /dev/null -w "%{http_code} relay-$env\n" \
+  OUT=$(curl -s -o /dev/null -w "%{http_code} relay-$env\n" --max-time 5 --http1.1 \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-    "https://relay-$env.collab.<domain>/"
+    "https://relay-$env.collab.<domain>/") || true
+  [ -z "$OUT" ] && OUT="000 relay-$env"
+  echo "$OUT"
 done
 
 # Admission proof: Identify with the env token -> ack; without a token -> rejection

@@ -48,3 +48,57 @@ jobs:
         run: |
           cd infra
           npm test
+
+  workflow-lint:
+    name: actionlint-release-and-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The two guard scripts run FIRST, before anything that reaches the
+      # network. They need nothing but the checkout, so a failure while
+      # fetching actionlint can no longer silently skip them — which is what
+      # happened while this job installed actionlint via
+      # `taiki-e/install-action`: that action ships no actionlint manifest, so
+      # it fell through to `cargo-binstall actionlint@1.7.12`, and actionlint is
+      # a Go program with no crates.io entry, so the step 404'd on every run.
+
+      # Negative-path regression test for the release-tag guard in deploy.yml's
+      # `meta` job: the tag is re-parsed as a shell script AS ROOT by SSM
+      # downstream, so the guard must refuse shell metacharacters.
+      - name: Check the deploy release-tag guard rejects injection
+        run: bash tests/features/deploy-tag-guard.sh
+
+      # Config-invariant regression test for the class that has now bitten M3
+      # twice: a step whose ACTION DEFAULTS silently invalidate a later step's
+      # assumption (setup-buildx-action making a container-driver builder
+      # current under `docker build`; imagetools defaulting to --prefer-index).
+      - name: Check the deploy image build and promotion invariants
+        run: bash tests/features/deploy-buildx-guard.sh
+
+      # Pinned release binary verified against its published sha256 — the same
+      # shape as the docker-compose plugin download in infra/lib/relay-stack.ts.
+      # Fetch and lint are ONE step so there is no "installed but never ran"
+      # seam between them.
+      # The guard scripts are security-relevant, so lint them too. shellcheck is
+      # preinstalled on ubuntu-latest. Scoped to the three M3 scripts: run-m1.sh
+      # and run-m2.sh belong to already-committed milestones and are out of this
+      # milestone's diff.
+      - name: Shellcheck the M3 scripts
+        run: shellcheck tests/features/run-m3.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh
+
+      # integration.yml lints ITSELF as well: a semantic error here (unknown
+      # runner label, bad context reference) does not stop the workflow running,
+      # it just makes it misbehave silently. ci.yml is deliberately excluded —
+      # it is frozen by the structural design and outside this milestone.
+      - name: Lint the release, deploy and integration workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+          "$RUNNER_TEMP/actionlint" .github/workflows/release.yml .github/workflows/deploy.yml .github/workflows/integration.yml

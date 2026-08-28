@@ -151,6 +151,8 @@ Checks below the behavior gate, each runnable with nothing deployed:
 | Registry repository declares immutable tags and scan on push | CDK assertions | SC3's tag immutability |
 | Each instance role reads only its own token parameter | CDK assertions | SC2's per-environment credential isolation |
 | Workflow lint over the release and deploy workflows | actionlint | the delivery lane parses cleanly and references valid contexts |
+| Deploy's release-tag guard refuses shell metacharacters, embedded newlines and CR | `bash tests/features/deploy-tag-guard.sh` | SC4 — the tag reaches SSM `AWS-RunShellScript` as root, so the guard is the trust boundary |
+| Deploy's image build and promotion invariants survive action defaults | `bash tests/features/deploy-buildx-guard.sh` | SC3 — the built and promoted artifact stays the single arm64 digest the deploy resolves |
 | Relay image builds, with the SIGINT stop signal declared | docker build | backs `relay-container-stops-on-sigint` |
 | Cost estimate review: roughly $32/month total across environments, under the $40 ceiling | documented-accepted, reviewed at bootstrap and monthly | SC7 |
 
@@ -170,8 +172,8 @@ The traceability and burn-down table for the ledger in the Residual ledger secti
 | R1 | Brief downtime and offline-queue loss per deploy; no HA | M4 | `handshake-returns-101` green after a stop-then-start deploy proves the interruption stays brief and the service returns | open |
 | R2 | Idle WebSocket connections reaped (no keepalive yet) | M4 | documented-accepted — keepalive is a named future direction of `01 — Logic Design`; clients reconnect | open |
 | R3 | Instance replacement loses caddy_data; certificates re-issue. Also triggers on any `cdk deploy` of a Relay-* stack after AWS publishes a newer AL2023 arm64 AMI, since the SSM-latest ImageId re-resolves and forces instance replacement — re-run the environment's deploy workflow afterward to bring the relay back up. | M2 | documented-accepted — deliberate tradeoff; the duplicate-certificate limit is noted alongside the bootstrap runbook | closed — runbook note under Bootstrap item 6 in `docs/aws-deployment-plan.md`, plus the `caddy_data` comment in `infra/assets/docker-compose.yml` |
-| R4 | Tags predating the deploy workflow cannot be dispatched | M3 | documented-accepted — deliberate consequence of dispatch-from-ref; every tag cut after the workflow lands is dispatchable | open |
+| R4 | Tags predating the deploy workflow cannot be dispatched | M3 | documented-accepted — deliberate consequence of dispatch-from-ref; every tag cut after the workflow lands is dispatchable | closed — Accepted tradeoffs note in docs/aws-deployment-plan.md, plus the R4 comment on deploy.yml's workflow_dispatch trigger |
 | R5 | Registry push role trusts all repository refs | M2 | integration check: each deploy role trusts only its own environment, bounding the blast radius one layer down | closed — push-role trust test in `infra/test/shared-stack.test.ts` |
 | R6 | HTTP/3 stays off (UDP 443 closed) | M2 | integration check: security group ingress asserts TCP 80 and 443 only | closed — SG assertion in `infra/test/relay-stack.test.ts` |
 
-**Totals**: 6 residuals; claims M2=3, M3=1, M4=2 → 6/6 claimed; 3 closed (R3, R5, R6), 3 open (R1, R2, R4).
+**Totals**: 6 residuals; claims M2=3, M3=1, M4=2 → 6/6 claimed; 4 closed (R3, R4, R5, R6), 2 open (R1, R2).

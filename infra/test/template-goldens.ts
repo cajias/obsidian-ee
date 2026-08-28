@@ -401,6 +401,12 @@ export const TEMPLATE_GOLDENS: Record<string, unknown> = {
           ]
         }
       },
+      "RepositoryName": {
+        "Description": "Bare ECR repository name — the value for the ECR_REPOSITORY repo variable",
+        "Value": {
+          "Ref": "RelayRepo971E060D"
+        }
+      },
       "EcrPushRoleArn": {
         "Value": {
           "Fn::GetAtt": [

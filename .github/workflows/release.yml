@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# Mirrors the fine-grained PAT's own two scopes (bootstrap runbook item 9). The
+# action's GitHub API calls all ride the PAT, not this ambient token.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Two pushes to main in quick succession would otherwise race on the same release
+# PR. cancel-in-progress is false: a run that has already created the GitHub
+# release must not be killed part-way (that is the event prod deploys on), and a
+# superseded run is cheap — release-please recomputes the PR from history anyway.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    steps:
+      # No path inputs are needed: the undotted release-please-config.json and
+      # .release-please-manifest.json at the repo root are the action's default
+      # lookup names. The `simple` strategy keeps release PRs to version.txt +
+      # CHANGELOG.md, so Cargo.lock is never regenerated and `--locked` CI stays
+      # green by construction (D7).
+      #
+      # The PAT is required, not a preference: releases created with the default
+      # GITHUB_TOKEN never fire `release:`-triggered workflows, so prod would
+      # silently never deploy (D5).
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}

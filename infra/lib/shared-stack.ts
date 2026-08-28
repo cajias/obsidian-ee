@@ -47,6 +47,16 @@ export class SharedStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'EcrRepositoryUri', { value: this.ecrRepo.repositoryUri });
 
+    // Runbook item 8's `vars.ECR_REPOSITORY` is the BARE repository name, not
+    // the URI above: deploy.yml feeds it to `aws ecr describe-images
+    // --repository-name` AND uses it as the image path segment after the
+    // registry host, so the URI would break the first and double the host in
+    // the second (deploy.sh then derives the wrong login host from `${IMAGE%%/*}`).
+    new cdk.CfnOutput(this, 'RepositoryName', {
+      value: this.ecrRepo.repositoryName,
+      description: 'Bare ECR repository name — the value for the ECR_REPOSITORY repo variable',
+    });
+
     // The L1 resource, not iam.OpenIdConnectProvider: the L2 is a CDK custom
     // resource, i.e. a Lambda holding iam:*OpenIDConnectProvider on "*" (it can
     // rewrite ANY provider in the account, including this one's trust anchor)

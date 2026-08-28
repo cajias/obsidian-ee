@@ -28,7 +28,7 @@ AWS: SharedStack (ECR, OIDC provider, hosted zone, 4 roles) + Relay-{dev,staging
 On instance: caddy:2 (auto Let's Encrypt) → relay:8080 on the compose network (no host ports on relay)
 ```
 
-Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job **retags the existing digest** (`docker buildx imagetools create`) to `vX.Y.Z` when that sha was already built — same-digest promotion preserved; builds only if missing.
+Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job **retags the existing digest** (`docker buildx imagetools create --prefer-index=false`) to `vX.Y.Z` when that sha was already built — same-digest promotion preserved; builds only if missing. `--prefer-index=false` is load-bearing: the source is a single-platform schema2 manifest, and the default would wrap it in a new image index and give the v-tag a different digest.
 
 ## Code-level constraints encoded
 
@@ -47,10 +47,10 @@ Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job
 
 ### 2. `.github/workflows/deploy.yml`
 - Triggers: `workflow_dispatch` (choice input dev/staging/prod, default dev; prod choice documented as rollback/redeploy hatch, e.g. `--ref v0.1.0`) + `release: {types: [published]}` → prod.
-- `permissions: {id-token: write, contents: read}`; `concurrency` keyed per target env, no cancel-in-progress.
-- `meta` job resolves env + tags: `sha-<sha12>` always; release → `deploy_tag = tag_name`.
-- `build` job on `ubuntu-24.04-arm`: `configure-aws-credentials@v4` (ECR push role), `amazon-ecr-login@v2`; skip build if `aws ecr describe-images` finds the sha tag (immutable tags — never re-push); on release, retag digest via `docker buildx imagetools create`.
-- `deploy` job: `environment: {name: <env>, url: https://<host>}` — staging's required reviewer pauses here; env-scoped `vars.AWS_DEPLOY_ROLE_ARN` / `RELAY_INSTANCE_ID` / `RELAY_HOSTNAME`; runs `aws ssm send-command` → `/opt/relay/deploy.sh <image>`, polls `get-command-invocation` to Success; then retry-loop curl WS-upgrade check expecting HTTP 101 (~2 min budget for first-deploy DNS/ACME).
+- Workflow-level `permissions: {contents: read}`, with `id-token: write` granted job-level on `build` and `deploy` only — `meta` handles the untrusted release tag and assumes no role, so it must not mint OIDC tokens; `concurrency` keyed per target env, no cancel-in-progress.
+- `meta` job resolves env + tags: `sha-<sha12>` always; release → `deploy_tag = tag_name`, rejected unless it matches `^v[0-9]+\.[0-9]+\.[0-9]+$` (the tag is re-parsed as root by SSM downstream).
+- `build` job on `ubuntu-24.04-arm`: `configure-aws-credentials@v4` (ECR push role), `amazon-ecr-login@v2`; skip build if `aws ecr describe-images` finds the sha tag (immutable tags — never re-push); on release, retag digest via `docker buildx imagetools create --prefer-index=false` (the default wraps the single-platform manifest in a new index and changes the digest).
+- `deploy` job: `environment: {name: <env>, url: https://<host>}` — staging's required reviewer pauses here; env-scoped `vars.AWS_DEPLOY_ROLE_ARN` / `RELAY_INSTANCE_ID` / `RELAY_HOSTNAME`; runs `aws ssm send-command` → `/opt/relay/deploy.sh <image>`, polls `get-command-invocation` to Success; then retry-loop `curl --http1.1 --max-time 5` WS-upgrade check expecting HTTP 101 (~2 min budget for first-deploy DNS/ACME).
 - Repo-level vars: `AWS_REGION`, `ECR_REPOSITORY`, `ECR_PUSH_ROLE_ARN`.
 
 ### 3. `docker/Dockerfile.relay` (edit)
@@ -118,7 +118,7 @@ relay-{{ENV}}.collab.<domain> {
        -f name=main -f type=branch
      ```
      Confirm both survived: `gh api repos/cajias/obsidian-ee/environments/staging --jq '{reviewers:[.protection_rules[]|select(.type=="required_reviewers")|.reviewers[].reviewer.login], policy:.deployment_branch_policy}'`
-8. `gh variable set` repo-level (`AWS_REGION`, `ECR_REPOSITORY`, `ECR_PUSH_ROLE_ARN`) + per-env (`AWS_DEPLOY_ROLE_ARN`, `RELAY_INSTANCE_ID`, `RELAY_HOSTNAME`).
+8. `gh variable set` repo-level (`AWS_REGION`, `ECR_REPOSITORY`, `ECR_PUSH_ROLE_ARN`) + per-env (`AWS_DEPLOY_ROLE_ARN`, `RELAY_INSTANCE_ID`, `RELAY_HOSTNAME`). `ECR_REPOSITORY` is the bare repository name `obsidian-ee/collab-relay` — RelayShared's `RepositoryName` output, **not** its `EcrRepositoryUri` output. deploy.yml passes it to `aws ecr describe-images --repository-name` (which rejects a URI) and also appends it after the registry host, where a URI would yield a doubled-registry image ref and `/opt/relay/deploy.sh`'s `${IMAGE%%/*}` would then log in to the wrong host.
 9. Fine-grained PAT (contents rw + pull-requests rw, this repo only) → `gh secret set RELEASE_PLEASE_TOKEN`.
 10. Merge the repo changes; `gh workflow run deploy.yml -f environment=dev`; verify.
 11. Point Obsidian plugin at `wss://relay-dev.collab.<domain>` + dev token.
@@ -127,7 +127,7 @@ Sequencing: STOPSIGNAL edit first (independent) → infra + runbook 1–8 → re
 
 ## Verification
 
-- Per env: curl WS-upgrade to `https://relay-<env>.collab.<domain>/` → expect **101**.
+- Per env: `curl --http1.1 --max-time 5` WS-upgrade to `https://relay-<env>.collab.<domain>/` → expect **101** (without `--http1.1` curl negotiates HTTP/2 with Caddy, which drops the `Upgrade` headers; without `--max-time` curl treats the 101 on an `https://` URL as a final response and reads the unframed body to EOF, so it hangs against a relay that holds the connection open). Capture the `-w '%{http_code}'` reading and substitute a `000` sentinel only when the capture is EMPTY — curl exits nonzero on both the timeout and the peer-closed path, but the code has already been printed.
 - `websocat wss://relay-dev…` + `Identify` with token → ack; without token → rejection (proves not an open relay).
 - Canary: merge a `fix:` commit → release PR (only version.txt/CHANGELOG → `--locked` CI stays green) → merge → `v0.1.1` published → prod deploy fires; ECR shows `v0.1.1` and `sha-…` on the same digest.
 - Gates: staging dispatch pauses "Waiting for review"; dev doesn't.
