@@ -63,6 +63,13 @@ jobs:
       # it fell through to `cargo-binstall actionlint@1.7.12`, and actionlint is
       # a Go program with no crates.io entry, so the step 404'd on every run.
 
+      # The join key (scenario names cited in both 03 and 04, and each .feature
+      # a verbatim copy) and the 6-row residual ledger are definition-of-done
+      # criteria that were previously checked only by a script outside this
+      # repository — so a reworded scenario name would have shipped silently.
+      - name: Check design-set integrity (join key + residual ledger)
+        run: bash tests/features/design-integrity-guard.sh
+
       # Negative-path regression test for the release-tag guard in deploy.yml's
       # `meta` job: the tag is re-parsed as a shell script AS ROOT by SSM
       # downstream, so the guard must refuse shell metacharacters.
@@ -87,7 +94,7 @@ jobs:
       # glob only because run-m1.sh and run-m2.sh predate the step and have
       # never been linted — widening it to *.sh is a separate, deliberate change.
       - name: Shellcheck the gate and guard scripts
-        run: shellcheck tests/features/run-m3.sh tests/features/run-m4.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh
+        run: shellcheck tests/features/run-m3.sh tests/features/run-m4.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh tests/features/design-integrity-guard.sh
 
       # integration.yml lints ITSELF as well: a semantic error here (unknown
       # runner label, bad context reference) does not stop the workflow running,
