@@ -171,77 +171,12 @@ websocat wss://relay-dev.collab.<domain>/
 3. Run the rollback dispatch: `gh workflow run deploy.yml -f environment=prod --ref v0.1.0`.
 4. Runbook item 11 — point the Obsidian plugin at `wss://relay-dev.collab.<domain>` with the dev token for the end-to-end collaborator check.
 
-### M4 runbook
-
-The ordered pass the maintainer runs by hand. Export these first, in the same shell every step below runs in:
-
-```bash
-export AWS_PROFILE=<profile> AWS_REGION=<region>  # must reach RelayShared and the three Relay-* stacks
-export RELAY_DOMAIN=<apex domain>                 # the <domain> in relay-<env>.collab.<domain>
-# Optional, only if the defaults do not fit:
-#   export RELAY_TOKEN=<dev token>       # when this profile may not read /relay/dev/auth-token
-#   export ECR_REPOSITORY=<name>         # when RelayShared's RepositoryName is not obsidian-ee/collab-relay
-```
-
-**1. Approve the staging dispatch at its reviewer pause.**
-
-```bash
-gh workflow run deploy.yml -f environment=staging
-gh run watch "$(gh run list --workflow=deploy.yml -L1 --json databaseId -q '.[0].databaseId')"
-```
-
-Observe: the `deploy and verify` job stops in `Waiting for review`. Approve it on the run page (**Review deployments → staging → Approve and deploy**); the job then resumes and its last step logs `attempt N: 101`. That is `staging-waits-for-review` green, and it leaves staging on the digest prod will promote.
-
-**2. Merge the canary `fix:` commit.**
-
-```bash
-git switch -c fix/m4-canary
-git commit --allow-empty -m "fix: canary release for the M4 rollout gate"
-git push -u origin fix/m4-canary
-gh pr create --fill && gh pr merge --squash --delete-branch
-```
-
-Observe: the `release` workflow runs on the merge and release-please opens a release PR. Check its file list before merging — it must touch only `version.txt` and `CHANGELOG.md`; a `Cargo.lock` change would break CI's `--locked` build.
-
-**3. Merge the release PR (this fires the prod deploy).**
-
-```bash
-gh pr list --label 'autorelease: pending'
-gh pr merge <release-pr-number> --squash
-```
-
-Observe: release-please publishes `v0.1.1`, and the `deploy` workflow fires on `release: published` and resolves `environment=prod`. In the build job, `Build and push (native arm64)` is **skipped** (the canary's `sha-` tag is already in the registry) while `Retag the released digest` runs — that skip-plus-retag is the same-digest promotion. Then take the incremental reading:
-
-```bash
-bash tests/features/run-m4.sh
-```
-
-Observe: gates (a)–(c) print `OK` and the script exits 2 naming the rollback drill as the one outstanding step.
-
-**4. Run the rollback dispatch.** This is a REAL prod deploy, which is why `run-m4.sh` never issues it.
-
-```bash
-gh workflow run deploy.yml -f environment=prod --ref v0.1.0
-gh run watch "$(gh run list --workflow=deploy.yml -L1 --json databaseId -q '.[0].databaseId')"
-```
-
-Observe: `Build and push` is skipped again and `Retag the released digest` does not run at all (this is a dispatch, not a release), so no image is built — the deploy job simply sends the SSM command with the `:v0.1.0` ref and its 101 verify passes.
-
-**5. Verify.**
-
-```bash
-M4_ROLLBACK_DRILL=done bash tests/features/run-m4.sh
-```
-
-Observe: exit 0 and `PASS: all four M4 scenarios verified`. Any non-zero exit prints either a `FAIL:` line naming the assertion that broke or a `BLOCKED:` block naming the human step still outstanding.
-
-**6. Restore prod to the released version, then close out halt step 4.**
-
-```bash
-gh workflow run deploy.yml -f environment=prod --ref v0.1.1
-```
-
-Observe: prod returns to `v0.1.1`. Then run runbook item 11 — point the Obsidian plugin at `wss://relay-dev.collab.$RELAY_DOMAIN` with the dev token and confirm two clients sync end to end.
+**M4 rollout runbook** — the ordered commands the maintainer runs, with what to
+observe at each, live in the Rollout runbook (M4) section of
+`docs/aws-deployment-plan.md`, alongside the Bootstrap runbook and Verification
+sections that own the rest of this system's operational procedure. M1-M3 cite
+that document's runbook items by number for the same reason: the design set
+states what must hold, the deployment plan states how to make it hold.
 
 ## Residual ledger
 

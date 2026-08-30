@@ -4,6 +4,13 @@
 
 set -e
 
+# Put rustup's shims on PATH; without this wasm-pack/tsc fail on stale bindings.
+# Deliberately NO RUSTUP_TOOLCHAIN override: the env var outranks the directory
+# override, so pinning it to "stable" would silently ignore rust-toolchain.toml
+# (1.87.0) and build the committed plugin bindings on whatever the contributor
+# happens to have installed.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Change to project root
 cd "$(dirname "$0")/.."
 
