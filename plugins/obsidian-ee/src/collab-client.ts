@@ -18,6 +18,13 @@ export type CollabRole = 'owner' | 'joiner';
 // bounds every array parsed out of it.
 const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 
+// Reconnect policy defaults, mirroring the Rust side so the two implementations
+// of this logic cannot drift again: MIN_STABLE_CONNECTION in
+// crates/collab-cli/src/commands.rs and RetryPolicy::default()'s max_delay in
+// crates/collab-core/src/connection.rs.
+const DEFAULT_MIN_STABLE_CONNECTION_MS = 10000;
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 30000;
+
 /**
  * Narrow view of WasmVaultSync (#32): the client only needs to apply remote
  * manifest updates; local file-event handling stays with the plugin.
@@ -39,6 +46,19 @@ export interface CollabClientConfig {
     vaultSync?: VaultSyncLike;
     /** The locally-trusted manifest doc id (from wasm `manifest_doc_id()`). */
     manifestDocId?: string;
+    /**
+     * How long a connection must stay up before the reconnect budget is
+     * refilled. Mirrors the Rust CLI's `MIN_STABLE_CONNECTION`
+     * (crates/collab-cli/src/commands.rs). Defaults to
+     * `DEFAULT_MIN_STABLE_CONNECTION_MS`.
+     */
+    minStableConnectionMs?: number;
+    /**
+     * Ceiling on the exponential reconnect backoff. Mirrors
+     * `RetryPolicy::max_delay` (crates/collab-core/src/connection.rs). Defaults
+     * to `DEFAULT_MAX_RECONNECT_DELAY_MS`.
+     */
+    maxReconnectDelayMs?: number;
 }
 
 export type UpdateCallback = (text: string) => void;
@@ -204,6 +224,7 @@ export class CollabClient {
     private readonly maxQueueSize = 1000;
     private connectionState: ConnectionState = 'disconnected';
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
     private isInitialConnect = true;
     private connectPromise: Promise<void> | null = null;
 
@@ -376,7 +397,13 @@ export class CollabClient {
                     }
 
                     this.flushMessageQueue();
-                    this.reconnectAttempts = 0;
+                    // Arm the stability window instead of refilling the retry
+                    // budget here: a successful accept is not proof the
+                    // connection is useful, and an accept-then-immediately-drop
+                    // relay (shutdown, takeover, eviction) would reconnect
+                    // forever because the budget never accumulates toward
+                    // maxReconnectAttempts.
+                    this.startStabilityTimer();
                     resolve();
                 };
 
@@ -773,17 +800,57 @@ export class CollabClient {
         this.onManifestPathsCallback = callback;
     }
 
+    /**
+     * Arm the stability window. Only once a connection has stayed up for
+     * `minStableConnectionMs` is the retry budget refilled — the TS analogue of
+     * the Rust `on_stable_connection` (crates/collab-core/src/connection.rs:302),
+     * driven there by MIN_STABLE_CONNECTION in the CLI. Refilling on `onopen`
+     * alone is the accept-then-drop bug: the budget would never accumulate and
+     * an accept-then-immediately-drop relay would be retried forever.
+     *
+     * The timer is cleared on every drop (handleReconnect) and by disconnect(),
+     * so a refill can never outlive the connection that earned it.
+     */
+    private startStabilityTimer(): void {
+        this.clearStabilityTimer();
+        this.stabilityTimer = setTimeout(() => {
+            this.stabilityTimer = null;
+            // disconnect() uses maxReconnectAttempts = 0 as its stop flag; never
+            // hand a budget back to a client the user explicitly stopped.
+            if (this.maxReconnectAttempts === 0) {
+                return;
+            }
+            this.reconnectAttempts = 0;
+        }, this.config.minStableConnectionMs ?? DEFAULT_MIN_STABLE_CONNECTION_MS);
+    }
+
+    private clearStabilityTimer(): void {
+        if (this.stabilityTimer) {
+            clearTimeout(this.stabilityTimer);
+            this.stabilityTimer = null;
+        }
+    }
+
     private handleReconnect(): void {
         // Clear any existing timer to prevent old timers from interfering
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        // The connection this was armed for is gone, so it never proved stable.
+        // Every drop routes through here, which is what keeps a pending refill
+        // from surviving the socket it belonged to.
+        this.clearStabilityTimer();
 
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
             this.connectionState = 'reconnecting';
             this.reconnectAttempts++;
-            const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+            // Cap the backoff, mirroring `delay.min(self.max_delay)` in
+            // crates/collab-core/src/connection.rs:153.
+            const delay = Math.min(
+                this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+                this.config.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS
+            );
             console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
             this.reconnectTimer = setTimeout(() => {
                 // Check if disconnect() was called while waiting
@@ -919,6 +986,9 @@ export class CollabClient {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        // A stability timer that outlived disconnect() would fire later and
+        // resurrect the retry budget of a session the user explicitly stopped.
+        this.clearStabilityTimer();
         this.ws?.close();
         this.ws = null;
         // Free a still-unconsumed key package (a joiner that never got its

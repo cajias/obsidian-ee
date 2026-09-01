@@ -454,11 +454,318 @@ describe('CollabClient', () => {
     });
 
     describe('reconnection', () => {
-        it('should attempt to reconnect with exponential backoff', async () => {
-            await connectClient(client);
+        // Every socket accepts (onopen) and drops in the SAME tick, so the
+        // connection never survives long enough for the stability window to
+        // elapse. This is the accept-then-immediately-drop relay (shutdown,
+        // takeover, resource eviction) documented at collab-core
+        // connection.rs:281 — the case the retry budget exists to stop.
+        function installAcceptThenDropWebSocket(): () => number {
+            let constructions = 0;
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
+                    constructions++;
+                    setTimeout(() => {
+                        ws.readyState = 1;
+                        ws.onopen?.();
+                        ws.readyState = 3;
+                        ws.onclose?.();
+                    }, 0);
+                },
+            });
+            return () => constructions;
+        }
 
-            // The reconnection logic is tested implicitly through the handleReconnect method
-            // which uses exponential backoff
+        // Sockets that open and STAY open; the test drops them explicitly. close()
+        // deliberately does NOT fire onclose, so a teardown path can be proven to
+        // clean up on its own rather than via the onclose -> handleReconnect hop.
+        function installStaysOpenWebSocket(): void {
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
+                    setTimeout(() => {
+                        ws.readyState = 1;
+                        ws.onopen?.();
+                    }, 0);
+                },
+            });
+        }
+
+        // Sockets that fail before ever opening (onerror then onclose, the normal
+        // browser failure order), so onopen never runs and the retry budget only
+        // ever accumulates.
+        function installFailBeforeOpenWebSocket(): void {
+            (global as any).WebSocket = createMockWebSocket({
+                onConstruct: (ws) => {
+                    setTimeout(() => {
+                        ws.onerror?.(new Error('connect failed'));
+                        ws.readyState = 3;
+                        ws.onclose?.();
+                    }, 0);
+                },
+            });
+        }
+
+        // Record the delays handleReconnect schedules. Every other setTimeout in
+        // these tests is either a mock socket's 0 ms construction hop or the
+        // stability window at `minStableConnectionMs`, so both are excluded by
+        // value (the reconnect delays are all >= 1000 ms and never collide).
+        function captureScheduledDelays(ignoredDelays: number[]): {
+            delays: () => number[];
+            restore: () => void;
+        } {
+            const spy = jest.spyOn(globalThis as any, 'setTimeout') as unknown as {
+                mock: { calls: unknown[][] };
+                mockRestore: () => void;
+            };
+            return {
+                delays: () =>
+                    spy.mock.calls
+                        .map((call) => call[1] as number)
+                        .filter((delay) => !ignoredDelays.includes(delay)),
+                restore: () => spy.mockRestore(),
+            };
+        }
+
+        // Pump the backoff loop step-wise: run only the currently-pending timers,
+        // then flush microtasks so connect()'s .finally (which clears
+        // connectPromise) runs between macrotasks, exactly as real timers
+        // interleave. runAllTimers would batch every timer without that flush,
+        // leaving connectPromise stale so the dedup guard blocks every retry.
+        // Two iterations advance the loop by one full cycle: one runs the
+        // reconnect timer (constructing the socket), the next runs the socket's
+        // own construction hop (opening it).
+        async function pumpReconnectLoop(iterations = 40): Promise<void> {
+            for (let i = 0; i < iterations; i++) {
+                jest.runOnlyPendingTimers();
+                await Promise.resolve();
+                await Promise.resolve();
+            }
+        }
+
+        // Open the first socket without letting the stability window elapse:
+        // connectClient()'s runAllTimers would fire the stability timer too.
+        async function connectWithoutStability(target: CollabClient): Promise<void> {
+            const connectPromise = target.connect();
+            jest.runOnlyPendingTimers();
+            await connectPromise;
+        }
+
+        it('schedules reconnects with real exponential backoff', async () => {
+            // Replaces a test whose body had no assertions at all ("tested
+            // implicitly"), so it could not fail. Mirrors
+            // retry_policy_exponential_backoff (collab-core connection.rs:387):
+            // 1000ms doubling per attempt, all still under the 30000ms ceiling.
+            const OriginalWebSocket = global.WebSocket;
+            await connectClient(client);
+            installFailBeforeOpenWebSocket();
+            const captured = captureScheduledDelays([0]);
+
+            try {
+                (client as any).ws?.onclose?.();
+                await pumpReconnectLoop();
+
+                expect(captured.delays()).toEqual([1000, 2000, 4000, 8000, 16_000]);
+            } finally {
+                captured.restore();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('accept-then-drop without stability reaches max_retries_exceeded', async () => {
+            // THE regression test. Mirrors
+            // accept_then_drop_without_stability_reaches_give_up (collab-core
+            // connection.rs:727): a relay that accepts the socket and immediately
+            // drops it must exhaust the retry budget and give up, NOT reconnect
+            // forever at a fixed cadence. minStableConnectionMs is far larger than
+            // the whole test's virtual time, so the budget can never be refilled.
+            const OriginalWebSocket = global.WebSocket;
+            installAcceptThenDropWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: 10_000 })
+            );
+            const disconnectCallback = jest.fn();
+            testClient.onDisconnect(disconnectCallback);
+
+            try {
+                await connectWithoutStability(testClient);
+                await pumpReconnectLoop();
+
+                expect(disconnectCallback).toHaveBeenCalledWith('max_retries_exceeded');
+                expect(testClient.getConnectionState()).toBe('disconnected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        }, 15_000);
+
+        it('onopen alone does not reset the retry budget', async () => {
+            // Mirrors on_connected_alone_does_not_reset_retry_count (collab-core
+            // connection.rs:473): reaching onopen is not proof the connection is
+            // useful, so the budget must keep accumulating across accept-then-drop
+            // cycles. reconnectAttempts is private, so this asserts the observable
+            // count of sockets built: the initial attempt plus exactly
+            // maxReconnectAttempts (5) retries, then the loop stops for good.
+            const OriginalWebSocket = global.WebSocket;
+            const constructions = installAcceptThenDropWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: 10_000 })
+            );
+            const disconnectCallback = jest.fn();
+            testClient.onDisconnect(disconnectCallback);
+
+            try {
+                await connectWithoutStability(testClient);
+                await pumpReconnectLoop();
+
+                expect(constructions()).toBe(6);
+                expect(disconnectCallback).toHaveBeenCalledTimes(1);
+
+                // ...and it stays stopped instead of resuming at a fixed cadence.
+                await pumpReconnectLoop(10);
+                expect(constructions()).toBe(6);
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        }, 15_000);
+
+        it('a connection that stays up past minStableConnectionMs refills the budget', async () => {
+            // Mirrors on_stable_connection_resets_retry_count (collab-core
+            // connection.rs:487). The discriminating half is the SECOND drop: a
+            // connection torn down before the window elapses must NOT refill the
+            // budget (that is the accept-then-drop bug), while one that outlives
+            // the window must. The scheduled delay encodes the attempt number,
+            // so 1000 -> attempt 1, 2000 -> attempt 2.
+            const OriginalWebSocket = global.WebSocket;
+            const STABLE_MS = 20;
+            installStaysOpenWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: STABLE_MS })
+            );
+            const captured = captureScheduledDelays([0, STABLE_MS]);
+
+            try {
+                // Burn one attempt: connect, then drop before the window elapses.
+                await connectWithoutStability(testClient);
+                (testClient as any).ws?.onclose?.();
+                expect(captured.delays()).toEqual([1000]);
+
+                // Reconnect and drop early again: still no refill, so attempt 2.
+                await pumpReconnectLoop(2);
+                expect(testClient.getConnectionState()).toBe('connected');
+                (testClient as any).ws?.onclose?.();
+                expect(captured.delays()).toEqual([1000, 2000]);
+
+                // Reconnect and let the window elapse: the budget is refilled, so
+                // the next drop is attempt 1 again.
+                await pumpReconnectLoop(2);
+                expect(testClient.getConnectionState()).toBe('connected');
+                jest.advanceTimersByTime(STABLE_MS);
+                (testClient as any).ws?.onclose?.();
+                expect(captured.delays()).toEqual([1000, 2000, 1000]);
+            } finally {
+                captured.restore();
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('repeated stable connections refill the budget each cycle', async () => {
+            // Mirrors multi_cycle_stable_connection_resets_retry_count (collab-core
+            // connection.rs:699): every stable cycle gets the full budget back, not
+            // just the first one. The trailing early drop is the discriminator —
+            // without a stability signal that cycle must NOT be refilled.
+            const OriginalWebSocket = global.WebSocket;
+            const STABLE_MS = 20;
+            installStaysOpenWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: STABLE_MS })
+            );
+            const captured = captureScheduledDelays([0, STABLE_MS]);
+
+            try {
+                await connectWithoutStability(testClient);
+
+                for (let cycle = 0; cycle < 3; cycle++) {
+                    jest.advanceTimersByTime(STABLE_MS);
+                    (testClient as any).ws?.onclose?.();
+                    await pumpReconnectLoop(2);
+                }
+                expect(captured.delays()).toEqual([1000, 1000, 1000]);
+
+                // Fourth cycle drops before the window: attempt 2, not attempt 1.
+                (testClient as any).ws?.onclose?.();
+                expect(captured.delays()).toEqual([1000, 1000, 1000, 2000]);
+            } finally {
+                captured.restore();
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('backoff is capped at maxReconnectDelayMs', async () => {
+            // Mirrors retry_policy_caps_at_max_delay (collab-core
+            // connection.rs:396) and the delay.min(max_delay) at
+            // connection.rs:153. The TS delay was an unbounded 1000 * 2^(n-1).
+            const OriginalWebSocket = global.WebSocket;
+            const MAX_DELAY_MS = 3000;
+            const testClient = new CollabClient(
+                makeDefaultConfig({ maxReconnectDelayMs: MAX_DELAY_MS })
+            );
+
+            try {
+                // The initial connect must OPEN: isInitialConnect gates the retry
+                // loop, so a first socket that never opens never retries at all.
+                await connectClient(testClient);
+                installFailBeforeOpenWebSocket();
+                const captured = captureScheduledDelays([0]);
+
+                try {
+                    (testClient as any).ws?.onclose?.();
+                    await pumpReconnectLoop();
+
+                    // 1000, 2000, then clamped: 4000/8000/16000 all become 3000.
+                    expect(captured.delays()).toEqual([1000, 2000, 3000, 3000, 3000]);
+                    expect(Math.max(...captured.delays())).toBeLessThanOrEqual(MAX_DELAY_MS);
+                } finally {
+                    captured.restore();
+                }
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('disconnect() before the stability window does not later refill the budget', async () => {
+            // A stability timer that outlives disconnect() would fire later and
+            // hand a full retry budget to a client the user explicitly stopped.
+            // The socket mock here does NOT fire onclose from close(), so the
+            // cleanup cannot be credited to the onclose -> handleReconnect hop:
+            // disconnect() itself has to clear the timer. reconnectAttempts is
+            // private and, once maxReconnectAttempts is 0, unobservable through
+            // behavior, so this asserts on the fields directly — the same idiom
+            // the existing max-retries tests use.
+            const OriginalWebSocket = global.WebSocket;
+            installStaysOpenWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: 10_000 })
+            );
+
+            try {
+                await connectWithoutStability(testClient);
+                expect((testClient as any).stabilityTimer).toBeTruthy();
+
+                // Spend part of the budget, then stop before the window elapses.
+                (testClient as any).reconnectAttempts = 3;
+                testClient.disconnect();
+                expect((testClient as any).stabilityTimer).toBeNull();
+
+                // Well past the window: nothing may refill a stopped client.
+                jest.advanceTimersByTime(60_000);
+                expect((testClient as any).reconnectAttempts).toBe(3);
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
         });
 
         it('should keep retrying (not deadlock) when reconnect sockets fail before opening', async () => {
