@@ -9,9 +9,13 @@
 // cache. Cross-crate breakage still surfaces at pre-commit/CI. A cold-cache
 // clippy run can still exceed the timeout below; that case is reported and
 // skipped rather than wedging the agent.
+// Clippy flags mirror the real gate (`cargo clippy-check`, xtask lint):
+// --all-targets --all-features -- -D warnings. Without `-D warnings` clippy
+// exits 0 on the whole warning class this workspace configures, so the hook
+// would pass code that then fails at pre-commit.
 // Exits 2 (with stderr fed back to Claude) on rustfmt parse errors or clippy
-// failures so the agent fixes them immediately; exits 0 otherwise. Silent/no-op
-// for non-Rust files and files outside a known package.
+// failures so the agent fixes them immediately; exits 0 otherwise, including
+// when a toolchain binary is missing — a broken guard must never block edits.
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
@@ -37,7 +41,17 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
   if (!fp || !fp.endsWith('.rs')) process.exit(0);
-  const root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  // Derive the root from the edited file, not CLAUDE_PROJECT_DIR: the latter
+  // stays pinned at the main checkout while a session works in a worktree, so
+  // clippy would run against code that was never edited.
+  let root;
+  try {
+    root = execFileSync('git', ['-C', path.dirname(fp), 'rev-parse', '--show-toplevel'], { stdio: 'pipe' })
+      .toString()
+      .trim();
+  } catch {
+    root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  }
   const rel = path.relative(root, fp).split(path.sep).join('/');
   if (rel.startsWith('..')) process.exit(0);
   const hit = PACKAGES.find(([prefix]) => rel.startsWith(prefix));
@@ -46,20 +60,28 @@ process.stdin.on('end', () => {
   try {
     execFileSync('rustfmt', ['--edition', '2021', fp], { stdio: 'pipe' });
   } catch (e) {
-    // rustfmt only fails on a parse error — the file does not compile yet.
+    if (e.code === 'ENOENT') {
+      process.stderr.write('cargo-check-changed: rustfmt not found on PATH — skipped.\n');
+      process.exit(0);
+    }
+    // rustfmt otherwise only fails on a parse error — the file does not compile yet.
     const out = (e.stdout?.toString() || '') + (e.stderr?.toString() || '');
     process.stderr.write(`rustfmt could not parse ${rel}:\n${out}\n`);
     process.exit(2);
   }
   try {
-    execFileSync('cargo', ['clippy', '-p', pkg, '--all-targets', '--message-format', 'short'], {
-      cwd: root,
-      stdio: 'pipe',
-      timeout: 180000,
-    });
+    const args = ['clippy', '-p', pkg, '--all-targets', '--all-features', '--message-format', 'short'];
+    execFileSync('cargo', [...args, '--', '-D', 'warnings'], { cwd: root, stdio: 'pipe', timeout: 180000 });
     process.exit(0);
   } catch (e) {
-    if (e.signal) {
+    if (e.code === 'ENOENT') {
+      process.stderr.write('cargo-check-changed: cargo not found on PATH — skipped.\n');
+      process.exit(0);
+    }
+    // Only the timeout above is benign. Any other signal death (OOM SIGKILL, a
+    // stray `pkill cargo`) falls through — `e.killed` is undefined even on a
+    // real timeout, so ETIMEDOUT is the only reliable discriminator.
+    if (e.code === 'ETIMEDOUT') {
       process.stderr.write(`cargo-check-changed: clippy timed out for ${pkg} — skipped, not a lint error.\n`);
       process.exit(0);
     }
