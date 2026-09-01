@@ -98,6 +98,25 @@ function createMockWebSocket(options: {
     };
 }
 
+// Sockets that open and STAY open; the test drops them explicitly. close()
+// deliberately does NOT fire onclose, so a teardown path can be proven to
+// clean up on its own rather than via the onclose -> handleReconnect hop.
+// Returns the running count of sockets constructed, which is how the reconnect
+// tests observe the private retry budget through behavior.
+function installStaysOpenWebSocket(): () => number {
+    let constructions = 0;
+    (global as any).WebSocket = createMockWebSocket({
+        onConstruct: (ws) => {
+            constructions++;
+            setTimeout(() => {
+                ws.readyState = 1;
+                ws.onopen?.();
+            }, 0);
+        },
+    });
+    return () => constructions;
+}
+
 // A mock of the MLS document surface the client drives. There is NO
 // set_encryption_key / has_encryption_key / encode_state_encrypted here — the AES
 // CollabCore is gone; MLS derives keys from group membership.
@@ -445,11 +464,34 @@ describe('CollabClient', () => {
     });
 
     describe('disconnect', () => {
-        it('should close WebSocket and prevent reconnection', async () => {
-            await connectClient(client);
+        it('closes the socket and genuinely prevents reconnection', async () => {
+            // Replaces a test whose body asserted NOTHING (it only said it
+            // "verified" that the private maxReconnectAttempts was 0). Asserts
+            // observable behavior instead: the socket is closed, the state is
+            // disconnected, and a drop arriving AFTER disconnect() builds no
+            // replacement socket.
+            const OriginalWebSocket = global.WebSocket;
+            const constructions = installStaysOpenWebSocket();
+            const testClient = new CollabClient(config);
 
-            client.disconnect();
-            // Verify reconnection is disabled by checking maxReconnectAttempts is 0
+            try {
+                await connectClient(testClient);
+                const ws = (testClient as any).ws;
+                expect(constructions()).toBe(1);
+
+                testClient.disconnect();
+                expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+                expect(testClient.getConnectionState()).toBe('disconnected');
+
+                // The stopped client must not start the backoff loop.
+                ws.onclose?.();
+                jest.runAllTimers();
+                await Promise.resolve();
+                expect(constructions()).toBe(1);
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
         });
     });
 
@@ -473,20 +515,6 @@ describe('CollabClient', () => {
                 },
             });
             return () => constructions;
-        }
-
-        // Sockets that open and STAY open; the test drops them explicitly. close()
-        // deliberately does NOT fire onclose, so a teardown path can be proven to
-        // clean up on its own rather than via the onclose -> handleReconnect hop.
-        function installStaysOpenWebSocket(): void {
-            (global as any).WebSocket = createMockWebSocket({
-                onConstruct: (ws) => {
-                    setTimeout(() => {
-                        ws.readyState = 1;
-                        ws.onopen?.();
-                    }, 0);
-                },
-            });
         }
 
         // Sockets that fail before ever opening (onerror then onclose, the normal
@@ -628,6 +656,91 @@ describe('CollabClient', () => {
             }
         }, 15_000);
 
+        it('a client configured with zero reconnect attempts gives up immediately', async () => {
+            // Mirrors retry_policy_zero_max_retries_fails_immediately (collab-core
+            // connection.rs:669), which had no expressible TS equivalent while
+            // disconnect() used the retry budget itself as its stop flag: a
+            // configured 0 was indistinguishable from "the user stopped me".
+            const OriginalWebSocket = global.WebSocket;
+            const constructions = installStaysOpenWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ maxReconnectAttempts: 0, minStableConnectionMs: 10_000 })
+            );
+            const disconnectCallback = jest.fn();
+            testClient.onDisconnect(disconnectCallback);
+
+            try {
+                await connectWithoutStability(testClient);
+                expect(constructions()).toBe(1);
+
+                (testClient as any).ws?.onclose?.();
+                await pumpReconnectLoop(4);
+
+                expect(disconnectCallback).toHaveBeenCalledWith('max_retries_exceeded');
+                expect(testClient.getConnectionState()).toBe('disconnected');
+                // Zero budget means zero retry sockets, not "five by default".
+                expect(constructions()).toBe(1);
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('a configured reconnect budget is honoured', async () => {
+            // Guards against the config field being accepted and then ignored:
+            // 2 means the initial socket plus exactly 2 retries, then give up.
+            const OriginalWebSocket = global.WebSocket;
+            const constructions = installAcceptThenDropWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ maxReconnectAttempts: 2, minStableConnectionMs: 10_000 })
+            );
+            const disconnectCallback = jest.fn();
+            testClient.onDisconnect(disconnectCallback);
+
+            try {
+                await connectWithoutStability(testClient);
+                await pumpReconnectLoop();
+
+                expect(constructions()).toBe(3);
+                expect(disconnectCallback).toHaveBeenCalledWith('max_retries_exceeded');
+                expect(testClient.getConnectionState()).toBe('disconnected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        }, 15_000);
+
+        it('connect() after disconnect() can reconnect again', async () => {
+            // The overload's real cost: disconnect() zeroed the retry BUDGET, so a
+            // client restarted with connect() kept a permanently empty budget and
+            // could never reconnect again — even though disconnect() already resets
+            // groupEstablished specifically to allow a restart. Stopping is
+            // lifecycle state (cleared by connect()); the budget is configuration.
+            const OriginalWebSocket = global.WebSocket;
+            const constructions = installStaysOpenWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: 10_000 })
+            );
+
+            try {
+                await connectWithoutStability(testClient);
+                testClient.disconnect();
+                expect(constructions()).toBe(1);
+
+                // Explicit restart, then a drop: the backoff loop must run again.
+                await connectWithoutStability(testClient);
+                expect(constructions()).toBe(2);
+                (testClient as any).ws?.onclose?.();
+                await pumpReconnectLoop(4);
+
+                expect(constructions()).toBeGreaterThan(2);
+                expect(testClient.getConnectionState()).toBe('connected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
         it('a connection that stays up past minStableConnectionMs refills the budget', async () => {
             // Mirrors on_stable_connection_resets_retry_count (collab-core
             // connection.rs:487). The discriminating half is the SECOND drop: a
@@ -741,9 +854,9 @@ describe('CollabClient', () => {
             // The socket mock here does NOT fire onclose from close(), so the
             // cleanup cannot be credited to the onclose -> handleReconnect hop:
             // disconnect() itself has to clear the timer. reconnectAttempts is
-            // private and, once maxReconnectAttempts is 0, unobservable through
-            // behavior, so this asserts on the fields directly — the same idiom
-            // the existing max-retries tests use.
+            // private and a stopped client emits nothing while the window runs,
+            // so this asserts on the fields directly — the same idiom the
+            // existing max-retries tests use.
             const OriginalWebSocket = global.WebSocket;
             installStaysOpenWebSocket();
             const testClient = new CollabClient(

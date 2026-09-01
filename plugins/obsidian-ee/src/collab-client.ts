@@ -24,6 +24,7 @@ const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 // crates/collab-core/src/connection.rs.
 const DEFAULT_MIN_STABLE_CONNECTION_MS = 10000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30000;
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 5;
 
 /**
  * Narrow view of WasmVaultSync (#32): the client only needs to apply remote
@@ -59,6 +60,13 @@ export interface CollabClientConfig {
      * to `DEFAULT_MAX_RECONNECT_DELAY_MS`.
      */
     maxReconnectDelayMs?: number;
+    /**
+     * How many reconnect attempts to spend before giving up with
+     * `max_retries_exceeded`. Mirrors `RetryPolicy::max_retries`
+     * (crates/collab-core/src/connection.rs). Defaults to
+     * `DEFAULT_MAX_RECONNECT_ATTEMPTS`; 0 gives up on the first drop.
+     */
+    maxReconnectAttempts?: number;
 }
 
 export type UpdateCallback = (text: string) => void;
@@ -218,7 +226,11 @@ export class CollabClient {
     private onDisconnectCallback: DisconnectCallback | null = null;
     private onErrorCallback: ErrorCallback | null = null;
     private reconnectAttempts = 0;
-    private maxReconnectAttempts = 5;
+    // Lifecycle state, NOT the retry budget: true once disconnect() has stopped
+    // this client, cleared by connect(). The budget lives in config
+    // (maxReconnectAttempts) and is never mutated — overloading it as the stop
+    // flag made a configured budget of 0 indistinguishable from "user stopped".
+    private stopped = false;
     private reconnectDelay = 1000;
     private messageQueue: object[] = [];
     private readonly maxQueueSize = 1000;
@@ -361,6 +373,11 @@ export class CollabClient {
             return this.connectPromise;
         }
 
+        // An explicit connect() restarts a stopped client, matching the
+        // groupEstablished reset disconnect() already does for exactly that case.
+        // Only reached on a real connect() call: the reconnect timer checks
+        // `stopped` before it gets here, so this cannot revive a stopped client.
+        this.stopped = false;
         this.connectionState = 'connecting';
         this.connectPromise = new Promise<void>((resolve, reject) => {
             // Per-attempt flag: has THIS socket reached onopen yet? Every attempt
@@ -815,9 +832,8 @@ export class CollabClient {
         this.clearStabilityTimer();
         this.stabilityTimer = setTimeout(() => {
             this.stabilityTimer = null;
-            // disconnect() uses maxReconnectAttempts = 0 as its stop flag; never
-            // hand a budget back to a client the user explicitly stopped.
-            if (this.maxReconnectAttempts === 0) {
+            // Never hand a budget back to a client the user explicitly stopped.
+            if (this.stopped) {
                 return;
             }
             this.reconnectAttempts = 0;
@@ -832,6 +848,13 @@ export class CollabClient {
     }
 
     private handleReconnect(): void {
+        // A stopped client runs none of this: disconnect() closes the socket
+        // itself, so the resulting onclose must not schedule a retry, flip the
+        // state to 'reconnecting', or report 'max_retries_exceeded' to a user who
+        // asked to stop. disconnect() has already cleared both timers.
+        if (this.stopped) {
+            return;
+        }
         // Clear any existing timer to prevent old timers from interfering
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -842,7 +865,10 @@ export class CollabClient {
         // from surviving the socket it belonged to.
         this.clearStabilityTimer();
 
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+        // Pure configuration, read fresh and never written: the client's stopped
+        // state is tracked separately by `this.stopped`.
+        const maxAttempts = this.config.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
+        if (this.reconnectAttempts < maxAttempts) {
             this.connectionState = 'reconnecting';
             this.reconnectAttempts++;
             // Cap the backoff, mirroring `delay.min(self.max_delay)` in
@@ -854,7 +880,7 @@ export class CollabClient {
             console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
             this.reconnectTimer = setTimeout(() => {
                 // Check if disconnect() was called while waiting
-                if (this.maxReconnectAttempts === 0) {
+                if (this.stopped) {
                     return;
                 }
                 this.connect().catch((error) => {
@@ -979,7 +1005,7 @@ export class CollabClient {
     }
 
     disconnect(): void {
-        this.maxReconnectAttempts = 0; // Prevent reconnection
+        this.stopped = true; // Prevent reconnection until connect() is called again
         this.connectPromise = null; // Clear any pending connection promise
         this.connectionState = 'disconnected';
         if (this.reconnectTimer) {
