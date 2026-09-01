@@ -59,6 +59,22 @@ process.stdin.on('end', () => {
     } catch {
       /* no origin/main — this probe simply does not apply */
     }
+    // So is a commit parked on some OTHER local branch not yet in origin/main —
+    // observed live: a task's work landed on feat/wasm-write-guard, but the
+    // session had since moved to a fresh branch level with origin/main, so both
+    // probes above came up empty despite real work existing. Scan refs/heads
+    // only, NOT `git log --all` (that also walks refs/stash, so a stray `git
+    // stash` would count as evidence forever). This probe is imprecise — it
+    // can't tell whether a branch's commits relate to THIS task, and it drifts
+    // stale-positive as unmerged branches pile up — but a BLOCKING gate should
+    // err toward allow; the goal is catching "did nothing", not a precise audit.
+    try {
+      for (const b of git(['for-each-ref', '--format=%(refname:short)', 'refs/heads']).split('\n')) {
+        if (b && git(['log', '--oneline', `origin/main..${b}`])) process.exit(0);
+      }
+    } catch {
+      /* branch scan failed — skip rather than block on it */
+    }
 
     process.stderr.write(
       `Task "${subject}" claims to change files, but it closed with no commits, no modified files and no untracked files.\n` +
