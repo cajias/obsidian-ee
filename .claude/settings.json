@@ -14,11 +14,21 @@
           },
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/cargo-check-changed.mjs"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rustfmt-changed.mjs"
           },
           {
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rust-pub-guard.mjs"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/cargo-clippy-turn.mjs"
           }
         ]
       }
