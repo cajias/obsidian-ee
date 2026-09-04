@@ -1407,6 +1407,76 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
         client.destroy();
     });
 
+    /** Every register_doc_key frame `sent` carries for `docId`. */
+    function anchorsFor(sent: string[], docId: string): unknown[] {
+        return sent
+            .map((m) => JSON.parse(m))
+            .filter((p) => p.type === 'register_doc_key' && p.doc_id === docId);
+    }
+
+    it('frees ONLY the slot that threw, keeping the already-anchored file group', async () => {
+        // The INTRA-attempt case: an owner with vaultSync on its FIRST connect
+        // bootstraps both slots in one pass. The file slot completes — its TOFU
+        // register_doc_key is already on the wire — and only THEN does the
+        // manifest group's create() throw. Freeing the file doc as well makes
+        // the retry build a fresh epoch-0 group and re-send a TOFU registration
+        // the relay refuses twice over (rotation continuity, then stale epoch),
+        // after which the client resolves normally and is silently deaf.
+        //
+        // One shared sink across both sockets: the frames under test span the
+        // failed attempt and its retry, and each attempt gets a new socket.
+        const OriginalWebSocket = global.WebSocket;
+        const sent: string[] = [];
+        (global as any).WebSocket = createMockWebSocket({
+            initialReadyState: 1,
+            onConstruct: (ws) => {
+                setTimeout(() => ws.onopen?.(), 0);
+            },
+            send: (ws, data) => {
+                ws.sentMessages.push(data);
+                sent.push(data);
+            },
+            // failConnect()'s close() must reach handleReconnect, or there is no
+            // retry to observe.
+            closeFiresOnclose: true,
+        });
+        try {
+            const client = new CollabClient(
+                makeDefaultConfig({
+                    vaultSync: { apply_remote_manifest: (): string[] => [] },
+                    manifestDocId: 'manifest1',
+                })
+            );
+            const createMock = WasmEncryptedDocument.create as unknown as jest.Mock;
+            createMock
+                .mockImplementationOnce(() => makeMockDoc())
+                .mockImplementationOnce(() => {
+                    throw new Error('manifest group creation failed');
+                });
+
+            const attempt = client.connect();
+            jest.runOnlyPendingTimers(); // onopen -> establishGroup throws
+            await expect(attempt).rejects.toThrow('manifest group creation failed');
+            const fileDoc = (client as any).doc;
+
+            jest.runOnlyPendingTimers(); // backoff timer -> connect()
+            jest.runOnlyPendingTimers(); // the retry socket's onopen
+
+            // The relay accepts exactly ONE TOFU registration per document.
+            expect(anchorsFor(sent, 'doc1')).toHaveLength(1);
+            expect(anchorsFor(sent, 'manifest1')).toHaveLength(1);
+            // ...because the file group survived the failed attempt untouched.
+            expect(fileDoc).not.toBeNull();
+            expect((client as any).doc).toBe(fileDoc);
+            expect(fileDoc.free).not.toHaveBeenCalled();
+            expect((client as any).manifestDoc).not.toBeNull();
+
+            client.destroy();
+        } finally {
+            global.WebSocket = OriginalWebSocket;
+        }
+    });
+
     it('refuses to connect() after destroy()', async () => {
         // destroy() ends the session and frees the groups, leaving slot state
         // indistinguishable from a never-connected client. Without a latch the

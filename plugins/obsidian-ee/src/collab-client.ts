@@ -360,29 +360,44 @@ export class CollabClient {
         // is a joiner still mid-handshake, whose one-time key package is already
         // on the wire. Only a slot with neither needs bootstrapping.
         const toBootstrap = slots.filter((slot) => !slot.getDoc() && !slot.getPending());
-        try {
-            toBootstrap.forEach((slot) => this.bootstrapGroup(slot));
-        } catch (error) {
-            // bootstrapGroup throws AFTER slot.setDoc(), so a half-done attempt
-            // would otherwise leave the doc set with register_doc_key never sent.
-            // Every later connect would then skip that slot's bootstrap and
-            // present capabilities for a document the relay has no anchor for —
-            // it rejects the subscribe, and the client goes silently deaf while
-            // resolving normally. Undo the whole attempt instead, so a retry
-            // re-runs it from scratch.
-            //
-            // Safe to discard the docs because every step that can throw in there
-            // runs BEFORE its frame is sent: the retry's fresh TOFU registration
-            // is still the relay's first for the document.
-            //
-            // Exactly the slots THIS call tried to bootstrap: a group that
-            // survived a disconnect is not part of this attempt, and freeing it
-            // here would leave the client deaf on a document it is still a
-            // member of. Same reason this teardown is not in failConnect, which
-            // is shared with the identify/subscribe branch that also fires on a
-            // RECONNECT whose long-lived group must survive.
-            toBootstrap.forEach((slot) => this.freeSlot(slot));
-            throw error;
+        for (const slot of toBootstrap) {
+            try {
+                this.bootstrapGroup(slot);
+            } catch (error) {
+                // bootstrapGroup can throw AFTER slot.setDoc() (the anchor's
+                // signing/verifying-key calls do), so a half-done slot would
+                // otherwise be left with a doc set and register_doc_key never
+                // sent. Every later connect would then skip that slot's
+                // bootstrap and present capabilities for a document the relay
+                // has no anchor for — it rejects the subscribe, and the client
+                // goes silently deaf while resolving normally. Undo the slot so
+                // a retry re-runs it from scratch.
+                //
+                // Exactly the ONE slot that threw, never the whole loop. The
+                // "nothing was sent yet" claim holds only PER SLOT: everything
+                // that can throw for THIS slot runs before its own frame goes
+                // out, so its retry's TOFU registration is still the relay's
+                // first for that document. It does NOT hold across slots — a
+                // slot that already completed has its register_doc_key on the
+                // wire, and freeing it would make the retry re-create it at
+                // epoch 0 and re-register, which the relay refuses twice over
+                // (rotation continuity, then stale epoch). Same reason a group
+                // that survived a disconnect is not in `toBootstrap` at all,
+                // and the same reason this teardown is not in failConnect,
+                // which is shared with the identify/subscribe branch that also
+                // fires on a RECONNECT whose long-lived group must survive.
+                //
+                // The joiner variant of the same over-broad teardown was a leak
+                // rather than a lockout — a completed slot's pending was freed
+                // with its key package already sent, so the owner could add a
+                // leaf for a member that then re-bootstraps with a fresh one (a
+                // phantom leaf: an epoch, no anchor damage). Per-slot undo
+                // closes that too, and the slot it DOES free has nothing on the
+                // wire: a joiner throws in generate_key_package, before both
+                // setPending and the send.
+                this.freeSlot(slot);
+                throw error;
+            }
         }
         // Anchors are registered, so the capability-less subscribes sent moments
         // ago in subscribe() can be upgraded to content-authorized (#72). This
