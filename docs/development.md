@@ -10,13 +10,23 @@
 Gate tooling, so `cargo xtask gates` runs the full set rather than skipping rows:
 
 ```bash
-brew install cargo-deny shellcheck actionlint   # or any prebuilt equivalent
+cargo +stable install cargo-deny --locked --version 0.20.2
+brew install shellcheck actionlint   # or any prebuilt equivalent
 ```
 
-`cargo-deny` must be installed **prebuilt**, not with `cargo install`: the
-version CI pins (0.20.2) requires rustc 1.88, while `rust-toolchain.toml` pins
-the 1.87 MSRV, so a source build cannot resolve under this workspace's
-toolchain. CI has the same constraint and installs a prebuilt binary too.
+**The `+stable` is required, not decorative.** `rust-toolchain.toml` pins the
+1.87 MSRV, and that pin applies to every cargo command run inside this
+directory — including installs of tools that are not workspace artifacts. Plain
+`cargo install cargo-deny` therefore fails with "requires rustc 1.88.0 or
+newer". rustup resolves `+toolchain` ahead of the directory pin, so `+stable`
+builds the tool with your default toolchain while leaving the workspace pin
+untouched. Do **not** reach for `RUSTUP_TOOLCHAIN` to achieve this — it
+outranks the pin for *every* subsequent command, which is the over-reach
+removed in `fd5beed` (it silently compiled the committed WASM bindings with
+whatever compiler the contributor happened to have).
+
+`brew install cargo-deny` also works and is faster (prebuilt bottle, same
+0.20.2), but is macOS-only; the cargo command above is the portable one.
 
 ## Quick Start
 
