@@ -534,6 +534,7 @@ async fn test_two_users_collaborate() {
         welcome: welcome_payload,
         commit: commit_payload,
         epoch: wire_epoch,
+        rotation: None,
     };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
 
@@ -672,6 +673,7 @@ async fn test_offline_message_delivery() {
         welcome: welcome_payload,
         commit: commit_payload,
         epoch: invite.epoch,
+        rotation: None,
     };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
 

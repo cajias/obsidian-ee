@@ -282,7 +282,7 @@ mod tests {
         let (mut alice, _) = MlsDocumentGroup::create("alice").unwrap();
         let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
         let bob_kp = bob_pending.key_package().to_vec();
-        let (_commit, welcome) = alice.add_member(&bob_kp).unwrap();
+        let (_commit, welcome, _) = alice.add_member(&bob_kp, "persist/doc.md").unwrap();
         let bob = bob_pending.join(&welcome).unwrap();
         assert_eq!(alice.epoch(), 1);
         assert_eq!(bob.epoch(), 1);
@@ -337,7 +337,7 @@ mod tests {
     fn test_epoch_preserved_across_advance() {
         let (mut alice, _bob) = two_member_group(); // epoch 1
         let carol = MlsDocumentGroup::generate_key_package("carol").unwrap();
-        let (_c, _w) = alice.add_member(carol.key_package()).unwrap();
+        let (_c, _w, _) = alice.add_member(carol.key_package(), "persist/doc.md").unwrap();
         assert_eq!(alice.epoch(), 2);
 
         let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
@@ -445,7 +445,7 @@ mod tests {
         const NEEDLE: &[u8] = b"NEEDLE-USERID-abc123";
         let (mut alice, _) = MlsDocumentGroup::create("NEEDLE-USERID-abc123").unwrap();
         let bob = MlsDocumentGroup::generate_key_package("bob").unwrap();
-        alice.add_member(bob.key_package()).unwrap();
+        alice.add_member(bob.key_package(), "persist/doc.md").unwrap();
 
         let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
         assert!(
