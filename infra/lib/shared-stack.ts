@@ -37,11 +37,16 @@ export class SharedStack extends cdk.Stack {
       // back with `deploy.yml -f environment=prod --ref v0.1.0`, which promotes
       // the digest that tag points at. A single `maxImageCount` rule counts them
       // together with every dev/staging `sha-` image, so ~25 dispatches expired
-      // the release the runbook tells you to roll back to. A promoted image
-      // carries both its `sha-` and `v` tags; ECR applies the FIRST matching
-      // rule, so giving `v` its own longer budget keeps releases off the churn
-      // rule. deploy.yml refuses to rebuild a missing prod image, so an expiry
-      // past this budget fails loudly rather than shipping an unvalidated digest.
+      // the release the runbook tells you to roll back to. Disjoint prefixes are
+      // impossible here — a promoted image carries BOTH its `sha-` and `v` tags —
+      // so priority ordering is the mechanism: per the ECR lifecycle docs a rule
+      // "can never mark images that are marked by higher priority rules, but can
+      // still identify them". So rule 2 still COUNTS releases toward its 25, it
+      // just cannot expire them; effective dev-churn retention is 25 minus
+      // whatever releases sit in the youngest 25. That is fine here (dev churn is
+      // disposable) but it is why the release budget is the load-bearing number.
+      // A prod dispatch refuses to rebuild a missing image, so an expiry past
+      // this budget fails loudly rather than shipping an unvalidated digest.
       lifecycleRules: [
         {
           rulePriority: 1,

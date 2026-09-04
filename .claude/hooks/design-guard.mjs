@@ -26,7 +26,21 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
   if (!fp) process.exit(0);
-  const root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  // Derive the root from the edited file, not CLAUDE_PROJECT_DIR: the latter
+  // stays pinned at the main checkout while a session works in a worktree, so
+  // every path would relativize to a ../../.. chain, GUARDED would never match,
+  // and this hook would silently no-op on exactly the edits it exists to catch.
+  // Same derivation as rustfmt-changed.mjs and rust-pub-guard.mjs.
+  let root;
+  try {
+    root = execFileSync('git', ['-C', path.dirname(fp), 'rev-parse', '--show-toplevel'], {
+      stdio: 'pipe',
+    })
+      .toString()
+      .trim();
+  } catch {
+    root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  }
   const rel = path.relative(root, fp).split(path.sep).join('/');
   if (!GUARDED.test(rel)) process.exit(0);
   try {

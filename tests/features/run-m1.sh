@@ -25,5 +25,15 @@ fi
 docker stop -t 10 relay-m1-check >/dev/null
 exit_code=$(docker inspect --format '{{.State.ExitCode}}' relay-m1-check)
 docker rm relay-m1-check >/dev/null
-[ "$exit_code" != "137" ] || { echo "FAIL: container was SIGKILLed at the stop timeout (exit 137)"; exit 1; }
-echo "OK: container stopped via SIGINT (exit $exit_code), not killed"
+# collab-relay returns Ok(()) after tokio::signal::ctrl_c (main.rs), so a clean
+# SIGINT stop is deterministically 0. Asserting `!= 137` accepted every other
+# nonzero too, so a relay that panicked WHILE shutting down (exit 101) still read
+# as "stopped via SIGINT". The Running check above and this one close different
+# holes: that one catches a container that never ran, this one a container that
+# ran but did not exit cleanly on the signal — a container exiting 0 immediately
+# would satisfy this check alone.
+[ "$exit_code" = "0" ] || {
+  echo "FAIL: expected a clean exit 0 on SIGINT, got $exit_code$([ "$exit_code" = 137 ] && echo ' — SIGKILLed at the stop timeout')" >&2
+  exit 1
+}
+echo "OK: container stopped cleanly via SIGINT (exit 0), not killed"

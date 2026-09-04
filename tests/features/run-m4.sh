@@ -242,7 +242,16 @@ for _ in $(seq 1 24); do
       --query StandardOutputContent --output text)
     break
   fi
-  [ "$status" = Failed ] && { echo "FAIL: could not read the running image from the prod instance (SSM command $cmd_id failed)"; exit 1; }
+  # Cancelled/TimedOut/Cancelling are terminal too. Treating only Failed as
+  # terminal burned all 24 polls and then reported "never returned", which names
+  # the symptom instead of the status that actually ended the command. Same
+  # classification deploy.yml's poll uses.
+  case "$status" in
+    Failed | Cancelled | Cancelling | TimedOut)
+      echo "FAIL: could not read the running image from the prod instance (SSM command $cmd_id terminated as $status)"
+      exit 1
+      ;;
+  esac
   sleep 5
 done
 [ -n "$running" ] || { echo "FAIL: SSM command $cmd_id never returned the prod instance's running image digest"; exit 1; }

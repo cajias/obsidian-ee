@@ -136,23 +136,34 @@ jobs:
             exit 1
           fi
 
-      # A prod deploy PROMOTES an image staging already validated; it must never
-      # manufacture one. If the sha image is absent here the cause is retention
-      # (RelayShared's ECR lifecycle rules), not "not built yet" — and rebuilding
-      # would push a NEVER-VALIDATED digest to prod under the release tag,
-      # defeating from the registry end the same byte-identity invariant the
-      # imagetools retag and deploy-buildx-guard.sh protect from the build end.
-      # Fail loudly instead: the operator re-cuts the release or picks a ref whose
-      # image still exists.
-      - name: Refuse to rebuild for a prod deploy
-        if: needs.meta.outputs.environment == 'prod' && steps.exists.outputs.found == 'false'
+      # A PROD DISPATCH re-deploys a ref whose image already exists: that is the
+      # M4 rollback procedure, `-f environment=prod --ref v0.1.0`. If the sha
+      # image is absent there, the cause is retention (RelayShared's ECR
+      # lifecycle rules), not "not built yet" — and rebuilding would push a
+      # NEVER-VALIDATED digest to prod under that tag, defeating from the
+      # registry end the byte-identity invariant the imagetools retag and
+      # deploy-buildx-guard.sh protect from the build end. Fail loudly instead.
+      #
+      # Scoped to workflow_dispatch deliberately. A `release` run legitimately
+      # finds no image: nothing builds one for the release commit, because
+      # deploy.yml has no push trigger and release.yml only cuts the tag, so
+      # github.sha under `release: published` is a merge commit this workflow has
+      # never seen. That the release path therefore BUILDS rather than promotes
+      # is a real gap in D6/SC3 — recorded as a Plan change in 03 — but it is
+      # pre-existing and wider than this guard; failing it here would break every
+      # release cut instead of closing the hole.
+      - name: Refuse to rebuild for a prod dispatch
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          needs.meta.outputs.environment == 'prod' &&
+          steps.exists.outputs.found == 'false'
         env:
           SHA_TAG: ${{ needs.meta.outputs.sha_tag }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
         run: |
           echo "refusing to deploy: image '$ECR_REPOSITORY:$SHA_TAG' is not in ECR." >&2
-          echo "prod promotes an existing validated image and never rebuilds one." >&2
-          echo "The image was most likely expired by the repository lifecycle policy." >&2
+          echo "a prod dispatch promotes an existing validated image, never a rebuilt one." >&2
+          echo "If this ref was deployed before, its image was expired by the lifecycle policy." >&2
           exit 1
 
       # Registry tags are immutable, so an existing sha tag can never be re-pushed.
