@@ -130,6 +130,7 @@ jest.unstable_mockModule('../wasm/collab_wasm', () => ({
     })),
 }));
 
+const { WasmEncryptedDocument } = await import('../wasm/collab_wasm');
 const { CollabClient } = await import('../collab-client');
 type CollabClient = InstanceType<typeof CollabClient>;
 
@@ -215,6 +216,92 @@ describe('subscribe capability (#72)', () => {
             // First registration is TOFU: no continuity proof exists yet.
             rotation_proof: [],
         });
+    });
+
+    it('re-bootstraps a usable group after the first anchor registration throws', async () => {
+        // registerAnchor() runs AFTER slot.setDoc(), and sign_doc_key_proof is a
+        // wasm-bindgen Result<T, JsError> call away from throwing. A partial
+        // bootstrap must leave NOTHING behind: a doc that survives with
+        // groupEstablished still set makes every later connect skip bootstrap, so
+        // register_doc_key is NEVER sent while the client keeps presenting
+        // capabilities for it. The relay answers "no subscribe anchor registered"
+        // and the subscription dies, but the client resolves, arms its stability
+        // timer and refills its retry budget — silently deaf forever.
+        (WasmEncryptedDocument.create as unknown as jest.Mock).mockImplementationOnce(
+            (...args: unknown[]) => {
+                const doc = makeMockDoc(String(args[0]));
+                doc.sign_doc_key_proof.mockImplementationOnce(() => {
+                    throw new Error('anchor proof failed');
+                });
+                createdDocs.push(doc);
+                return doc;
+            }
+        );
+
+        client = new CollabClient(makeConfig());
+        const failed = client.connect();
+        jest.runAllTimers();
+        await expect(failed).rejects.toThrow('anchor proof failed');
+
+        await connectClient(client);
+
+        // The retry must produce a WORKING group, not merely a resolved promise:
+        // a fresh doc whose anchor actually reached the relay, with the presented
+        // capability minted by that same fresh doc.
+        expect(createdDocs).toHaveLength(2);
+        expect(createdDocs[0].free).toHaveBeenCalled();
+        expect(createdDocs[0].mint_subscribe_capability).not.toHaveBeenCalled();
+
+        const retryFrames = frames(sockets[1]);
+        expect(retryFrames.filter((f) => f.type === 'register_doc_key')).toHaveLength(1);
+        const presented = subscribes(sockets[1], 'doc1').filter((f) => f.capability);
+        expect(presented).toHaveLength(1);
+        expect(createdDocs[1].mint_subscribe_capability).toHaveBeenCalled();
+        // The anchor must be registered BEFORE the capability that verifies
+        // against it is presented.
+        const anchorIdx = retryFrames.findIndex((f) => f.type === 'register_doc_key');
+        const capabilityIdx = retryFrames.findIndex(
+            (f) => f.type === 'subscribe' && f.capability !== undefined
+        );
+        expect(capabilityIdx).toBeGreaterThan(anchorIdx);
+    });
+
+    it('keeps the anchored group when minting throws after register_doc_key went out', async () => {
+        // The mirror image of the test above. Once register_doc_key is on the
+        // wire the relay holds an anchor for this document, and it rejects a
+        // second TOFU registration ("anchor rotation continuity proof
+        // verification failed", relay.rs). So a throw from the LAST bootstrap
+        // step — minting — must fail the connect WITHOUT discarding the group: a
+        // retry with a fresh doc could never re-register, and every capability it
+        // minted would verify against the wrong key.
+        (WasmEncryptedDocument.create as unknown as jest.Mock).mockImplementationOnce(
+            (...args: unknown[]) => {
+                const doc = makeMockDoc(String(args[0]));
+                doc.mint_subscribe_capability.mockImplementationOnce(() => {
+                    throw new Error('mint exploded');
+                });
+                createdDocs.push(doc);
+                return doc;
+            }
+        );
+
+        client = new CollabClient(makeConfig());
+        const failed = client.connect();
+        jest.runAllTimers();
+        await expect(failed).rejects.toThrow('mint exploded');
+
+        // The anchor DID reach the relay, so the group must survive intact.
+        expect(frames(sockets[0]).filter((f) => f.type === 'register_doc_key')).toHaveLength(1);
+        expect(createdDocs[0].free).not.toHaveBeenCalled();
+
+        await connectClient(client);
+
+        // The retry reuses that same group: no second doc, no second TOFU
+        // registration, and the capability comes from the anchored doc.
+        expect(createdDocs).toHaveLength(1);
+        expect(frames(sockets[1]).filter((f) => f.type === 'register_doc_key')).toHaveLength(0);
+        const presented = subscribes(sockets[1], 'doc1').filter((f) => f.capability);
+        expect(presented).toHaveLength(1);
     });
 
     it('subscribes capability-less first, then re-presents after joining', async () => {
@@ -340,11 +427,14 @@ describe('subscribe capability (#72)', () => {
 
         const emitted = frames(sockets[0]).slice(before);
         // create_invite advanced the epoch, so the relay's anchor must move with
-        // it BEFORE the joiner presents an epoch-4 capability.
+        // it BEFORE the joiner presents an epoch-4 capability — and this client
+        // must re-present its OWN capability at the new epoch before the Welcome
+        // lets the joiner start sending, or it is unauthorized in the window
+        // between the rotation and its own re-subscribe.
         expect(emitted.map((f) => f.type)).toEqual([
             'register_doc_key',
-            'mls_handshake',
             'subscribe',
+            'mls_handshake',
         ]);
         expect(emitted[0]).toMatchObject({
             doc_id: 'doc1',
@@ -353,7 +443,7 @@ describe('subscribe capability (#72)', () => {
             proof: [12],
             rotation_proof: [13],
         });
-        expect((emitted[2] as unknown as SubscribeFrame).capability).toBeDefined();
+        expect((emitted[1] as unknown as SubscribeFrame).capability).toBeDefined();
     });
 
     it('CHARACTERIZATION: manifest-discovered paths stay capability-less (no group yet)', async () => {

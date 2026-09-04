@@ -412,7 +412,11 @@ describe('CollabClient', () => {
             // establishGroup(), that throw would abort onopen before resolve()/reject()
             // ran, leaving connectPromise permanently unsettled — the exact hang class
             // already fixed once for the sibling identify/subscribe branch.
-            (WasmEncryptedDocument.create as unknown as jest.Mock).mockImplementationOnce(() => {
+            const createMock = WasmEncryptedDocument.create as unknown as jest.Mock;
+            // The mock is module-level and not reset between tests, so count
+            // relative to whatever this suite has already accumulated.
+            const createsBefore = createMock.mock.calls.length;
+            createMock.mockImplementationOnce(() => {
                 throw new Error('crypto provider unavailable');
             });
 
@@ -428,6 +432,17 @@ describe('CollabClient', () => {
             expect(retryPromise).not.toBe(connectPromise);
             jest.runAllTimers();
             await expect(retryPromise).resolves.toBeUndefined();
+
+            // A resolved retry is NOT the bar: the failed attempt must not have
+            // consumed the once-only bootstrap. If it did, the client comes back
+            // with no group at all — no anchor registered, nothing encryptable —
+            // while reporting itself connected.
+            expect(createMock.mock.calls.length - createsBefore).toBe(2);
+            expect((client as any).doc).not.toBeNull();
+            const retryFrames = (client as any).ws.sentMessages.map((m: string) => JSON.parse(m));
+            expect(
+                retryFrames.filter((f: { type: string }) => f.type === 'register_doc_key')
+            ).toHaveLength(1);
         });
     });
 

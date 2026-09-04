@@ -308,12 +308,11 @@ export class CollabClient {
     private bootstrapGroup(slot: GroupSlot): void {
         if (this.config.role === 'owner') {
             slot.setDoc(WasmEncryptedDocument.create(slot.docId, this.config.userId));
-            // The group exists now, so (a) the relay's verification anchor can be
-            // registered — nothing a member mints verifies without it — and (b)
-            // the capability-less subscription sent moments ago in onopen can be
-            // upgraded from handshake-only to content-authorized (#72).
+            // The group exists now, so the relay's verification anchor can be
+            // registered — nothing a member mints verifies without it (#72).
+            // Presenting the capability is establishGroup's job, deliberately
+            // after this: see the comment there.
             this.registerAnchor(slot);
-            this.subscribeTo(slot);
             return;
         }
         const pending = generate_key_package(this.config.userId);
@@ -344,15 +343,46 @@ export class CollabClient {
         if (this.groupEstablished) {
             return;
         }
-        this.groupEstablished = true;
-        this.bootstrapGroup(this.fileSlot());
         // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
         // established by the same handshake. Same role: whoever owns the file doc
-        // owns the manifest group. Throws here fail the connect() attempt via
-        // tryEstablishGroup, exactly like the file group.
-        if (this.config.vaultSync && this.config.manifestDocId) {
-            this.bootstrapGroup(this.manifestSlot());
+        // owns the manifest group. Throws below fail the connect() attempt via
+        // tryInitialize, exactly like the file group.
+        const slots =
+            this.config.vaultSync && this.config.manifestDocId
+                ? [this.fileSlot(), this.manifestSlot()]
+                : [this.fileSlot()];
+        try {
+            slots.forEach((slot) => this.bootstrapGroup(slot));
+        } catch (error) {
+            // bootstrapGroup throws AFTER slot.setDoc(), so a half-done attempt
+            // would otherwise leave the doc set with the flag latched and
+            // register_doc_key never sent. Every later connect would then skip
+            // bootstrap and present capabilities for a document the relay has no
+            // anchor for — it rejects the subscribe, and the client goes silently
+            // deaf while resolving normally. Undo the whole attempt instead, so a
+            // retry re-runs it from scratch.
+            //
+            // Safe to discard the docs because every step that can throw in there
+            // runs BEFORE its frame is sent: the retry's fresh TOFU registration
+            // is still the relay's first for the document.
+            //
+            // This teardown belongs here rather than in failConnect: failConnect is
+            // shared with the identify/subscribe branch, which also fires on a
+            // RECONNECT whose long-lived group must survive.
+            this.freeSlot(this.fileSlot());
+            this.freeSlot(this.manifestSlot());
+            throw error;
         }
+        this.groupEstablished = true;
+        // Anchors are registered, so the capability-less subscribes sent moments
+        // ago in subscribe() can be upgraded to content-authorized (#72). This
+        // runs OUTSIDE the teardown above on purpose: minting is the one step
+        // that happens after register_doc_key is already on the wire, and
+        // discarding the doc then would strand a relay-side anchor a fresh TOFU
+        // registration cannot replace (the relay demands a rotation continuity
+        // proof once an anchor exists). A throw here still fails the connect; the
+        // group survives and the next attempt's subscribe() re-presents.
+        slots.filter((slot) => slot.getDoc()).forEach((slot) => this.subscribeTo(slot));
     }
 
     /** True when this frame's doc_id is the configured manifest group. */
@@ -755,15 +785,20 @@ export class CollabClient {
                 if (invite.rotation) {
                     this.registerDocKey(slot.docId, invite.rotation);
                 }
+                // This client's own capability was minted at the previous epoch
+                // and no longer verifies; re-present at the new one. Before the
+                // Welcome, not after: the rotation just revoked THIS client's own
+                // content authorization (the relay gates fan-out on strict epoch
+                // equality), and the Welcome is what makes the joiner start
+                // sending. Matches the Rust half's register -> present -> welcome
+                // order in collab-cli's commands.rs.
+                this.subscribeTo(slot);
                 this.send({
                     type: 'mls_handshake',
                     doc_id: slot.docId,
                     payload: [...invite.welcome],
                     message_type: 'welcome',
                 });
-                // This client's own capability was minted at the previous epoch
-                // and no longer verifies; re-present at the new one.
-                this.subscribeTo(slot);
                 break;
             }
             case 'welcome': {
