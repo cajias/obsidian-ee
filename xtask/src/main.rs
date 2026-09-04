@@ -60,7 +60,7 @@ COMMANDS:
 
 fn docker_up() -> ExitCode {
     println!("Starting Docker Compose environment...");
-    run_cmd("docker", &["compose", "-f", "docker/docker-compose.yml", "up", "-d"])
+    run_cmd("docker", &["compose", "-f", "docker/docker-compose.yml", "up", "-d", "--build"])
 }
 
 fn docker_down() -> ExitCode {
