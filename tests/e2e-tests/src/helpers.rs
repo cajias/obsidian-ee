@@ -177,9 +177,13 @@ impl TestClient {
     ///
     /// Returns an error if subscription fails.
     pub async fn subscribe(&mut self, doc_id: &DocumentId) -> anyhow::Result<()> {
-        // capability: None — these helpers exercise the default (un-gated) relay
-        // where subscribe authorization (issue #29) is off; the MLS-handshake
-        // bootstrap needs an un-gated subscribe to deliver the Welcome.
+        // capability: None — these helpers exercise an UN-GATED relay. Two
+        // different defaults get you there: `TestServer::start()` builds a
+        // `RelayServer::new()`, whose flag is off, and the Docker wire tests
+        // point at docker/docker-compose.yml, which sets RELAY_SUBSCRIBE_AUTHZ=0
+        // because the relay BINARY defaults it on since #72. Against a gated
+        // relay these subscriptions are handshake-only and receive no content —
+        // see tests/e2e-tests/tests/subscribe_authz.rs for the gated flows.
         self.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await?;
         let response = self.recv().await?;
         if !matches!(response, ServerMessage::Subscribed { .. }) {

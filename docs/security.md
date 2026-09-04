@@ -42,7 +42,7 @@ The AES-128-GCM AEAD in the ciphersuite is internal to MLS; there is no standalo
 | **Metadata analysis** | Document IDs, user IDs, message sizes, and timing are visible to the relay |
 | **Compromised client device** | If a client is compromised, its current session keys are exposed |
 | **Denial of service** | No rate limiting on the relay server currently |
-| **Document access control** | MLS group membership gates *decryption* always. *Subscription* (metadata) access is optionally gated by per-document subscribe authorization (issue #29, opt-in via `RELAY_SUBSCRIBE_AUTHZ`); see [Per-Document Subscribe Authorization](#per-document-subscribe-authorization-issue-29) |
+| **Document access control** | MLS group membership gates *decryption* always. *Content* (`YrsUpdate`) fan-out is gated by per-document subscribe authorization (issue #29), **on by default** since #72 and disabled with `RELAY_SUBSCRIBE_AUTHZ=0`. *Subscription* itself stays open so the MLS join can bootstrap, so metadata remains visible to any identified client; see [Per-Document Subscribe Authorization](#per-document-subscribe-authorization-issue-29) |
 | **User authentication** | User IDs are self-asserted; no identity verification system. A subscribe capability binds a `user_id`, but that is the same self-asserted relay identity — it stops replay-as-another-subscriber, not impersonation of a fabricated identity |
 | **Group admission control** | The owner auto-invites ANY key package arriving on the document channel; see below |
 
@@ -193,10 +193,11 @@ The WASM/browser client (`collab-wasm`) uses this same MLS flow: it wraps `colla
 
 By default any identified client may `Subscribe` to any `doc_id`. The payload
 stays MLS-encrypted, but a non-member still observes metadata (epochs, sender
-ids, message sizes, timing). Issue #29 adds an **opt-in** gate that requires a
-subscriber to prove current-epoch group membership; issue #72 then moved that
-gate off `Subscribe` itself and onto `YrsUpdate` fan-out, so the MLS join can
-still bootstrap over the relay (see "Content gating" below).
+ids, message sizes, timing). Issue #29 adds a gate that requires a subscriber to
+prove current-epoch group membership; issue #72 then moved that gate off
+`Subscribe` itself and onto `YrsUpdate` fan-out, so the MLS join can still
+bootstrap over the relay (see "Content gating" below), and turned it **on by
+default**.
 
 ### How it works
 
@@ -214,19 +215,62 @@ still bootstrap over the relay (see "Content gating" below).
   value taken from the inbound frame. Binding `user_id` means a capability minted
   for one member cannot be replayed by another subscriber within its TTL.
 
-### Enabling it (`RELAY_SUBSCRIBE_AUTHZ`)
+### The default, and turning it off (`RELAY_SUBSCRIBE_AUTHZ`)
 
-Subscribe authorization is **off by default** and enabled per relay via the
-`RELAY_SUBSCRIBE_AUTHZ` environment variable (truthy: `1`/`true`/`yes`/`on`),
-mirroring `RELAY_AUTH_TOKEN`. The relay logs whether it is on or off at startup.
+Subscribe authorization is **on by default**. `RELAY_SUBSCRIBE_AUTHZ` is a
+two-way override of that default, not an enable switch:
 
-Since content gating (below) the *relay* no longer requires members to join
-out-of-band — the MLS-handshake-over-relay bootstrap works with authz on. The
-shipped *clients* are the remaining gap: neither `collab-cli` nor the Obsidian
-plugin mints or presents a capability yet, both send `capability: None`. Turning
-`RELAY_SUBSCRIBE_AUTHZ` on today therefore leaves them handshake-only and
-withholds every `YrsUpdate` from them. Client capability support lands first;
-flipping the default is the step after that.
+| Value | Result |
+|-------|--------|
+| unset | **on** |
+| `0`, `false`, `no`, `off` (case-insensitive, trimmed) | off |
+| anything else, including set-but-empty | **on** |
+
+An unrecognised value lands on rather than off. Authz on is the more restrictive
+state, so a typo fails closed instead of silently opening content fan-out. The
+relay logs which state it started in.
+
+Both shipped clients mint and present a capability whenever they hold an MLS
+group for the document, so the ordinary flows work with the default on:
+`collab-cli session-check` (covered by
+`tests/e2e-tests/tests/cli_subscribe_authz.rs`), and the plugin's owner and
+joiner sessions including the same-instance `disconnect()` → `connect()`
+reconnect cycle, which re-presents the capability at the current epoch.
+
+**Three paths still subscribe capability-less**, and they share one root cause —
+**no client persists MLS group state**, so any code path that does not already
+hold a live group in memory has nothing to mint from:
+
+- **`collab-cli connect`** (the read-only listener) subscribes handshake-only and
+  receives no `YrsUpdate`. It holds no group, and `keygen` persists none — see the
+  comment at `crates/collab-cli/src/commands.rs` in `run_ws_session`.
+- **The plugin's manifest-discovered paths** (`handleManifestUpdate` in
+  `plugins/obsidian-ee/src/collab-client.ts`) subscribe with `capability: None`: a
+  path that has only just been announced has no group on this client yet.
+- **The plugin's user-facing restart** (`stopSession()` then `startSession()`)
+  constructs a *new* `CollabClient`, which builds a fresh epoch-0 group. Its
+  `RegisterDocKey` is refused by TOFU against a document that is already anchored,
+  so it never becomes content-authorized. Only the same-instance
+  `disconnect()`/`connect()` cycle resumes correctly.
+
+Each is a loss of *content delivery on that path*, never a loss of
+confidentiality: a capability-less subscriber sees handshake metadata and no
+plaintext. Persisting MLS group state closes all three at once and is tracked as
+#72 follow-up work.
+
+**Migration.** Set `RELAY_SUBSCRIBE_AUTHZ=0` (or `false`/`no`/`off`) to restore
+the previous behavior. Off, every identified subscriber receives every
+`YrsUpdate` for any `doc_id` it names — payloads stay MLS-encrypted, so a
+non-member still cannot decrypt, but ciphertext, sizes, and timing all flow to
+it, and a removed member keeps receiving content after a rekey. On, content
+reaches only subscribers authorized at the document's current anchor epoch, a
+rekey revokes stale authorizations for free, and the three paths above go quiet.
+
+`docker/docker-compose.yml` sets `RELAY_SUBSCRIBE_AUTHZ=0` explicitly. It is a
+test fixture: the Docker-gated wire tests subscribe capability-less, and
+`fail_closed.rs` specifically needs the relay to fan out to an unauthorized
+subscriber so it can prove MLS fail-closed independently of this gate. That file
+is not a deployment template.
 
 ### Content gating: subscribe is open, content is not (issue #72)
 
@@ -250,9 +294,8 @@ onto fan-out:
 - The check runs *before* fan-out, so an unauthorized subscriber is excluded from
   the offline queue too and cannot accumulate content for later hand-over.
 
-Subscribe authorization remains **off by default**. Content gating was the first
-half of the "MLS hardening" item; flipping the default is the remaining half,
-tracked as separate follow-up work, and MUST NOT quietly become permanent.
+Content gating was the first half of the "MLS hardening" item; the default flip
+above is the second, and both have now landed.
 
 ### Documented residuals
 
@@ -282,7 +325,7 @@ tracked as separate follow-up work, and MUST NOT quietly become permanent.
   required for bootstrap — the joiner's `Welcome` arrives that way. Payloads are
   group-encrypted, so what this exposes is metadata (who joins, when, how the
   epoch progresses), not content.
-- **Availability delta.** With authz on, capability-less subscribes still consume
+- **Availability delta.** With authz on — the default — capability-less subscribes still consume
   `max_subscribers_per_doc` (1000). Subscriptions survive disconnect, and a
   subscriber that never gets enqueued is never reached by `drop_subscriptions`, so
   repeated connect/`Identify`/`Subscribe`/disconnect cycles can wedge a document's
