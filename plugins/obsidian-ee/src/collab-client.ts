@@ -438,10 +438,12 @@ export class CollabClient {
             return this.connectPromise;
         }
 
-        // An explicit connect() restarts a stopped client, matching the
-        // groupEstablished reset disconnect() already does for exactly that case.
-        // Only reached on a real connect() call: the reconnect timer checks
-        // `stopped` before it gets here, so this cannot revive a stopped client.
+        // An explicit connect() restarts a stopped client. A group that survived
+        // the disconnect is RESUMED (establishGroup stays a no-op); a slot that
+        // had none is re-bootstrapped, which is what disconnect() clears
+        // groupEstablished for. Only reached on a real connect() call: the
+        // reconnect timer checks `stopped` before it gets here, so this cannot
+        // revive a stopped client.
         this.stopped = false;
         this.connectionState = 'connecting';
         this.connectPromise = new Promise<void>((resolve, reject) => {
@@ -793,6 +795,18 @@ export class CollabClient {
                 // sending. Matches the Rust half's register -> present -> welcome
                 // order in collab-cli's commands.rs.
                 this.subscribeTo(slot);
+                // The commit is what carries EXISTING members to the new epoch;
+                // forwarding only the Welcome works for exactly two parties and
+                // diverges the group at the third. It goes out BEFORE the
+                // Welcome: the relay fans every handshake frame out to all other
+                // subscribers in order, so the new member sees this too, and only
+                // no-ops it while it still has no group (see `case 'commit'`).
+                this.send({
+                    type: 'mls_handshake',
+                    doc_id: slot.docId,
+                    payload: [...invite.commit],
+                    message_type: 'commit',
+                });
                 this.send({
                     type: 'mls_handshake',
                     doc_id: slot.docId,
@@ -836,12 +850,30 @@ export class CollabClient {
                 break;
             }
             case 'commit': {
-                // ponytail: the returned anchor rotation is dropped and no
-                // capability is re-presented at the new epoch. Dead in this
-                // plugin's own choreography — the owner forwards only the
-                // Welcome, never `invite.commit` — so this path never runs today.
-                // Wire both up when 3+-party groups ship (#72 follow-up).
-                slot.getDoc()?.process_commit(payload);
+                // No group yet: this is the add-commit that admits THIS client,
+                // fanned out to every subscriber ahead of its own Welcome. There
+                // is nothing to advance and nothing to re-present — a bare
+                // subscribe here would only downgrade what is already
+                // handshake-only.
+                const doc = slot.getDoc();
+                if (!doc) {
+                    return;
+                }
+                // An existing member follows the owner's commit to the new epoch.
+                // The rotation it returns is DELIBERATELY dropped: the owner
+                // already registered the identical anchor for this epoch, and
+                // only one registration can win. The relay verifies continuity
+                // under the CURRENT anchor key and then demands a strictly higher
+                // epoch, so a second registration of the same rotation is
+                // rejected twice over (crates/collab-relay/src/relay.rs,
+                // `handle_register_doc_key`). Mirrors the Rust choreography in
+                // `three_real_members` (tests/e2e-tests/tests/subscribe_authz.rs),
+                // where only the owner registers.
+                doc.process_commit(payload);
+                // This client's capability was minted at the previous epoch and
+                // no longer verifies against the rotated anchor; re-present at
+                // the new one or the relay withholds every yrs_update (#72).
+                this.subscribeTo(slot);
                 break;
             }
             default:
@@ -1159,12 +1191,38 @@ export class CollabClient {
         this.clearStabilityTimer();
         this.ws?.close();
         this.ws = null;
-        // Free a still-unconsumed key package (a joiner that never got its
-        // Welcome); see freeSlot's doc comment for the double-free hazard.
+        // An ESTABLISHED MLS group outlives the socket and must survive an
+        // explicit stop. Freeing it here made the next connect() build a FRESH
+        // epoch-0 group: silently divergent from every other member, and
+        // announced with a TOFU register_doc_key the relay rejects — an anchor
+        // for the document already exists, so it demands a rotation-continuity
+        // proof — followed by an epoch-0 capability it rejects as Unauthorized.
+        //
+        // Only a slot with NO group is torn down. That releases a still-
+        // unconsumed key package (a joiner that never got its Welcome) and lets
+        // the next connect() re-bootstrap that slot from scratch; see freeSlot's
+        // doc comment for the double-free hazard. destroy() releases the groups.
+        [this.fileSlot(), this.manifestSlot()]
+            .filter((slot) => !slot.getDoc())
+            .forEach((slot) => this.freeSlot(slot));
+        // Re-run the bootstrap on the next connect only if nothing survived. A
+        // group that DID survive keeps establishGroup a no-op — exactly what
+        // already happens across an automatic reconnect.
+        this.groupEstablished = this.doc !== null || this.manifestDoc !== null;
+    }
+
+    /**
+     * End the session: stop the client and release its MLS groups.
+     *
+     * `disconnect()` is a pause — it keeps an established group so a later
+     * `connect()` RESUMES it rather than re-creating one. `destroy()` is the
+     * end, freeing the wasm handles `disconnect()` deliberately holds. This
+     * client must not be reused afterwards.
+     */
+    destroy(): void {
+        this.disconnect();
         this.freeSlot(this.fileSlot());
-        // Same lifecycle for the manifest group (#32).
         this.freeSlot(this.manifestSlot());
-        // Allow a future reconnect after an explicit disconnect to re-establish.
         this.groupEstablished = false;
     }
 }

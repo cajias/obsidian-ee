@@ -189,7 +189,7 @@ export default class CollabPlugin extends Plugin {
 
         try {
             // Create client and editor sync. CollabClient owns the MLS document
-            // lifetime and frees it in disconnect().
+            // lifetime and frees it in destroy() (see stopSession).
             this.collabClient = new CollabClient(config);
             this.editorSync = new EditorSync(this.collabClient);
 
@@ -341,9 +341,12 @@ export default class CollabPlugin extends Plugin {
             this.editorSync = null;
         }
 
-        // CollabClient owns the MLS document and frees it in disconnect().
+        // CollabClient owns the MLS document and frees it in destroy(). NOT
+        // disconnect(): that one deliberately KEEPS an established group so a
+        // reconnecting client resumes it instead of building a fresh epoch-0
+        // group. Ending the session is what releases the wasm handles.
         if (this.collabClient) {
-            this.collabClient.disconnect();
+            this.collabClient.destroy();
             this.collabClient = null;
         }
 
