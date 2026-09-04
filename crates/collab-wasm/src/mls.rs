@@ -4,7 +4,9 @@
 //! Errors surface as real JS `Error`s via [`js_err`], unlike the removed AES
 //! path which returned `{type, message}` objects.
 
-use collab_core::{EncryptedDocument, EncryptedOp, Invite, MlsDocumentGroup, PendingMember};
+use collab_core::{
+    AnchorRotation, EncryptedDocument, EncryptedOp, Invite, MlsDocumentGroup, PendingMember,
+};
 use wasm_bindgen::prelude::*;
 
 fn js_err(e: collab_core::Error) -> JsError {
@@ -30,6 +32,51 @@ pub fn generate_key_package(user_id: &str) -> Result<WasmPendingMember, JsError>
     MlsDocumentGroup::generate_key_package(user_id).map(WasmPendingMember).map_err(js_err)
 }
 
+/// The `RegisterDocKey` payload that moves the relay's subscribe anchor to the
+/// epoch a commit just created (issue #29). Send all four fields verbatim.
+#[wasm_bindgen]
+pub struct WasmAnchorRotation(AnchorRotation);
+
+#[wasm_bindgen]
+impl WasmAnchorRotation {
+    #[wasm_bindgen(getter)]
+    pub fn epoch(&self) -> u64 {
+        self.0.epoch
+    }
+    #[wasm_bindgen(getter)]
+    pub fn public_key(&self) -> Vec<u8> {
+        self.0.public_key.to_vec()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn proof(&self) -> Vec<u8> {
+        self.0.proof.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn rotation_proof(&self) -> Vec<u8> {
+        self.0.rotation_proof.clone()
+    }
+}
+
+/// A member removal: the commit existing members must process, plus the anchor
+/// rotation the removal's rekey requires.
+#[wasm_bindgen]
+pub struct WasmRemoval {
+    commit: Vec<u8>,
+    rotation: AnchorRotation,
+}
+
+#[wasm_bindgen]
+impl WasmRemoval {
+    #[wasm_bindgen(getter)]
+    pub fn commit(&self) -> Vec<u8> {
+        self.commit.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn rotation(&self) -> WasmAnchorRotation {
+        WasmAnchorRotation(self.rotation.clone())
+    }
+}
+
 /// An invite: the Welcome for the new member plus the commit for existing members.
 #[wasm_bindgen]
 pub struct WasmInvite(Invite);
@@ -50,6 +97,7 @@ impl WasmInvite {
             welcome: welcome.to_vec(),
             commit: Vec::new(),
             epoch: 0,
+            rotation: None,
         })
     }
 
@@ -68,6 +116,12 @@ impl WasmInvite {
     #[wasm_bindgen(getter)]
     pub fn epoch(&self) -> u64 {
         self.0.epoch
+    }
+    /// The anchor rotation this invite's commit created — `undefined` on a
+    /// [`WasmInvite::from_welcome`] reconstruction, which has no outgoing key.
+    #[wasm_bindgen(getter)]
+    pub fn rotation(&self) -> Option<WasmAnchorRotation> {
+        self.0.rotation.clone().map(WasmAnchorRotation)
     }
 }
 
@@ -113,14 +167,20 @@ impl WasmEncryptedDocument {
         self.0.create_invite(key_package).map(WasmInvite).map_err(js_err)
     }
 
-    pub fn process_commit(&mut self, commit: &[u8]) -> Result<(), JsError> {
-        self.0.process_commit(commit).map_err(js_err)
+    /// Process a peer's commit, returning the anchor rotation for the epoch it
+    /// creates: the group has rekeyed, so the relay's anchor must move with it.
+    pub fn process_commit(&mut self, commit: &[u8]) -> Result<WasmAnchorRotation, JsError> {
+        self.0.process_commit(commit).map(WasmAnchorRotation).map_err(js_err)
     }
 
     /// Owner-only: remove `member_user_id`, returning the commit existing members
-    /// must `process_commit` (issue #31). Rejected if this client is not the owner.
-    pub fn remove_member(&mut self, member_user_id: &str) -> Result<Vec<u8>, JsError> {
-        self.0.remove_member(member_user_id).map_err(js_err)
+    /// must `process_commit` plus the resulting anchor rotation (issues #31, #29).
+    /// Rejected if this client is not the owner.
+    pub fn remove_member(&mut self, member_user_id: &str) -> Result<WasmRemoval, JsError> {
+        self.0
+            .remove_member(member_user_id)
+            .map(|(commit, rotation)| WasmRemoval { commit, rotation })
+            .map_err(js_err)
     }
 
     /// True iff this client created the document's group (is the owner).
