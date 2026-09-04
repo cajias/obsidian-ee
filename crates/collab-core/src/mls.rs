@@ -365,6 +365,11 @@ impl MlsDocumentGroup {
         // The outgoing epoch's subscribe key: derivable only until the commit
         // below merges. It lives in this stack frame and is dropped on return —
         // retaining a superseded key would forfeit MLS post-compromise security.
+        //
+        // INVARIANT, reviewer-enforced: no superseded key may be stored on
+        // `MlsDocumentGroup` or anywhere outliving this call. No test can catch a
+        // new field holding one (adding and even reading such a field breaks
+        // nothing and passes clippy), so a field added here needs a REASON.
         let outgoing = self.derive_subscribe_keypair()?;
 
         // Deserialize the key package
@@ -533,7 +538,9 @@ impl MlsDocumentGroup {
     ///
     /// # Errors
     ///
-    /// Returns an error if processing the commit fails.
+    /// Returns an error if processing the commit fails, or if this member is the
+    /// one the commit removes: eviction leaves no key for the new epoch, so there
+    /// is no rotation to emit.
     pub fn process_commit(&mut self, commit_bytes: &[u8], doc_id: &str) -> Result<AnchorRotation> {
         // Outgoing epoch key, captured before the merge below (see `add_member`).
         let outgoing = self.derive_subscribe_keypair()?;
@@ -664,13 +671,32 @@ impl MlsDocumentGroup {
     ///
     /// # Errors
     ///
-    /// Returns an error if exporting the new epoch's MLS secret fails.
+    /// Returns an error if exporting the new epoch's MLS secret fails, or if the
+    /// derived key has not actually changed (see the removal-bypass guard below).
     fn anchor_rotation(
         &self,
         doc_id: &str,
         outgoing: &ed25519_dalek::SigningKey,
     ) -> Result<AnchorRotation> {
         let new_key = self.derive_subscribe_keypair()?;
+
+        // Removal-bypass guard, fail closed. A commit always advances the epoch and
+        // the exporter secret, so the new key can never legitimately equal the
+        // outgoing one. If it does, the emitted proof would be key_N signing over
+        // (doc_id, epoch, pubkey_N) — which the relay verifies under its STORED
+        // pubkey_N and accepts, moving the anchor to a key an evicted member still
+        // holds. That is a complete removal bypass, so refuse to emit it.
+        //
+        // Without this guard the property rests on an openmls invariant we do not
+        // control: `export_secret` erroring (`UseAfterEviction`) once a member's own
+        // removal has marked the group inactive. Pinned by
+        // `evicted_member_process_commit_emits_no_rotation`.
+        if new_key.verifying_key() == outgoing.verifying_key() {
+            return Err(Error::Mls(
+                "Anchor rotation derived the outgoing epoch's key; refusing to rotate".to_string(),
+            ));
+        }
+
         let public_key = new_key.verifying_key().to_bytes();
         let epoch = self.epoch();
         Ok(AnchorRotation {
@@ -1009,9 +1035,13 @@ mod tests {
 
         let (commit, _) = alice.remove_member("carol", DOC_A).unwrap();
         bob.process_commit(&commit, DOC_A).unwrap();
-        // Carol processes her own removal; openmls evicts her (group inactive).
-        // Our wrapper must surface this as Ok(()) or Err — never a panic.
-        let _ = carol.process_commit(&commit, DOC_A);
+        // Carol processes her own removal; openmls evicts her (group inactive) so
+        // no new epoch key can be exported and no rotation is emitted. The return
+        // is load-bearing (see `evicted_member_process_commit_emits_no_rotation`).
+        assert!(
+            carol.process_commit(&commit, DOC_A).is_err(),
+            "an evicted member must not obtain a rotation from her own removal"
+        );
 
         // Alice sends at the new epoch. Bob (still a member) decrypts fine.
         let msg = b"members-only after removal";
@@ -1138,10 +1168,14 @@ mod tests {
         let carol_cap = carol.mint_subscribe_capability("carol", DOC_A, NOW, TTL).unwrap();
         assert_eq!(carol_cap.epoch, 2);
 
-        // Alice removes Carol; Bob & Carol process it.
+        // Alice removes Carol; Bob & Carol process it. Carol is evicted by her own
+        // removal, so her `process_commit` must fail rather than hand her a rotation.
         let (commit, _) = alice.remove_member("carol", DOC_A).unwrap();
         bob.process_commit(&commit, DOC_A).unwrap();
-        let _ = carol.process_commit(&commit, DOC_A);
+        assert!(
+            carol.process_commit(&commit, DOC_A).is_err(),
+            "an evicted member must not obtain a rotation from her own removal"
+        );
 
         // New epoch → rotated anchor key (owner re-registers it, same as add).
         let key_after = alice.subscribe_verifying_key().unwrap();
@@ -1297,7 +1331,11 @@ mod tests {
 
         let (commit, alice_rotation) = alice.remove_member("carol", DOC_A).unwrap();
         let bob_rotation = bob.process_commit(&commit, DOC_A).unwrap();
-        let _ = carol.process_commit(&commit, DOC_A);
+        // Carol is the removed member: no rotation for her, only an error.
+        assert!(
+            carol.process_commit(&commit, DOC_A).is_err(),
+            "an evicted member must not obtain a rotation from her own removal"
+        );
 
         assert_eq!(alice_rotation.epoch, alice.epoch());
         assert_eq!(bob_rotation.epoch, alice_rotation.epoch);
@@ -1316,6 +1354,78 @@ mod tests {
             ),
             Ok(()),
             "the removal rotation must verify under the pre-removal anchor key"
+        );
+    }
+
+    #[test]
+    fn anchor_rotation_refuses_a_key_that_did_not_rotate() {
+        // The removal-bypass guard, tested directly. A rotation whose new key
+        // EQUALS the outgoing one is a signature by key_N over (doc, epoch,
+        // pubkey_N): the relay verifies it under its stored pubkey_N and accepts,
+        // moving the anchor to a key an evicted member still holds. `anchor_rotation`
+        // must refuse rather than emit that proof.
+        //
+        // The natural path to equal keys is unreachable today — openmls gates
+        // `export_secret` on `is_active()`, so an evicted member errors before
+        // reaching here (see `evicted_member_process_commit_emits_no_rotation`).
+        // That is a third-party invariant this repo does not pin, so the guard is
+        // exercised directly by handing `anchor_rotation` the CURRENT epoch's key
+        // as its outgoing key.
+        let (alice, _, _) = three_member_group();
+        let current = alice.derive_subscribe_keypair().unwrap();
+
+        let result = alice.anchor_rotation(DOC_A, &current);
+        assert!(
+            result.is_err(),
+            "a rotation to the key it rotates FROM must be refused, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn evicted_member_process_commit_emits_no_rotation() {
+        // A member processing her OWN removal must get an Err — never a rotation.
+        // Pins the invariant the guard above backstops: if `export_secret` ever
+        // returned the last epoch's secret instead of failing, Carol would emit a
+        // rotation to the key she still holds and the relay would accept it.
+        let (mut alice, mut bob, mut carol) = three_member_group();
+
+        let (commit, _) = alice.remove_member("carol", DOC_A).unwrap();
+        bob.process_commit(&commit, DOC_A).unwrap();
+
+        let result = carol.process_commit(&commit, DOC_A);
+        assert!(
+            result.is_err(),
+            "the removed member must not obtain an anchor rotation, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn add_member_binds_the_caller_supplied_doc_id() {
+        // The positive half of the doc-binding pair. Every other rotation test
+        // EMITS under DOC_A, so "binds the caller's doc_id" and "binds a constant
+        // that happens to be DOC_A" are indistinguishable without this: emitting
+        // under a SECOND document and verifying under it is what separates them.
+        let (mut alice, _) = MlsDocumentGroup::create("alice").unwrap();
+        let outgoing_vk = alice.subscribe_verifying_key().unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+
+        let (_c, _w, rot) = alice.add_member(bob_pending.key_package(), DOC_B).unwrap();
+
+        assert_eq!(
+            collab_proto::verify_anchor_rotation(
+                DOC_B,
+                rot.epoch,
+                &rot.public_key,
+                &outgoing_vk,
+                &rot.rotation_proof,
+            ),
+            Ok(()),
+            "a rotation emitted for DOC_B must verify under DOC_B"
+        );
+        assert_eq!(
+            collab_proto::verify_doc_key_proof(DOC_B, rot.epoch, &rot.public_key, &rot.proof),
+            Ok(()),
+            "the self-proof must bind DOC_B too"
         );
     }
 }

@@ -353,4 +353,53 @@ mod tests {
         // ...and vice versa.
         assert!(file_doc.decrypt_bytes(&manifest_op.ciphertext).is_err());
     }
+
+    /// The `EncryptedDocument` layer must pass its OWN document id down to the
+    /// rotation-proof signing, on BOTH membership paths. Nothing else pins this:
+    /// every other call site discards the rotation, so binding a wrong id here
+    /// would be invisible. The proofs below only verify under `DOC`, so replacing
+    /// either `self.doc.id()` argument with any other value fails this test.
+    #[test]
+    fn rotations_bind_the_documents_own_id() {
+        const DOC: &str = "notes/rotation-binding.md";
+        let mut alice = EncryptedDocument::create(DOC, "alice").unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let invite = alice.create_invite(bob_pending.key_package()).unwrap();
+        // `create_invite` must hand the owner a rotation to register (not `None`).
+        assert!(invite.rotation.is_some(), "create_invite must emit the add-commit's rotation");
+        let mut bob = EncryptedDocument::join(&invite, bob_pending).unwrap();
+
+        // Add path: a PEER processing the commit emits the rotation, signed by the
+        // key it held before the merge.
+        let bob_outgoing = bob.subscribe_verifying_key().unwrap();
+        let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
+        let add = alice.create_invite(carol_pending.key_package()).unwrap();
+        let bob_rot = bob.process_commit(&add.commit).unwrap();
+        assert_eq!(
+            collab_proto::verify_anchor_rotation(
+                DOC,
+                bob_rot.epoch,
+                &bob_rot.public_key,
+                &bob_outgoing,
+                &bob_rot.rotation_proof,
+            ),
+            Ok(()),
+            "process_commit must bind the document's own id"
+        );
+
+        // Removal path: the owner's own rotation, same binding.
+        let alice_outgoing = alice.subscribe_verifying_key().unwrap();
+        let (_commit, removal_rot) = alice.remove_member("carol").unwrap();
+        assert_eq!(
+            collab_proto::verify_anchor_rotation(
+                DOC,
+                removal_rot.epoch,
+                &removal_rot.public_key,
+                &alice_outgoing,
+                &removal_rot.rotation_proof,
+            ),
+            Ok(()),
+            "remove_member must bind the document's own id"
+        );
+    }
 }

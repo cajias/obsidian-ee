@@ -36,7 +36,12 @@
 //! that has to accompany it. See
 //! `test_anchor_rotation_unwedges_a_rekeyed_document`.
 //!
-//! Both self-host their authz relay, so neither needs Docker — but both are
+//! The third takes the same rotation machinery down the REMOVAL path — the point
+//! where #31 (member removal) meets #72 (anchor rotation): rotating the anchor
+//! after a removal is what makes the removal mean something at the relay. See
+//! `removal_rotation_revokes_the_removed_members_capability`.
+//!
+//! All three self-host their authz relay, so none needs Docker — but all are
 //! `#[ignore]`d, which keeps them in the `--include-ignored` wire-test tier the
 //! e2e gate counts and OUT of a plain `cargo test --workspace` run.
 //!
@@ -79,6 +84,53 @@ fn two_real_members(doc_id: &str) -> (EncryptedDocument, EncryptedDocument) {
     assert_eq!(alice_doc.epoch(), 1, "owner must be at epoch 1 after the add-commit");
     assert_eq!(bob_doc.epoch(), 1, "joiner must be at epoch 1");
     (alice_doc, bob_doc)
+}
+
+/// Three real members of one group, all settled at epoch 2 sharing the exporter
+/// secret — Alice (owner), Bob and Carol. Extends [`two_real_members`] with a
+/// second add-commit that Bob must also process to stay in step.
+fn three_real_members(doc_id: &str) -> (EncryptedDocument, EncryptedDocument, EncryptedDocument) {
+    let (mut alice_doc, mut bob_doc) = two_real_members(doc_id);
+
+    let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
+    let invite = alice_doc.create_invite(carol_pending.key_package()).unwrap();
+    // Bob is an EXISTING member: he reaches epoch 2 by processing the add-commit,
+    // not by the Welcome. Without this he stays at epoch 1 and mints stale caps.
+    bob_doc.process_commit(&invite.commit).unwrap();
+    let carol_doc = EncryptedDocument::join(
+        &Invite {
+            doc_id: doc_id.to_string(),
+            welcome: invite.welcome,
+            commit: vec![],
+            epoch: 2,
+            rotation: None,
+        },
+        carol_pending,
+    )
+    .unwrap();
+
+    assert_eq!(alice_doc.epoch(), 2, "the owner must be at epoch 2 after the second add");
+    assert_eq!(bob_doc.epoch(), 2, "the existing member must follow the add-commit to epoch 2");
+    assert_eq!(carol_doc.epoch(), 2, "the second joiner enters at epoch 2");
+    (alice_doc, bob_doc, carol_doc)
+}
+
+/// Subscribe `client` for `doc_id` with a capability `doc` mints for `user_id`,
+/// and assert the relay accepted it.
+async fn subscribe_ok(
+    client: &mut TestClient,
+    doc: &EncryptedDocument,
+    user_id: &str,
+    doc_id: &DocumentId,
+    context: &str,
+) {
+    let capability = doc.mint_subscribe_capability(user_id, doc_id, now_unix(), TTL_SECS).unwrap();
+    client
+        .send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: Some(capability) })
+        .await
+        .unwrap();
+    let reply = client.recv().await.unwrap();
+    assert!(matches!(reply, ServerMessage::Subscribed { .. }), "{context}: got {reply:?}");
 }
 
 /// A foreign group (Eve's own), advanced to epoch 1 so she can mint a capability
@@ -419,4 +471,139 @@ async fn test_anchor_rotation_unwedges_a_rekeyed_document() {
     let carol_op = carol.recv_update().await.unwrap();
     carol_doc.apply_encrypted_update(&carol_op).unwrap();
     assert_eq!(carol_doc.get_content(), secret, "the re-authorized member must decrypt the update");
+}
+
+/// #31 (member removal) meeting #72 (anchor rotation) over the real wire: the
+/// rotation is what gives a removal teeth at the relay. Removing a member rekeys
+/// the group, and registering the resulting rotation moves the anchor past the
+/// epoch the removed member's key can reach — so her capability stops verifying
+/// while the remaining members simply re-mint at the new epoch.
+///
+/// GIVEN a relay with subscribe authorization ENABLED, an anchor registered at
+/// epoch 2, and three real members (Alice the owner, Bob, Carol) whose epoch-2
+/// capabilities all subscribe successfully, WHEN Alice removes Carol and
+/// registers the rotation the removal commit emitted, THEN Carol's epoch-2
+/// capability is REJECTED `Unauthorized` at the capability gate, Carol receives
+/// no subsequent `YrsUpdate`, Carol's own `process_commit` yields no rotation she
+/// could use to move the anchor back, and Bob — who re-mints at epoch 3 —
+/// subscribes and decrypts the content off the wire.
+#[tokio::test]
+#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
+#[allow(clippy::too_many_lines)]
+async fn removal_rotation_revokes_the_removed_members_capability() {
+    let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+    let url = server.url().to_owned();
+    let doc_id: DocumentId = "removal-rotation-doc".to_string();
+    let secret = "members only: readable after carol is gone";
+
+    let (mut alice_doc, mut bob_doc, mut carol_doc) = three_real_members(&doc_id);
+    let mut alice = TestClient::connect_as(&url, "alice").await.unwrap();
+    let mut bob = TestClient::connect_as(&url, "bob").await.unwrap();
+    let mut carol = TestClient::connect_as(&url, "carol").await.unwrap();
+
+    // --- The owner registers the epoch-2 anchor (TOFU) -----------------------
+    alice
+        .send(&ClientMessage::RegisterDocKey {
+            doc_id: doc_id.clone(),
+            epoch: alice_doc.epoch(),
+            public_key: alice_doc.subscribe_verifying_key().unwrap().to_vec(),
+            proof: alice_doc.sign_doc_key_proof(&doc_id).unwrap(),
+            rotation_proof: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // --- Baseline: all three epoch-2 capabilities are ACCEPTED ---------------
+    // Alice's Subscribed also flushes the silent registration above (one
+    // connection, FIFO), so Bob and Carol act against a live anchor.
+    subscribe_ok(&mut alice, &alice_doc, "alice", &doc_id, "the owner's epoch-2 capability").await;
+    subscribe_ok(&mut bob, &bob_doc, "bob", &doc_id, "a member's epoch-2 capability").await;
+    let carol_cap =
+        carol_doc.mint_subscribe_capability("carol", &doc_id, now_unix(), TTL_SECS).unwrap();
+    carol
+        .send(&ClientMessage::Subscribe {
+            doc_id: doc_id.clone(),
+            capability: Some(carol_cap.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(carol.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+        "the member about to be removed must hold a WORKING epoch-2 capability first"
+    );
+
+    // LOAD-BEARING, do not simplify away: Carol must drop her live subscription
+    // for the rest of this test to mean anything. Rotating the anchor does not
+    // tear down existing subscriptions — the documented residual at
+    // `docs/security.md` "Live subscriptions are checked at subscribe time only"
+    // (#31 scope). Without this Unsubscribe, Carol stays in the fan-out set and
+    // the test would prove nothing about her CAPABILITY, which is what it exists
+    // to prove.
+    carol.send(&ClientMessage::Unsubscribe { doc_id: doc_id.clone() }).await.unwrap();
+    assert!(
+        matches!(carol.recv().await.unwrap(), ServerMessage::Unsubscribed { .. }),
+        "carol must be out of the fan-out set before the removal"
+    );
+
+    // --- The removal advances the group to epoch 3 ---------------------------
+    let (commit, rotation) = alice_doc.remove_member("carol").unwrap();
+    bob_doc.process_commit(&commit).unwrap();
+    // Carol is evicted by her own removal: no new epoch key, so no rotation she
+    // could present to drag the anchor back to a key she still holds.
+    assert!(
+        carol_doc.process_commit(&commit).is_err(),
+        "the removed member must not obtain a rotation from her own removal"
+    );
+    assert_eq!(alice_doc.epoch(), 3, "the removal commit must advance the owner to epoch 3");
+    assert_eq!(bob_doc.epoch(), 3, "the remaining member must follow the removal to epoch 3");
+    assert_eq!(rotation.epoch, 3, "the rotation must name the epoch the removal created");
+    // The positive reading of why she cannot re-mint: she has no epoch-3 key at all.
+    assert!(
+        carol_doc.mint_subscribe_capability("carol", &doc_id, now_unix(), TTL_SECS).is_err(),
+        "the removed member must not be able to mint at the epoch her removal created"
+    );
+
+    // --- The owner registers the removal's rotation --------------------------
+    alice
+        .send(&ClientMessage::RegisterDocKey {
+            doc_id: doc_id.clone(),
+            epoch: rotation.epoch,
+            public_key: rotation.public_key.to_vec(),
+            proof: rotation.proof,
+            rotation_proof: rotation.rotation_proof,
+        })
+        .await
+        .unwrap();
+    // Registration is silent; the owner's epoch-3 subscribe flushes it and proves
+    // the anchor actually moved.
+    subscribe_ok(&mut alice, &alice_doc, "alice", &doc_id, "the owner's epoch-3 capability").await;
+
+    // --- THE REVOCATION: Carol's capability no longer verifies ---------------
+    carol
+        .send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: Some(carol_cap) })
+        .await
+        .unwrap();
+    match carol.recv().await.unwrap() {
+        ServerMessage::Error { code: ErrorCode::Unauthorized, message } => assert!(
+            message.contains("capability"),
+            "the removed member must fail the CAPABILITY gate, got: {message}"
+        ),
+        other => panic!("the removed member's stale capability must be rejected, got {other:?}"),
+    }
+
+    // --- A remaining member simply re-mints at the new epoch ------------------
+    subscribe_ok(&mut bob, &bob_doc, "bob", &doc_id, "a remaining member's epoch-3 capability")
+        .await;
+
+    // --- Content flows to the remaining member, never to the removed one ------
+    alice_doc.insert(0, secret);
+    let update = alice_doc.get_encrypted_update().unwrap();
+    alice.send_update(&doc_id, &update).await.unwrap();
+
+    let bob_op = bob.recv_update().await.unwrap();
+    bob_doc.apply_encrypted_update(&bob_op).unwrap();
+    assert_eq!(bob_doc.get_content(), secret, "the remaining member must decrypt the update");
+
+    let carol_saw = carol.try_recv(Duration::from_secs(2)).await.unwrap();
+    assert!(carol_saw.is_none(), "the removed member must receive no YrsUpdate; got {carol_saw:?}");
 }
