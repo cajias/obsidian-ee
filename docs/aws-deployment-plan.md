@@ -34,7 +34,7 @@ Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job
 
 - **Singleton**: one instance per env; deploy = stop-then-start, drops in-memory offline queue (accepted; clients reconnect).
 - **Signals**: relay handles only SIGINT (`crates/collab-relay/src/main.rs:59`) → add `STOPSIGNAL SIGINT` to `docker/Dockerfile.relay` (image already ships `netcat-openbsd` for the TCP healthcheck — verified).
-- **Auth**: `RELAY_AUTH_TOKEN` unset = open relay → per-env SecureString `/relay/<env>/auth-token` in SSM Parameter Store, injected by deploy.sh; instance role can read only its own. `RELAY_SUBSCRIBE_AUTHZ` stays off (deadlocks MLS bootstrap).
+- **Auth**: `RELAY_AUTH_TOKEN` unset = open relay → per-env SecureString `/relay/<env>/auth-token` in SSM Parameter Store, injected by deploy.sh; instance role can read only its own. `RELAY_SUBSCRIBE_AUTHZ` stays off, pinned explicitly to `0` (the relay's default flips to on with #72, so unset no longer means off; enabling it needs the deployed clients verified first).
 - **Keepalive**: no WS ping/pong yet (`routing.rs:171`) — idle connections reaped, reconnect expected.
 - **101 verify is valid**: relay auth happens after the WS handshake (in `Identify`), so an unauthenticated upgrade still completes.
 

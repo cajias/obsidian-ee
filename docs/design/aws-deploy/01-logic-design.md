@@ -198,7 +198,7 @@ graph LR
 - **Deploy workflow inputs**: `environment` (dev / staging / prod) and the git `ref` to run from. Dispatching prod at a prior release tag is the rollback path (SC6).
 - **Token parameter**: `/relay/<env>/auth-token`, a SecureString in SSM Parameter Store, created at bootstrap by the maintainer and injected into the relay container by the deploy script at deploy time. The token never appears in an image, a workflow log, or a repository variable.
 - **Image tag contract**: every built commit carries `sha-<commit>`; every release carries `vX.Y.Z`; for a released commit both tags name the **same digest** (SC3).
-- **Environment variable constraint**: `RELAY_SUBSCRIBE_AUTHZ` stays off; subscribe-time authorization deadlocks the MLS bootstrap handshake. Admission control lives entirely in the Identify exchange.
+- **Environment variable constraint**: `RELAY_SUBSCRIBE_AUTHZ` stays off — pinned explicitly to `0`, not left unset, because the relay's default flips to on with #72. Turning the gate on is a deliberate later step that first requires verifying the deployed clients register a document anchor and present a capability. Admission control lives entirely in the Identify exchange.
 - **Health contract**: after every deploy, a WebSocket-upgrade probe against the published address must return 101 within the retry budget; the deploy reports success only then (SC1).
 
 ## Runtime & permission model

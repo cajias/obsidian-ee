@@ -174,8 +174,9 @@ of continue.*
 - The release PR touches only `version.txt`/`CHANGELOG.md`, so cargo `--locked`
   CI stays green by design — never "fix" the release flow to regenerate the
   lockfile.
-- `RELAY_SUBSCRIBE_AUTHZ` stays **off** — enabling it deadlocks MLS bootstrap.
-  Do not "harden" it on.
+- `RELAY_SUBSCRIBE_AUTHZ` stays **off**, pinned explicitly to `0` — the relay's
+  default flips to on with #72, so unset no longer means off, and enabling the
+  gate needs the deployed clients verified first. Do not "harden" it on.
 - The relay handles **only SIGINT**; docker's default stop signal is SIGTERM.
   `STOPSIGNAL SIGINT` in `docker/Dockerfile.relay` is load-bearing (M1 exists
   for it).

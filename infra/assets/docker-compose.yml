@@ -6,6 +6,13 @@
 # reachable only on the compose network), the image comes from the registry
 # rather than a local build, and stop_grace_period is widened for production.
 #
+# RELAY_SUBSCRIBE_AUTHZ is deliberately NOT part of that sync. Both files pin it
+# off — that one from #91 — for unrelated reasons: there it is a wire-test
+# fixture (three tests need the relay gate off to prove MLS fails closed on its
+# own), here it is the deployment decision recorded below. The two move
+# independently, and that file's note about what "a real relay" should do does
+# not govern this one.
+#
 # RELAY_IMAGE and RELAY_AUTH_TOKEN come from /opt/relay/.env, written by deploy.sh
 # at deploy time. No top-level `version:` key: current Compose Specification.
 
@@ -44,9 +51,16 @@ services:
       # of silently starting an open relay (SC2) — collab-relay's main.rs treats
       # an empty token as "auth disabled".
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:?RELAY_AUTH_TOKEN must be set; refusing to start an unauthenticated relay}
-      # RELAY_SUBSCRIBE_AUTHZ must stay unset/off — see the Environment variable
-      # constraint in 01-logic-design.md; it deadlocks the MLS bootstrap handshake.
-      # Admission control lives entirely in the Identify exchange.
+      # Pinned off explicitly rather than left unset: the relay's default flips
+      # to ON with #72 (PR #91), so unset would start gating YrsUpdate content
+      # here with no diff to this branch; `=0` is off under either default. The
+      # old justification — subscribe-time authz deadlocks the MLS bootstrap —
+      # no longer holds: #72 makes a capability-less Subscribe handshake-only,
+      # so a joiner still receives its Welcome and only content is gated.
+      # Turning it on is a deliberate later step, gated on verifying the
+      # DEPLOYED clients register a document anchor and present a capability.
+      # Admission control today still lives in the Identify exchange.
+      - RELAY_SUBSCRIBE_AUTHZ=0
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "8080"]
       interval: 10s
