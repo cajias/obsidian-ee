@@ -242,7 +242,11 @@ export class CollabClient {
     // (owner) or until the Welcome arrives (joiner).
     private manifestDoc: WasmEncryptedDocument | null = null;
     private manifestPending: WasmPendingMember | null = null;
-    private groupEstablished = false;
+    // Terminal: set by destroy(), which frees the groups. Post-destroy() slot
+    // state is indistinguishable from a never-connected client's, so nothing
+    // derivable stops a later connect() from bootstrapping a fresh epoch-0
+    // group — this flag does.
+    private destroyed = false;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
     private onManifestPathsCallback: ManifestPathsCallback | null = null;
@@ -326,13 +330,17 @@ export class CollabClient {
     }
 
     /**
-     * Establish the MLS group(s) EXACTLY ONCE, on the first successful connect.
-     * MLS group state is long-lived and persists across reconnects (only
-     * `this.ws` is recreated), so onopen must NOT re-run this on a reconnect:
+     * Establish the MLS group(s) EXACTLY ONCE EACH, per slot. MLS group state is
+     * long-lived and persists across reconnects (only `this.ws` is recreated),
+     * so onopen must NOT re-run this for a slot that already has one:
      * re-creating would spawn a NEW empty solo group at epoch 0 and orphan the
-     * real group. This guard satisfies the CLAUDE.md reconnect-lifecycle
-     * invariant "guard against a second start that would orphan the prior
-     * client/handle."
+     * real group. The per-slot filter below satisfies the CLAUDE.md
+     * reconnect-lifecycle invariant "guard against a second start that would
+     * orphan the prior client/handle."
+     *
+     * Per-slot, not one flag over both: a vault-sync joiner can be admitted to
+     * the file group and NOT the manifest group (the Welcomes are independent),
+     * and an all-or-nothing latch left that second group permanently unjoinable.
      *
      * ponytail: first-cut behavior — a joiner whose socket drops mid-handshake
      * (before the Welcome) stays un-joined and fails closed (no plaintext), which
@@ -340,9 +348,6 @@ export class CollabClient {
      * machine is deliberately NOT built here (YAGNI).
      */
     private establishGroup(): void {
-        if (this.groupEstablished) {
-            return;
-        }
         // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
         // established by the same handshake. Same role: whoever owns the file doc
         // owns the manifest group. Throws below fail the connect() attempt via
@@ -351,29 +356,34 @@ export class CollabClient {
             this.config.vaultSync && this.config.manifestDocId
                 ? [this.fileSlot(), this.manifestSlot()]
                 : [this.fileSlot()];
+        // A slot with a live doc is a group to RESUME; a slot with a live pending
+        // is a joiner still mid-handshake, whose one-time key package is already
+        // on the wire. Only a slot with neither needs bootstrapping.
+        const toBootstrap = slots.filter((slot) => !slot.getDoc() && !slot.getPending());
         try {
-            slots.forEach((slot) => this.bootstrapGroup(slot));
+            toBootstrap.forEach((slot) => this.bootstrapGroup(slot));
         } catch (error) {
             // bootstrapGroup throws AFTER slot.setDoc(), so a half-done attempt
-            // would otherwise leave the doc set with the flag latched and
-            // register_doc_key never sent. Every later connect would then skip
-            // bootstrap and present capabilities for a document the relay has no
-            // anchor for — it rejects the subscribe, and the client goes silently
-            // deaf while resolving normally. Undo the whole attempt instead, so a
-            // retry re-runs it from scratch.
+            // would otherwise leave the doc set with register_doc_key never sent.
+            // Every later connect would then skip that slot's bootstrap and
+            // present capabilities for a document the relay has no anchor for —
+            // it rejects the subscribe, and the client goes silently deaf while
+            // resolving normally. Undo the whole attempt instead, so a retry
+            // re-runs it from scratch.
             //
             // Safe to discard the docs because every step that can throw in there
             // runs BEFORE its frame is sent: the retry's fresh TOFU registration
             // is still the relay's first for the document.
             //
-            // This teardown belongs here rather than in failConnect: failConnect is
-            // shared with the identify/subscribe branch, which also fires on a
+            // Exactly the slots THIS call tried to bootstrap: a group that
+            // survived a disconnect is not part of this attempt, and freeing it
+            // here would leave the client deaf on a document it is still a
+            // member of. Same reason this teardown is not in failConnect, which
+            // is shared with the identify/subscribe branch that also fires on a
             // RECONNECT whose long-lived group must survive.
-            this.freeSlot(this.fileSlot());
-            this.freeSlot(this.manifestSlot());
+            toBootstrap.forEach((slot) => this.freeSlot(slot));
             throw error;
         }
-        this.groupEstablished = true;
         // Anchors are registered, so the capability-less subscribes sent moments
         // ago in subscribe() can be upgraded to content-authorized (#72). This
         // runs OUTSIDE the teardown above on purpose: minting is the one step
@@ -382,7 +392,11 @@ export class CollabClient {
         // registration cannot replace (the relay demands a rotation continuity
         // proof once an anchor exists). A throw here still fails the connect; the
         // group survives and the next attempt's subscribe() re-presents.
-        slots.filter((slot) => slot.getDoc()).forEach((slot) => this.subscribeTo(slot));
+        //
+        // Only the slots THIS call bootstrapped: a slot that already had a group
+        // was re-presented moments ago by subscribe(), so re-minting it here is a
+        // wasted wasm call.
+        toBootstrap.filter((slot) => slot.getDoc()).forEach((slot) => this.subscribeTo(slot));
     }
 
     /** True when this frame's doc_id is the configured manifest group. */
@@ -433,17 +447,22 @@ export class CollabClient {
     }
 
     connect(): Promise<void> {
+        // destroy() freed the groups, so reconnecting would bootstrap a FRESH
+        // epoch-0 solo group: divergent from every other member and announced
+        // with a TOFU registration the relay rejects. Fail closed.
+        if (this.destroyed) {
+            return Promise.reject(new Error('CollabClient has been destroyed'));
+        }
         // Prevent concurrent connection attempts
         if (this.connectPromise) {
             return this.connectPromise;
         }
 
         // An explicit connect() restarts a stopped client. A group that survived
-        // the disconnect is RESUMED (establishGroup stays a no-op); a slot that
-        // had none is re-bootstrapped, which is what disconnect() clears
-        // groupEstablished for. Only reached on a real connect() call: the
-        // reconnect timer checks `stopped` before it gets here, so this cannot
-        // revive a stopped client.
+        // the disconnect is RESUMED (establishGroup skips a slot that still has
+        // one); a slot that disconnect() emptied is re-bootstrapped. Only reached
+        // on a real connect() call: the reconnect timer checks `stopped` before
+        // it gets here, so this cannot revive a stopped client.
         this.stopped = false;
         this.connectionState = 'connecting';
         this.connectPromise = new Promise<void>((resolve, reject) => {
@@ -1202,13 +1221,12 @@ export class CollabClient {
         // unconsumed key package (a joiner that never got its Welcome) and lets
         // the next connect() re-bootstrap that slot from scratch; see freeSlot's
         // doc comment for the double-free hazard. destroy() releases the groups.
+        // Emptying that slot is also what tells the next connect() to
+        // re-bootstrap it: establishGroup() bootstraps exactly the slots with
+        // neither a doc nor a pending.
         [this.fileSlot(), this.manifestSlot()]
             .filter((slot) => !slot.getDoc())
             .forEach((slot) => this.freeSlot(slot));
-        // Re-run the bootstrap on the next connect only if nothing survived. A
-        // group that DID survive keeps establishGroup a no-op — exactly what
-        // already happens across an automatic reconnect.
-        this.groupEstablished = this.doc !== null || this.manifestDoc !== null;
     }
 
     /**
@@ -1216,13 +1234,13 @@ export class CollabClient {
      *
      * `disconnect()` is a pause — it keeps an established group so a later
      * `connect()` RESUMES it rather than re-creating one. `destroy()` is the
-     * end, freeing the wasm handles `disconnect()` deliberately holds. This
-     * client must not be reused afterwards.
+     * end, freeing the wasm handles `disconnect()` deliberately holds. The
+     * client is not reusable afterwards — `connect()` rejects.
      */
     destroy(): void {
         this.disconnect();
         this.freeSlot(this.fileSlot());
         this.freeSlot(this.manifestSlot());
-        this.groupEstablished = false;
+        this.destroyed = true;
     }
 }

@@ -143,6 +143,11 @@ const makeMockDoc = () => ({
         .fn<() => { ciphertext: Uint8Array; epoch: bigint }>()
         .mockReturnValue({ ciphertext: new Uint8Array([1, 2, 3]), epoch: 1n }),
     apply_encrypted_update: jest.fn(),
+    // The manifest group's send path (#32): sendManifestUpdate encrypts under
+    // the manifest group rather than diffing text.
+    encrypt_bytes: jest
+        .fn<() => { ciphertext: Uint8Array; epoch: bigint }>()
+        .mockReturnValue({ ciphertext: new Uint8Array([4, 5]), epoch: 1n }),
     create_invite: jest
         .fn<() => { welcome: Uint8Array; rotation: MockRotation }>()
         .mockReturnValue({ welcome: new Uint8Array([9, 9]), rotation: MOCK_ROTATION }),
@@ -752,8 +757,9 @@ describe('CollabClient', () => {
         it('connect() after disconnect() can reconnect again', async () => {
             // The overload's real cost: disconnect() zeroed the retry BUDGET, so a
             // client restarted with connect() kept a permanently empty budget and
-            // could never reconnect again — even though disconnect() already resets
-            // groupEstablished specifically to allow a restart. Stopping is
+            // could never reconnect again — even though disconnect() deliberately
+            // leaves the client restartable, keeping an established group to resume
+            // and emptying only the slots that must be re-bootstrapped. Stopping is
             // lifecycle state (cleared by connect()); the budget is configuration.
             const OriginalWebSocket = global.WebSocket;
             const constructions = installStaysOpenWebSocket();
@@ -1297,6 +1303,121 @@ describe('CollabClient MLS group lifecycle across reconnect', () => {
         expect((client as any).doc).toBeNull();
 
         client.disconnect();
+    });
+
+    // A vault-sync joiner (#32): the file group and the manifest group are
+    // bootstrapped together, but their Welcomes arrive INDEPENDENTLY — which is
+    // the only way a client ends up half-joined.
+    function makeVaultJoinerConfig(): CollabClientConfig {
+        return makeDefaultConfig({
+            userId: 'bob',
+            role: 'joiner',
+            vaultSync: { apply_remote_manifest: (): string[] => [] },
+            manifestDocId: 'manifest1',
+        });
+    }
+
+    function deliverWelcome(client: CollabClient, docId: string, payload: number[]): void {
+        (client as any).ws?.onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                message_type: 'welcome',
+                doc_id: docId,
+                payload,
+            }),
+        });
+    }
+
+    /** Every key_package frame this socket sent for `docId`. */
+    function keyPackagesFor(ws: { sentMessages: string[] }, docId: string): unknown[] {
+        return ws.sentMessages
+            .map((m) => JSON.parse(m))
+            .filter(
+                (p) =>
+                    p.type === 'mls_handshake' &&
+                    p.message_type === 'key_package' &&
+                    p.doc_id === docId
+            );
+    }
+
+    it('re-bootstraps ONLY the un-joined slot when a half-joined vault-sync joiner reconnects', async () => {
+        // A vaultSync joiner received the FILE Welcome but never the manifest
+        // one. disconnect() releases the still-unconsumed manifest key package,
+        // so the next connect() MUST re-bootstrap that slot. An all-or-nothing
+        // latch over BOTH groups skipped it: the manifest group stayed
+        // permanently unjoinable — sendManifestUpdate false forever, and every
+        // inbound manifest frame throwing "no MLS group established".
+        (generate_key_package as unknown as jest.Mock).mockClear();
+        const client = new CollabClient(makeVaultJoinerConfig());
+        await connectClient(client);
+
+        // Both slots shipped a key package; only the file Welcome comes back.
+        expect(generate_key_package as unknown as jest.Mock).toHaveBeenCalledTimes(2);
+        deliverWelcome(client, 'doc1', [1, 2]);
+        expect((client as any).doc).not.toBeNull();
+        expect((client as any).manifestDoc).toBeNull();
+        expect((client as any).manifestPending).not.toBeNull();
+
+        client.disconnect();
+        // The un-joined slot's key package was released, so it must be re-minted.
+        expect((client as any).manifestPending).toBeNull();
+
+        await connectClient(client);
+        const ws = (client as any).ws;
+        expect(keyPackagesFor(ws, 'manifest1')).toHaveLength(1);
+        // ...and the SURVIVING file group is resumed, never re-bootstrapped: a
+        // second key package for doc1 would leak a pending whose Welcome the
+        // already-joined guard then rejects.
+        expect(keyPackagesFor(ws, 'doc1')).toHaveLength(0);
+        expect(generate_key_package as unknown as jest.Mock).toHaveBeenCalledTimes(3);
+
+        // The manifest Welcome now lands on a live pending: the group works.
+        deliverWelcome(client, 'manifest1', [3, 4]);
+        expect((client as any).manifestDoc).not.toBeNull();
+        expect(client.sendManifestUpdate(new Uint8Array([5]))).toBe(true);
+
+        client.destroy();
+    });
+
+    it('undoing a failed bootstrap does NOT free the other slot’s surviving group', async () => {
+        // Same half-joined joiner, but this time the manifest re-bootstrap
+        // throws. The teardown that undoes the failed attempt must free only
+        // what THIS attempt tried to bootstrap: freeing the file group that
+        // survived the disconnect would leave the client silently deaf on a
+        // document it is still a member of, with no way back but a new session.
+        const client = new CollabClient(makeVaultJoinerConfig());
+        await connectClient(client);
+        deliverWelcome(client, 'doc1', [1, 2]);
+        const fileDoc = (client as any).doc;
+        expect(fileDoc).not.toBeNull();
+        client.disconnect();
+
+        (generate_key_package as unknown as jest.Mock).mockImplementationOnce(() => {
+            throw new Error('key package generation failed');
+        });
+        const connectPromise = client.connect();
+        // runOnlyPendingTimers, not runAllTimers: the rejection schedules a
+        // retry whose second attempt would succeed and hide the state under test.
+        jest.runOnlyPendingTimers();
+        await expect(connectPromise).rejects.toThrow('key package generation failed');
+
+        expect((client as any).doc).toBe(fileDoc);
+        expect(fileDoc.free).not.toHaveBeenCalled();
+
+        client.destroy();
+    });
+
+    it('refuses to connect() after destroy()', async () => {
+        // destroy() ends the session and frees the groups, leaving slot state
+        // indistinguishable from a never-connected client. Without a latch the
+        // next connect() would bootstrap a FRESH epoch-0 solo group, divergent
+        // from every other member and announced with a TOFU registration the
+        // relay rejects. Fail closed instead.
+        const client = new CollabClient(makeDefaultConfig());
+        await connectClient(client);
+        client.destroy();
+
+        await expect(client.connect()).rejects.toThrow('destroyed');
     });
 });
 

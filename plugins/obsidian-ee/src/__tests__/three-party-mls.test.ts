@@ -106,7 +106,10 @@ describe('three-party MLS: the add-commit reaches existing members', () => {
         if (!trio) {
             return;
         }
-        [trio.alice, trio.bob, trio.carol].forEach((t) => t.client.disconnect());
+        // destroy(), not disconnect(): these clients hold REAL wasm groups, which
+        // disconnect() deliberately keeps alive for a resume — three leaked docs
+        // per test.
+        [trio.alice, trio.bob, trio.carol].forEach((t) => t.client.destroy());
         trio = undefined;
         await wait(50);
     });
