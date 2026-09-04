@@ -10,23 +10,23 @@
 Gate tooling, so `cargo xtask gates` runs the full set rather than skipping rows:
 
 ```bash
-cargo +stable install cargo-deny --locked --version 0.20.2
+cargo install cargo-deny --locked --version 0.20.2
 brew install shellcheck actionlint   # or any prebuilt equivalent
 ```
 
-**The `+stable` is required, not decorative.** `rust-toolchain.toml` pins the
-1.87 MSRV, and that pin applies to every cargo command run inside this
-directory — including installs of tools that are not workspace artifacts. Plain
-`cargo install cargo-deny` therefore fails with "requires rustc 1.88.0 or
-newer". rustup resolves `+toolchain` ahead of the directory pin, so `+stable`
-builds the tool with your default toolchain while leaving the workspace pin
-untouched. Do **not** reach for `RUSTUP_TOOLCHAIN` to achieve this — it
-outranks the pin for *every* subsequent command, which is the over-reach
-removed in `fd5beed` (it silently compiled the committed WASM bindings with
-whatever compiler the contributor happened to have).
+Pin the version: it is the one `ci.yml` installs, and `cargo xtask gates` runs
+the same `cargo deny check` CI does.
 
-`brew install cargo-deny` also works and is faster (prebuilt bottle, same
-0.20.2), but is macOS-only; the cargo command above is the portable one.
+**If a tool ever refuses to install with "requires rustc X or newer":**
+`rust-toolchain.toml` pins the build toolchain, and that pin governs *every*
+cargo command run inside this directory — including installs of tools that are
+not workspace artifacts. This bit once, while the file still pinned the 1.87
+MSRV. Fix it with `cargo +stable install <tool>`, since rustup resolves
+`+toolchain` above the file and only for that command. Do **not** reach for
+`RUSTUP_TOOLCHAIN`: it outranks the pin for every *subsequent* command too,
+which is the over-reach `fd5beed` removed from `build-wasm.sh` after it
+compiled the WASM bindings with whatever compiler the contributor happened to
+have. `brew install cargo-deny` is a faster prebuilt alternative, but macOS-only.
 
 ## Quick Start
 

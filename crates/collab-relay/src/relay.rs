@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     /// A capability minted for a DIFFERENT doc is rejected on this doc (the
-    /// capability's own doc_id does not match the subscribe target).
+    /// capability's own `doc_id` does not match the subscribe target).
     #[tokio::test]
     async fn test_authz_rejects_capability_for_other_doc() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;

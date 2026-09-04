@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
 
@@ -47,8 +47,16 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
 
+      # `+1.87.0` is load-bearing. rust-toolchain.toml pins the BUILD toolchain
+      # and outranks whatever `dtolnay/rust-toolchain` sets as the rustup
+      # default, so a bare `cargo check` here would run the pinned toolchain and
+      # this job would verify the same thing as `check` — which is exactly what
+      # it did while the file pinned 1.87.0, making the MSRV trivially "true".
+      # rustup resolves `+toolchain` above the file, and only for this command.
+      # Do NOT switch to RUSTUP_TOOLCHAIN: that outranks the pin for every later
+      # command in the job (the over-reach removed in fd5beed).
       - name: Check workspace builds on the declared MSRV
-        run: cargo check --workspace --all-targets
+        run: cargo +1.87.0 check --workspace --all-targets
 
   test:
     name: Test
@@ -58,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -78,8 +86,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pinned MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.87.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -131,7 +139,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -174,8 +182,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pinned MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.87.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2

@@ -316,11 +316,9 @@ const GATES: &[(&str, &str, &str)] = &[
         "actionlint .github/workflows/release.yml .github/workflows/deploy.yml .github/workflows/integration.yml",
     ),
     // ci.yml gates on this, but it had never run locally, so a dependency
-    // advisory would surface only after a push. Install with
-    // `cargo +stable install cargo-deny --locked --version 0.20.2`: 0.20.2
-    // needs rustc 1.88 and rust-toolchain.toml pins the 1.87 MSRV, which
-    // applies to installs run inside this directory too. `+stable` outranks
-    // that pin for the one command without changing it for anything else.
+    // advisory would surface only after a push. Install it with
+    // `cargo install cargo-deny --locked --version 0.20.2` (see
+    // docs/development.md). Pin the version: it is the one CI installs.
     ("cargo-deny (advisories, bans, licenses, sources)", "cargo-deny", "cargo deny check"),
     ("M2 exit gate (cdk-synth-emits-four-stacks)", "", "bash tests/features/run-m2.sh"),
     ("CDK app type-check", "", "cd infra && npx --no-install tsc --noEmit"),

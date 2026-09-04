@@ -1,3 +1,22 @@
+# The BUILD toolchain — what everything compiles with, locally and in CI.
+#
+# This is NOT the MSRV. The MSRV is `rust-version` in Cargo.toml (1.87, forced by
+# openmls needing `u*::is_multiple_of`), and it is verified separately by ci.yml's
+# `msrv` job via `cargo +1.87.0 check`. The two numbers move independently: this
+# one tracks a recent stable so contributors get current diagnostics, that one is
+# a compatibility floor that only rises when a dependency forces it.
+#
+# They used to be the same number, which broke both halves. This file OUTRANKS
+# `rustup default`, so every CI job ran the MSRV no matter which toolchain its
+# `dtolnay/rust-toolchain` step installed — the `msrv` job verified the same
+# compiler as everything else, and nothing ever tested a newer one. It also
+# applies to `cargo install`, so installing a dev tool that needs a newer rustc
+# failed (see docs/development.md on `cargo +stable install`).
+#
+# Pin an exact version, never "stable": a floating channel means two contributors
+# compile the wasm bindings with different compilers. Bumping it is a deliberate,
+# reviewable edit — run `cargo clippy --workspace --all-targets --all-features`
+# after, since pedantic/nursery gain lints between releases.
 [toolchain]
-channel = "1.87.0"
+channel = "1.97.0"
 components = ["rustfmt", "clippy", "rust-analyzer"]
