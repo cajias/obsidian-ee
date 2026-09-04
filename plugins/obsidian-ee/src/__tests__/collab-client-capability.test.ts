@@ -75,6 +75,8 @@ const makeMockDoc = (docId: string) => ({
     decrypt_bytes: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([6])),
     create_invite: jest.fn(() => ({
         welcome: new Uint8Array([9, 9]),
+        // The commit EXISTING members must process to follow the new epoch.
+        commit: new Uint8Array([10, 10]),
         // A real create_invite advances the epoch and emits the anchor rotation
         // for the epoch it just created.
         rotation: {
@@ -347,6 +349,58 @@ describe('subscribe capability (#72)', () => {
         expect(reconnected[0].capability).toMatchObject({ user_id: 'user1', doc_id: 'doc1' });
     });
 
+    it('resumes the owner group across an explicit disconnect() -> connect()', async () => {
+        // MLS group state is long-lived and outlives the socket. An explicit
+        // disconnect() used to free it, so the next connect() built a FRESH
+        // epoch-0 group: divergent from every other member, and announced with a
+        // TOFU register_doc_key for a document the relay already anchors — which
+        // it rejects at the rotation-continuity check, followed by an epoch-0
+        // capability it rejects as Unauthorized. Same-process resume, not
+        // re-creation.
+        client = new CollabClient(makeConfig());
+        await connectClient(client);
+        expect(createdDocs).toHaveLength(1);
+
+        client.disconnect();
+        await connectClient(client);
+
+        expect(sockets).toHaveLength(2);
+        expect(createdDocs).toHaveLength(1);
+    });
+
+    it('sends no second TOFU registration after an explicit disconnect() -> connect()', async () => {
+        // The relay's anchor for this document already exists, and a second
+        // registration with an EMPTY rotation_proof fails the continuity check
+        // (crates/collab-relay/src/relay.rs, `handle_register_doc_key`). Exactly
+        // one registration is correct for the lifetime of the group.
+        client = new CollabClient(makeConfig());
+        await connectClient(client);
+
+        client.disconnect();
+        await connectClient(client);
+
+        const registrations = sockets.flatMap((s) =>
+            frames(s).filter((f) => f.type === 'register_doc_key')
+        );
+        expect(registrations).toHaveLength(1);
+    });
+
+    it('re-presents the surviving group capability after an explicit reconnect', async () => {
+        // Content has to flow again after the restart, which under subscribe
+        // authorization means the second socket's subscribe carries a capability
+        // minted by the SAME group — the one the relay's anchor still names.
+        client = new CollabClient(makeConfig());
+        await connectClient(client);
+
+        client.disconnect();
+        await connectClient(client);
+
+        const restarted = subscribes(sockets[1], 'doc1');
+        expect(restarted).toHaveLength(1);
+        expect(restarted[0].capability).toMatchObject({ user_id: 'user1', doc_id: 'doc1' });
+        expect(createdDocs[0].mint_subscribe_capability).toHaveBeenCalledTimes(2);
+    });
+
     it('settles the connect attempt when minting throws on reconnect', async () => {
         const errors: { type: string; message: string }[] = [];
         client = new CollabClient(makeConfig({ maxReconnectAttempts: 3 }));
@@ -431,11 +485,17 @@ describe('subscribe capability (#72)', () => {
         // must re-present its OWN capability at the new epoch before the Welcome
         // lets the joiner start sending, or it is unauthorized in the window
         // between the rotation and its own re-subscribe.
+        // The commit precedes the Welcome: the relay fans handshake frames out
+        // to every other subscriber in order, and the new member only no-ops the
+        // commit while it still has no group of its own.
         expect(emitted.map((f) => f.type)).toEqual([
             'register_doc_key',
             'subscribe',
             'mls_handshake',
+            'mls_handshake',
         ]);
+        expect(emitted[2]).toMatchObject({ message_type: 'commit', payload: [10, 10] });
+        expect(emitted[3]).toMatchObject({ message_type: 'welcome', payload: [9, 9] });
         expect(emitted[0]).toMatchObject({
             doc_id: 'doc1',
             epoch: 4,
