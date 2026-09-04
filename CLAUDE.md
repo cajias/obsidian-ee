@@ -121,3 +121,70 @@ Keep internal-crate APIs `pub(crate)` (not `pub`) so `rustc`'s `dead_code` lint 
 unused items — `pub` items in a workspace-internal crate are never reported as dead.
 Do not add speculative public surface "for later"; a test that exists only to exercise
 otherwise-unused code is a signal to delete the code, not keep it.
+
+## Current build state — aws-deploy
+
+Branch `feat/aws-deploy`, 9 commits, rebased onto `origin/main` (`f96fe69`) on
+2026-09-02, unpushed, no PR. Plan: `docs/design/aws-deploy/03-implementation-plan.md`
+(M1–M4). Design set `00`–`04` is ratified; changes to it are recorded as numbered
+"Plan change" notes inside the milestone sections.
+
+| Milestone | Commit | Gate | State |
+|---|---|---|---|
+| M1 STOPSIGNAL | `6ddc9bb` | `bash tests/features/run-m1.sh` | green at commit; needs a running Docker daemon to re-verify |
+| M2 CDK infra | `c95b961` | `bash tests/features/run-m2.sh` | **green, exit 0** |
+| M3 release + deploy | `f1ff1fc` | `bash tests/features/run-m3.sh` | code-complete; **exit 2 BLOCKED** on human steps |
+| M4 verified rollout | `b3a7046` | `bash tests/features/run-m4.sh` | harness + runbook shipped; **exit 2 BLOCKED** on human steps |
+
+Plus `254824a` (simplify pass), `5c92a7c` (design-integrity CI guard), `fd5beed`
+(toolchain fix + runbook move), `72f2655` (design-guard hook + `xtask gates`).
+
+**Nothing is blocked on the agent.** Every remaining step needs the maintainer's AWS
+account.
+
+### Verified green locally (no AWS needed)
+
+```bash
+cargo xtask gates    # all 8, cheapest first; last run 8/8 green
+```
+
+`GATES` in `xtask/src/main.rs` is the single source of truth, kept byte-identical to
+the matching `integration.yml` steps and covered by a test that fails if a gate names a
+file that no longer exists. It supersedes a six-command prose list that had drifted —
+it was missing the CDK app type-check (`npx --no-install tsc --noEmit`, the only type
+check in the pipeline) and shellcheck over the guard scripts. `run-m3.sh` / `run-m4.sh`
+stay out: they need AWS.
+
+### The one open item
+
+Residual **R1** is the only one not closed: its closing check is `handshake-returns-101`
+observed against a deployed target — a reading, not an artifact. It closes when the
+rollout runs green. Ledger is 5 closed / 1 pending, deliberately. Do not mark it closed
+without the reading.
+
+### Next actions, in order (all human)
+
+1. **Bootstrap AWS** — `docs/aws-deployment-plan.md` → `## Bootstrap runbook`, items 1–7.
+   Watch two things: pick a subnet that auto-assigns public IPs **and** sits in `${REGION}a`
+   (item 3); and item 7's `PUT /environments` is create-or-replace, so the branch/tag policy
+   and the staging reviewer go in the **same** body.
+2. **M3 halt steps 8–10** — mint `RELEASE_PLEASE_TOKEN`, `gh variable set` the repo and
+   per-env variables, run the first dev dispatch.
+3. **Verify M3**, then walk M4:
+   ```bash
+   export AWS_PROFILE=<profile> AWS_REGION=<region> RELAY_DOMAIN=<apex domain>
+   bash tests/features/run-m3.sh      # expects 101 from relay-dev
+   bash tests/features/run-m4.sh      # names the next outstanding step each run
+   ```
+   M4's ordered procedure: `docs/aws-deployment-plan.md` → `## Rollout runbook (M4)`.
+   `run-m4.sh` verifies the rollback drill but never issues it — that dispatch is a real
+   prod deploy and stays a human step.
+
+### Conventions this build follows (keep them)
+
+- BDD scenario names are a byte-frozen join key between `03` and `04`; `.feature` files are
+  verbatim copies. `design-integrity-guard.sh` enforces both in CI, and
+  `.claude/hooks/design-guard.mjs` enforces them at edit time.
+- Amending a ratified gate command requires a numbered **Plan change** note in `03` with the
+  empirical justification — see the four already there.
+- One commit per milestone, so `/code-review` and `/simplify` get a scoped diff.

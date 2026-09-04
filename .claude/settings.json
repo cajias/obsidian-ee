@@ -1,4 +1,33 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(rtk read *)",
+      "Bash(rtk git *)",
+      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      "mcp__plugin_context-mode_context-mode__ctx_execute",
+      "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index"
+    ]
+  },
+  "skillOverrides": {
+    "agent-trader-project-hub": "off",
+    "autoresearch-is-code-metric-optimizer": "off",
+    "build-prompt-generator": "off",
+    "claudeception": "off",
+    "create-readme": "off",
+    "design-phase-artifacts": "off",
+    "design-plan-docs": "off",
+    "documentation-writer": "off",
+    "infinite-gratitude": "off",
+    "iterative-build-loop": "off",
+    "notebooklm": "off",
+    "pptx": "off",
+    "quant-knowledge-pipeline": "off",
+    "quant-sota-inspiration": "off",
+    "using-nautilus-trader": "off",
+    "workers-best-practices": "off",
+    "workshop-handout-generator": "off",
+    "wrangler": "off"
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -26,6 +55,10 @@
           {
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rust-pub-guard.mjs"
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/design-guard.mjs"
           }
         ]
       }
