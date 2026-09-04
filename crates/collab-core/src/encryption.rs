@@ -379,4 +379,28 @@ mod tests {
             .expect("same doc id must restore");
         assert_eq!(restored.epoch(), doc_a.epoch());
     }
+
+    /// The SEAL side must bind the document's OWN id, not a constant.
+    ///
+    /// The tests above all seal under "docA", so on their own they cannot tell
+    /// "seal binds the id it was given" from "seal binds a literal that happens
+    /// to equal the fixture's id" — a hardcoded `"docA"` in `snapshot_encrypted`
+    /// passes every one of them. Sealing a DIFFERENT document and requiring that
+    /// it restore under its own id and fail under the other closes that.
+    #[test]
+    fn test_snapshot_binds_the_documents_own_id() {
+        let doc_b = EncryptedDocument::create("docB", "alice").unwrap();
+        let snapshot = doc_b.snapshot_encrypted(&SNAPSHOT_KEY).unwrap();
+
+        assert!(
+            EncryptedDocument::restore_encrypted("docB", &snapshot, &SNAPSHOT_KEY, 0)
+                .unwrap()
+                .is_some(),
+            "a docB snapshot must restore under docB"
+        );
+        assert!(
+            EncryptedDocument::restore_encrypted("docA", &snapshot, &SNAPSHOT_KEY, 0).is_err(),
+            "a docB snapshot must NOT restore under docA"
+        );
+    }
 }

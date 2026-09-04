@@ -405,6 +405,26 @@ mod tests {
         );
     }
 
+    // Scenario 3d: the SEAL side binds the id it was GIVEN, not a constant.
+    // Every other test here seals under DOC_ID ("docA"), so a hardcoded literal
+    // in `snapshot_encrypted` would satisfy all of them — the negatives still
+    // mismatch on open, the positives still match. Sealing under a different id
+    // is what pins the parameter as load-bearing.
+    #[test]
+    fn test_snapshot_binds_the_doc_id_it_was_given() {
+        let (alice, _bob) = two_member_group();
+        let snapshot = alice.snapshot_encrypted("docB", &KEY).unwrap();
+
+        assert!(
+            MlsDocumentGroup::restore_encrypted("docB", &snapshot, &KEY, 0).unwrap().is_some(),
+            "a docB snapshot must restore under docB"
+        );
+        assert!(
+            MlsDocumentGroup::restore_encrypted(DOC_ID, &snapshot, &KEY, 0).is_err(),
+            "a docB snapshot must NOT restore under docA"
+        );
+    }
+
     // Scenario 3c: POSITIVE control for 3b — the SAME doc id round-trips, so 3b
     // cannot pass merely because restore is broken for every doc id.
     #[test]
