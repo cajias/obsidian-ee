@@ -30,13 +30,14 @@
 //! below (issue #72). Before #72 that flow deadlocked: a joiner had to Subscribe
 //! to *receive* the `Welcome`, but could only mint a capability *after* joining.
 //!
-//! Runs both under `cargo test --workspace` (self-hosted relay, no Docker) and
-//! under `cargo xtask e2e` via `--include-ignored`. It is marked `#[ignore]` to
-//! keep it in the wire-test tier counted by the e2e gate.
+//! TAGGING — neither test here is `#[ignore]`d, deliberately. Both self-host
+//! their authz relay via `TestServer`, so neither needs Docker. They still run
+//! under the e2e gate (`cargo xtask e2e`), because `--include-ignored` is a
+//! superset: it runs untagged tests too. Tagging them would only hide them from
+//! a plain `cargo test --workspace` — coverage subtracted for nothing.
 //!
-//! Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
-//! (This test self-hosts its authz relay and does not use the Docker relay, but
-//! carries the tag so it lands in the `--include-ignored` wire-test tier.)
+//! The `#[ignore]`s in `full_flow.rs` and `fail_closed.rs` are the real thing:
+//! those hardcode `ws://localhost:8080/ws` and do need the Docker relay.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -80,7 +81,6 @@ fn foreign_group_at_epoch_1(doc_id: &str) -> EncryptedDocument {
 }
 
 #[tokio::test]
-#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
 #[allow(clippy::too_many_lines)]
 async fn test_non_member_subscribe_rejected_over_relay() {
     // Self-hosted relay with subscribe authorization ENABLED.
@@ -223,6 +223,10 @@ async fn test_non_member_subscribe_rejected_over_relay() {
 /// the join deadlocked), he receives the handshake but NOT that first update,
 /// AND only after he mints a capability at the anchor epoch and re-subscribes
 /// with it does relayed content reach him and decrypt.
+// DELIBERATELY NOT `#[ignore]`d — this is the default-run test defending the #72
+// mapping end to end: a capability-less subscribe grants the handshake and no
+// content. Tagging it would hide that defence from `cargo test --workspace` and
+// buy nothing (see the module-level TAGGING note).
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_joiner_bootstraps_and_gains_content_after_capability() {

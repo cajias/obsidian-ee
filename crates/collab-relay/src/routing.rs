@@ -1017,19 +1017,57 @@ mod tests {
     }
 
     /// A document with NO anchor has nobody content-authorized, so gated content
-    /// goes nowhere — fail closed, even for a subscriber carrying a stale
-    /// `Some(epoch)` from before the anchor was dropped.
+    /// goes nowhere — fail closed.
+    ///
+    /// `None` is the ONLY authorization state reachable on an unanchored doc:
+    /// `subscribe(.., Some(epoch))` is reached solely from `relay.rs` after
+    /// `authorize_subscribe` found an anchor, and anchors are never removed. So
+    /// this pins the handshake-only subscriber — the case the fail-closed `?` in
+    /// [`MessageRouter::recipients`] actually guards. Both a live and an offline
+    /// subscriber, so the offline queue is covered too.
     #[tokio::test]
-    async fn test_content_gating_without_anchor_delivers_nothing() {
+    async fn test_content_gating_without_anchor_withholds_from_handshake_only() {
         let router = MessageRouter::new();
         router.set_content_gating(true);
 
-        let (handle, mut rx) = create_test_client("bob", 1);
+        let (handle, mut rx) = create_test_client("eve", 1);
         router.register_client(handle, true).await;
-        assert!(router.subscribe("bob", "doc1", Some(1)).await);
+        assert!(router.subscribe("eve", "doc1", None).await);
+        assert!(router.subscribe("offline-eve", "doc1", None).await);
 
         assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 0);
         assert!(rx.try_recv().is_err(), "no anchor means nobody is content-authorized");
+        assert!(
+            !router.has_offline_messages("offline-eve").await,
+            "an unauthorized subscriber must not accumulate queued content either"
+        );
+    }
+
+    /// The other direction of the same re-statement: a BARE re-subscribe
+    /// DOWNGRADES an authorized subscriber back to handshake-only. This is what a
+    /// reconnecting client does if it forgets to re-present its capability — it
+    /// silently stops receiving content, so a client that reconnects must mint
+    /// and re-present, not just re-subscribe.
+    #[tokio::test]
+    async fn test_bare_resubscribe_downgrades_authorization() {
+        let router = MessageRouter::new();
+        router.set_content_gating(true);
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+
+        let (handle, mut rx) = create_test_client("member", 1);
+        router.register_client(handle, true).await;
+        assert!(router.subscribe("member", "doc1", Some(1)).await);
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 1);
+        assert!(rx.try_recv().is_ok());
+
+        // Reconnect, re-subscribe, present nothing.
+        assert!(router.subscribe("member", "doc1", None).await);
+
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(2)).await, 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "a bare re-subscribe drops content authorization back to handshake-only"
+        );
     }
 
     /// Re-subscribing re-states authorization: this is how a joiner upgrades from

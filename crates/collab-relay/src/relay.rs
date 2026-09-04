@@ -847,6 +847,8 @@ mod tests {
     use super::*;
     use futures::stream::{SplitSink, SplitStream};
     use futures::SinkExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
     use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
     /// Test helper for starting a server on a random port.
@@ -890,6 +892,26 @@ mod tests {
             Self { write, read }
         }
 
+        /// Connect and `Identify` as `user_id`, asserting the reply — the
+        /// three-line preamble every authz test opens with. Mirrors
+        /// `e2e_tests::helpers::TestClient::connect_as`.
+        async fn connect_as(server: &TestServer, user_id: &str) -> Self {
+            let mut client = Self::connect(server).await;
+            client.send(ClientMessage::Identify { user_id: user_id.into(), token: None }).await;
+            assert!(matches!(client.recv().await, ServerMessage::Identified { .. }));
+            client
+        }
+
+        /// `Subscribe` to [`AUTHZ_DOC`] with `capability`, asserting it succeeds.
+        async fn subscribe_ok(&mut self, capability: SubscribeCapability) {
+            self.send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(capability),
+            })
+            .await;
+            assert!(matches!(self.recv().await, ServerMessage::Subscribed { .. }));
+        }
+
         async fn send(&mut self, msg: ClientMessage) {
             let json = serde_json::to_string(&msg).unwrap();
             self.write.send(Message::Text(json)).await.unwrap();
@@ -903,7 +925,23 @@ mod tests {
                 return serde_json::from_str(&text).unwrap();
             }
         }
+
+        /// Receive within `duration`, returning `None` only on a real timeout —
+        /// the shape of `e2e_tests::helpers::TestClient::try_recv`. Needed to
+        /// assert a message does NOT arrive; `recv` would block forever.
+        async fn try_recv(&mut self, duration: Duration) -> Option<ServerMessage> {
+            match timeout(duration, self.read.next()).await {
+                Err(_elapsed) => None,
+                Ok(Some(Ok(Message::Text(text)))) => Some(serde_json::from_str(&text).unwrap()),
+                Ok(other) => panic!("unexpected websocket frame: {other:?}"),
+            }
+        }
     }
+
+    /// Long enough that a delivery the relay actually made lands, short enough
+    /// that asserting absence stays cheap. Absence is only ever asserted AFTER a
+    /// positive control has received the same fan-out, so this is not a race.
+    const QUIET: Duration = Duration::from_millis(300);
 
     #[tokio::test]
     async fn test_client_connects() {
@@ -1177,6 +1215,13 @@ mod tests {
     /// can it mint a capability. It is not content-authorized by this subscribe —
     /// the router withholds `YrsUpdate` from it (see the routing.rs content-gating
     /// tests and the `subscribe_authz` wire test).
+    ///
+    /// Asserting the `Subscribed` reply alone is not enough: a mutation storing
+    /// the capability-less subscribe as `Some(anchor.epoch)` still replies
+    /// `Subscribed`. So this drives a real `YrsUpdate` through and asserts the
+    /// CONTENT half — with a content-authorized `member2` as the positive
+    /// control. Fan-out is one synchronous pass, so once `member2` holds the
+    /// update the gating decision for `joiner` has already been made.
     #[tokio::test]
     async fn test_authz_missing_capability_subscribes_handshake_only() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
@@ -1198,6 +1243,34 @@ mod tests {
             joiner.recv().await,
             ServerMessage::Subscribed { doc_id } if doc_id == AUTHZ_DOC
         ));
+
+        // Positive control: a second member subscribed WITH a valid capability.
+        let mut member2 = TestClient::connect(&server).await;
+        member2.send(ClientMessage::Identify { user_id: "member2".into(), token: None }).await;
+        assert!(matches!(member2.recv().await, ServerMessage::Identified { .. }));
+        member2
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member2")),
+            })
+            .await;
+        assert!(matches!(member2.recv().await, ServerMessage::Subscribed { .. }));
+
+        member
+            .send(ClientMessage::YrsUpdate {
+                doc_id: AUTHZ_DOC.into(),
+                encrypted: vec![1, 2, 3],
+                epoch: AUTHZ_EPOCH,
+            })
+            .await;
+        assert!(
+            matches!(member2.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a content-authorized subscriber must still receive the update"
+        );
+        assert!(
+            joiner.try_recv(QUIET).await.is_none(),
+            "a capability-less subscribe authorizes the handshake only: no content"
+        );
     }
 
     /// With authz on, a subscribe carrying a capability that FAILS verification
@@ -1226,7 +1299,13 @@ mod tests {
         ));
     }
 
-    /// A capability signed by a NON-anchor key (a non-member) is rejected.
+    /// A capability signed by a NON-anchor key (a non-member) is rejected — and
+    /// the rejection means no subscription, so no content reaches Eve either.
+    ///
+    /// The second half is the load-bearing one: a mutation that sends
+    /// `Unauthorized` but still subscribes Eve content-authorized passes the
+    /// reply assertion. `member2` is the positive control that proves the update
+    /// was fanned out at all.
     #[tokio::test]
     async fn test_authz_rejects_non_member_capability() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
@@ -1251,6 +1330,34 @@ mod tests {
             eve.recv().await,
             ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
         ));
+
+        // Positive control: a second member subscribed WITH a valid capability.
+        let mut member2 = TestClient::connect(&server).await;
+        member2.send(ClientMessage::Identify { user_id: "member2".into(), token: None }).await;
+        assert!(matches!(member2.recv().await, ServerMessage::Identified { .. }));
+        member2
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member2")),
+            })
+            .await;
+        assert!(matches!(member2.recv().await, ServerMessage::Subscribed { .. }));
+
+        member
+            .send(ClientMessage::YrsUpdate {
+                doc_id: AUTHZ_DOC.into(),
+                encrypted: vec![4, 5, 6],
+                epoch: AUTHZ_EPOCH,
+            })
+            .await;
+        assert!(
+            matches!(member2.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a content-authorized subscriber must still receive the update"
+        );
+        assert!(
+            eve.try_recv(QUIET).await.is_none(),
+            "a REJECTED capability must leave no subscription and deliver no content"
+        );
     }
 
     /// A capability minted for a DIFFERENT doc is rejected on this doc (the
@@ -1417,16 +1524,20 @@ mod tests {
 
     /// Rotation continuity POSITIVE (PR #73 review): a rotation authorized by the
     /// CURRENT anchor key succeeds. The new anchor (new key + higher epoch) then
-    /// governs subscribe.
+    /// governs subscribe — AND revokes content for a subscriber still authorized
+    /// at the old epoch, which is the half that matters for a removed member.
     #[tokio::test]
     async fn test_register_doc_key_accepts_rotation_signed_by_current_key() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
         let member_signer = member_key();
 
-        let mut member = TestClient::connect(&server).await;
-        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
-        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        let mut member = TestClient::connect_as(&server, "member").await;
         register_anchor(&mut member, &member_signer).await;
+
+        // A second member subscribes NOW, at epoch 1, and is not told about the
+        // rotation about to happen — the removed-member shape.
+        let mut stale = TestClient::connect_as(&server, "stale").await;
+        stale.subscribe_ok(cap_for(&member_signer, "stale")).await;
 
         // Rekey: the member now holds the epoch-2 exporter key and rotates to it,
         // authorizing the rotation with a continuity proof under the CURRENT
@@ -1452,12 +1563,26 @@ mod tests {
         // new key at epoch 2 subscribes.
         let new_epoch_cap =
             sign_subscribe_capability(&next_signer, "member", AUTHZ_DOC, AUTHZ_EPOCH + 1, u64::MAX);
-        member
-            .send(ClientMessage::Subscribe {
+        member.subscribe_ok(new_epoch_cap).await;
+
+        // Content half: `stale` keeps its subscription across the rotation but its
+        // stored epoch no longer matches the anchor, so post-rotation content is
+        // withheld. `member` (re-authorized at epoch 2) is the positive control.
+        let mut sender = TestClient::connect_as(&server, "sender").await;
+        sender
+            .send(ClientMessage::YrsUpdate {
                 doc_id: AUTHZ_DOC.into(),
-                capability: Some(new_epoch_cap),
+                encrypted: vec![7, 8, 9],
+                epoch: AUTHZ_EPOCH + 1,
             })
             .await;
-        assert!(matches!(member.recv().await, ServerMessage::Subscribed { .. }));
+        assert!(
+            matches!(member.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a member re-authorized at the NEW epoch still receives content"
+        );
+        assert!(
+            stale.try_recv(QUIET).await.is_none(),
+            "a rotation revokes content for a subscriber authorized at the OLD epoch"
+        );
     }
 }
