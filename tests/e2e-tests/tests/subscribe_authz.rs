@@ -31,9 +31,14 @@
 //! the exporter secret, as in `collab-core`'s `two_member_group`), and the #29
 //! authorization gate is exercised over the real wire.
 //!
-//! Runs both under `cargo test --workspace` (self-hosted relay, no Docker) and
-//! under `cargo xtask e2e` via `--include-ignored`. It is marked `#[ignore]` to
-//! keep it in the wire-test tier counted by the e2e gate.
+//! The second test in this file covers the OTHER half of the same gate: what
+//! happens to those capabilities once the group rekeys, and the anchor rotation
+//! that has to accompany it. See
+//! `test_anchor_rotation_unwedges_a_rekeyed_document`.
+//!
+//! Both self-host their authz relay, so neither needs Docker — but both are
+//! `#[ignore]`d, which keeps them in the `--include-ignored` wire-test tier the
+//! e2e gate counts and OUT of a plain `cargo test --workspace` run.
 //!
 //! Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
 //! (This test self-hosts its authz relay and does not use the Docker relay, but
@@ -41,7 +46,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use collab_core::{EncryptedDocument, Invite, MlsDocumentGroup};
+use collab_core::{AnchorRotation, EncryptedDocument, Invite, MlsDocumentGroup};
 use collab_proto::{ClientMessage, DocumentId, ErrorCode, ServerMessage};
 use collab_relay::RelayServer;
 use e2e_tests::helpers::{TestClient, TestServer};
@@ -61,7 +66,13 @@ fn two_real_members(doc_id: &str) -> (EncryptedDocument, EncryptedDocument) {
     let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
     let invite = alice_doc.create_invite(bob_pending.key_package()).unwrap();
     let bob_doc = EncryptedDocument::join(
-        &Invite { doc_id: doc_id.to_string(), welcome: invite.welcome, commit: vec![], epoch: 1 },
+        &Invite {
+            doc_id: doc_id.to_string(),
+            welcome: invite.welcome,
+            commit: vec![],
+            epoch: 1,
+            rotation: None,
+        },
         bob_pending,
     )
     .unwrap();
@@ -204,4 +215,208 @@ async fn test_non_member_subscribe_rejected_over_relay() {
     // so the fanned-out update never reaches her.
     let eve_saw = eve.try_recv(Duration::from_secs(2)).await.unwrap();
     assert!(eve_saw.is_none(), "a rejected non-member must receive no YrsUpdate; got {eve_saw:?}");
+}
+
+/// An outsider's own group on the same `doc_id`, advanced to epoch 2 so it emits
+/// a rotation that is internally consistent — valid self-proof, right document,
+/// right target epoch — but signed by a key that is NOT the relay's stored anchor.
+fn foreign_rotation_to_epoch_2(doc_id: &str) -> AnchorRotation {
+    let mut eve_doc = foreign_group_at_epoch_1(doc_id);
+    let eve_device = MlsDocumentGroup::generate_key_package("eve-device-2").unwrap();
+    let invite = eve_doc.create_invite(eve_device.key_package()).unwrap();
+    assert_eq!(eve_doc.epoch(), 2, "Eve's group must reach the epoch it is trying to rotate to");
+    invite.rotation.expect("create_invite must emit an anchor rotation")
+}
+
+/// Assert the relay rejected a `RegisterDocKey` at the ROTATION check specifically.
+/// A bad self-proof is also `Unauthorized`, so the code alone would pass for the
+/// wrong reason — the message is the positive reading of which gate fired.
+async fn assert_rotation_rejected(client: &mut TestClient, context: &str) {
+    match client.recv().await.unwrap() {
+        ServerMessage::Error { code: ErrorCode::Unauthorized, message } => assert!(
+            message.contains("rotation"),
+            "{context}: expected the rotation-continuity check to reject it, got: {message}"
+        ),
+        other => panic!("{context}: expected Unauthorized, got {other:?}"),
+    }
+}
+
+/// The wedge this makes escapable (issue #29 follow-up): once the group rekeys,
+/// members mint capabilities at the new epoch while the relay's anchor is still
+/// the old one, so every capability fails — and only a holder of the OUTGOING
+/// epoch's key can authorize the rotation that fixes it. That key exists solely
+/// inside the commit call, so the proof is emitted there.
+///
+/// GIVEN a relay with subscribe authorization ENABLED and an anchor registered at
+/// epoch 1, WHEN a membership change advances the group to epoch 2, THEN a real
+/// member's epoch-2 capability is REJECTED until the anchor is rotated; an
+/// outsider's internally-consistent rotation and a rotation proof minted for a
+/// DIFFERENT document are both REJECTED; and the rotation emitted by the commit
+/// itself is ACCEPTED, after which epoch-2 capabilities work and content flows.
+#[tokio::test]
+#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
+#[allow(clippy::too_many_lines)]
+async fn test_anchor_rotation_unwedges_a_rekeyed_document() {
+    let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+    let url = server.url().to_owned();
+    let doc_id: DocumentId = "anchor-rotation-doc".to_string();
+    let other_doc: DocumentId = "anchor-rotation-other-doc".to_string();
+    let secret = "members only: still readable after the rekey";
+
+    let (mut alice_doc, _bob_doc) = two_real_members(&doc_id);
+    let mut alice = TestClient::connect_as(&url, "alice").await.unwrap();
+
+    // --- The owner registers the epoch-1 anchor (TOFU) for BOTH documents ----
+    // `other_doc` carries the same key under its own self-proof and exists only
+    // so a rotation proof can be presented against a document it was not minted
+    // for (negative (b) below).
+    for target in [&doc_id, &other_doc] {
+        alice
+            .send(&ClientMessage::RegisterDocKey {
+                doc_id: target.clone(),
+                epoch: alice_doc.epoch(),
+                public_key: alice_doc.subscribe_verifying_key().unwrap().to_vec(),
+                proof: alice_doc.sign_doc_key_proof(target).unwrap(),
+                rotation_proof: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Baseline: an epoch-1 capability is accepted. Awaiting `Subscribed` also
+    // flushes the two silent registrations above — one connection, FIFO handling.
+    let now = now_unix();
+    alice
+        .send(&ClientMessage::Subscribe {
+            doc_id: doc_id.clone(),
+            capability: Some(
+                alice_doc.mint_subscribe_capability("alice", &doc_id, now, TTL_SECS).unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(alice.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+        "the epoch-1 capability must be accepted against the epoch-1 anchor"
+    );
+
+    // --- A membership change advances the group to epoch 2 -------------------
+    let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
+    let invite = alice_doc.create_invite(carol_pending.key_package()).unwrap();
+    let rotation = invite.rotation.expect("create_invite must emit the anchor rotation");
+    let mut carol_doc = EncryptedDocument::join(
+        &Invite {
+            doc_id: doc_id.clone(),
+            welcome: invite.welcome,
+            commit: vec![],
+            epoch: 2,
+            rotation: None,
+        },
+        carol_pending,
+    )
+    .unwrap();
+    assert_eq!(alice_doc.epoch(), 2, "the add-commit must advance the owner to epoch 2");
+    assert_eq!(carol_doc.epoch(), 2, "the new member joins at epoch 2");
+    assert_eq!(rotation.epoch, 2, "the rotation must name the epoch just created");
+
+    // --- THE WEDGE: epoch-2 capabilities fail while the anchor is still at 1 --
+    let mut carol = TestClient::connect_as(&url, "carol").await.unwrap();
+    carol
+        .send(&ClientMessage::Subscribe {
+            doc_id: doc_id.clone(),
+            capability: Some(
+                carol_doc.mint_subscribe_capability("carol", &doc_id, now, TTL_SECS).unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            carol.recv().await.unwrap(),
+            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
+        ),
+        "a real member's epoch-2 capability must fail against the stale epoch-1 anchor"
+    );
+
+    // --- Negative (a): an outsider's internally-consistent rotation ----------
+    // Eve's self-proof is valid for her own key and the rotation names the right
+    // document and epoch — only the CONTINUITY signature is under the wrong key.
+    let mut eve = TestClient::connect_as(&url, "eve").await.unwrap();
+    let eve_rotation = foreign_rotation_to_epoch_2(&doc_id);
+    eve.send(&ClientMessage::RegisterDocKey {
+        doc_id: doc_id.clone(),
+        epoch: eve_rotation.epoch,
+        public_key: eve_rotation.public_key.to_vec(),
+        proof: eve_rotation.proof,
+        rotation_proof: eve_rotation.rotation_proof,
+    })
+    .await
+    .unwrap();
+    assert_rotation_rejected(&mut eve, "a non-member's rotation of someone else's anchor").await;
+
+    // --- Negative (b): the right proof, presented for the WRONG document -----
+    // Same signer, same target epoch, same new key, valid self-proof for
+    // `other_doc` — but the continuity proof binds `doc_id`, so it must fail.
+    alice
+        .send(&ClientMessage::RegisterDocKey {
+            doc_id: other_doc.clone(),
+            epoch: rotation.epoch,
+            public_key: rotation.public_key.to_vec(),
+            proof: alice_doc.sign_doc_key_proof(&other_doc).unwrap(),
+            rotation_proof: rotation.rotation_proof.clone(),
+        })
+        .await
+        .unwrap();
+    assert_rotation_rejected(&mut alice, "a rotation proof minted for another document").await;
+
+    // --- Positive: the rotation the commit itself emitted --------------------
+    alice
+        .send(&ClientMessage::RegisterDocKey {
+            doc_id: doc_id.clone(),
+            epoch: rotation.epoch,
+            public_key: rotation.public_key.to_vec(),
+            proof: rotation.proof,
+            rotation_proof: rotation.rotation_proof,
+        })
+        .await
+        .unwrap();
+
+    // Success is silent, so the owner's epoch-2 subscribe is what proves the
+    // anchor moved (and flushes the registration on the way).
+    alice
+        .send(&ClientMessage::Subscribe {
+            doc_id: doc_id.clone(),
+            capability: Some(
+                alice_doc.mint_subscribe_capability("alice", &doc_id, now, TTL_SECS).unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(alice.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+        "after the rotation the anchor must accept an epoch-2 capability"
+    );
+
+    carol
+        .send(&ClientMessage::Subscribe {
+            doc_id: doc_id.clone(),
+            capability: Some(
+                carol_doc.mint_subscribe_capability("carol", &doc_id, now, TTL_SECS).unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(carol.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+        "the member wedged out a moment ago must now subscribe with the same epoch-2 capability"
+    );
+
+    // --- Content flows again over the rotated anchor -------------------------
+    alice_doc.insert(0, secret);
+    let update = alice_doc.get_encrypted_update().unwrap();
+    alice.send_update(&doc_id, &update).await.unwrap();
+
+    let carol_op = carol.recv_update().await.unwrap();
+    carol_doc.apply_encrypted_update(&carol_op).unwrap();
+    assert_eq!(carol_doc.get_content(), secret, "the re-authorized member must decrypt the update");
 }

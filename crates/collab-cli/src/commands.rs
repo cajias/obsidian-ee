@@ -477,8 +477,15 @@ async fn run_session(
     // Bob receives the welcome and joins the group (a 2-party joiner reads only
     // the welcome — correct MLS semantics; the KeyPackage genuinely crossed the wire).
     let welcome = bob.recv_mls(MlsMessageType::Welcome).await?;
-    let bob_invite =
-        collab_core::Invite { doc_id: doc_id.to_string(), welcome, commit: vec![], epoch: 1 };
+    // A joiner-side reconstruction: no commit and no anchor rotation — Bob holds
+    // no outgoing-epoch key to sign one with.
+    let bob_invite = collab_core::Invite {
+        doc_id: doc_id.to_string(),
+        welcome,
+        commit: vec![],
+        epoch: 1,
+        rotation: None,
+    };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
 
     // Alice writes the text and publishes the encrypted update.

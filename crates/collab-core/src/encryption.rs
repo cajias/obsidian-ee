@@ -1,5 +1,6 @@
 //! Encrypted document wrapper combining Yrs CRDT with MLS encryption.
 
+use crate::mls::AnchorRotation;
 use crate::{CollabDocument, DocumentId, MlsDocumentGroup, PendingMember, Result};
 
 /// An encrypted collaborative document.
@@ -122,9 +123,17 @@ impl EncryptedDocument {
     ///
     /// Returns an error if creating the invite fails.
     pub fn create_invite(&mut self, key_package: &[u8]) -> Result<Invite> {
-        let (commit, welcome) = self.mls.add_member(key_package)?;
+        // `self.doc.id()` is the LOCALLY-TRUSTED document id — never a value read
+        // off the wire — which is what the emitted rotation proof binds.
+        let (commit, welcome, rotation) = self.mls.add_member(key_package, self.doc.id())?;
 
-        Ok(Invite { doc_id: self.doc.id().to_string(), welcome, commit, epoch: self.mls.epoch() })
+        Ok(Invite {
+            doc_id: self.doc.id().to_string(),
+            welcome,
+            commit,
+            epoch: self.mls.epoch(),
+            rotation: Some(rotation),
+        })
     }
 
     /// Process a commit message from another member (e.g., when a new member is added).
@@ -137,8 +146,8 @@ impl EncryptedDocument {
     /// # Errors
     ///
     /// Returns an error if processing the commit fails.
-    pub fn process_commit(&mut self, commit: &[u8]) -> Result<()> {
-        self.mls.process_commit(commit)
+    pub fn process_commit(&mut self, commit: &[u8]) -> Result<AnchorRotation> {
+        self.mls.process_commit(commit, self.doc.id())
     }
 
     /// Owner-only: remove the member identified by `member_user_id`, advancing
@@ -149,8 +158,8 @@ impl EncryptedDocument {
     ///
     /// Returns an error if this member is not the owner, the target is not a
     /// current member (or is the owner), or the MLS operation fails.
-    pub fn remove_member(&mut self, member_user_id: &str) -> Result<Vec<u8>> {
-        self.mls.remove_member(member_user_id)
+    pub fn remove_member(&mut self, member_user_id: &str) -> Result<(Vec<u8>, AnchorRotation)> {
+        self.mls.remove_member(member_user_id, self.doc.id())
     }
 
     /// True iff this member created the document's group (is the owner).
@@ -254,6 +263,13 @@ pub struct Invite {
     /// MLS epoch at which this invite was created (after `add_member`).
     /// Used to detect stale invites when this epoch does not match the current group epoch.
     pub epoch: u64,
+    /// The anchor rotation the add-commit created (issue #29). `Some` when the
+    /// owner produced this invite via [`EncryptedDocument::create_invite`] —
+    /// send it to the relay as `RegisterDocKey` so subscribe capabilities minted
+    /// at the new epoch keep verifying. `None` on a joiner-side reconstruction
+    /// from bare Welcome bytes, which carries no rotation (as `commit` there is
+    /// likewise empty): a joiner holds no outgoing-epoch key to sign one.
+    pub rotation: Option<AnchorRotation>,
 }
 
 #[cfg(test)]
