@@ -287,10 +287,12 @@ fn check_function_complexity(space: &serde_json::Value) -> Option<String> {
 /// `integration.yml`, in cheapest-first order. Each entry is
 /// (label, optional required binary, shell command).
 ///
-/// The command strings are kept BYTE-IDENTICAL to the corresponding workflow
-/// steps so drift between this runner and CI shows up in a plain diff. The list
-/// this replaces lived only as prose in CLAUDE.local.md, where running five of
-/// the six and calling it green cost nothing.
+/// The command strings are written to match the corresponding workflow steps
+/// verbatim, so the two can be compared by eye. Nothing enforces that — the test
+/// below only checks that the files a gate names still exist — so a reviewer
+/// changing a step in `integration.yml` has to update this list by hand. The
+/// list this replaces lived only as prose in the untracked hand-off notes, where
+/// running five of the six and calling it green cost nothing.
 ///
 /// Ordering is load-bearing in one place: `run-m2.sh` installs
 /// `infra/node_modules`, so it must precede the two gates that need it — the

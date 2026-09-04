@@ -156,8 +156,8 @@ WS_URL="wss://relay-dev.collab.${RELAY_DOMAIN}/"
 if [ -n "${RELAY_TOKEN:-}" ]; then
   token=$RELAY_TOKEN
 elif ! token=$(aws ssm get-parameter --name /relay/dev/auth-token --with-decryption \
-                 --query Parameter.Value --output text 2>&1); then
-  printf '%s\n' "$token" >&2
+                 --query Parameter.Value --output text 2>"$log"); then
+  cat "$log" >&2
   cat <<'EOF'
 BLOCKED: cannot read the dev token from SSM at /relay/dev/auth-token.
 Outstanding human step: the bootstrap runbook's token step must have run, and the
@@ -210,8 +210,16 @@ EOF
   exit 2
 fi
 
-prior_digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
-  --image-ids "imageTag=$PRIOR_TAG" --query 'imageDetails[0].imageDigest' --output text)
+# Classified like every other AWS read here: unguarded, a missing $PRIOR_TAG aborts
+# under `set -e` with a raw botocore traceback, right after (a)-(c) printed OK — which
+# reads as an infrastructure glitch rather than "the rollback target is gone".
+if ! prior_digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$PRIOR_TAG" --query 'imageDetails[0].imageDigest' --output text 2>"$log"); then
+  cat "$log" >&2
+  echo "FAIL: no image tagged $PRIOR_TAG in $ECR_REPOSITORY, so the rollback drill cannot be verified." >&2
+  echo "The release image is the rollback target; if it expired, re-cut the release." >&2
+  exit 1
+fi
 instance=$(aws ec2 describe-instances \
   --filters Name=tag:RelayEnv,Values=prod Name=instance-state-name,Values=running \
   --query 'Reservations[].Instances[].InstanceId' --output text)

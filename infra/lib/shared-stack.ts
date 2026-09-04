@@ -33,7 +33,25 @@ export class SharedStack extends cdk.Stack {
       repositoryName: 'obsidian-ee/collab-relay',
       imageTagMutability: ecr.TagMutability.IMMUTABLE,
       imageScanOnPush: true,
-      lifecycleRules: [{ maxImageCount: 25 }],
+      // Release images are the documented rollback target: the M4 runbook rolls
+      // back with `deploy.yml -f environment=prod --ref v0.1.0`, which promotes
+      // the digest that tag points at. A single `maxImageCount` rule counts them
+      // together with every dev/staging `sha-` image, so ~25 dispatches expired
+      // the release the runbook tells you to roll back to. A promoted image
+      // carries both its `sha-` and `v` tags; ECR applies the FIRST matching
+      // rule, so giving `v` its own longer budget keeps releases off the churn
+      // rule. deploy.yml refuses to rebuild a missing prod image, so an expiry
+      // past this budget fails loudly rather than shipping an unvalidated digest.
+      lifecycleRules: [
+        {
+          rulePriority: 1,
+          description: 'Retain release images (the rollback target)',
+          tagStatus: ecr.TagStatus.TAGGED,
+          tagPrefixList: ['v'],
+          maxImageCount: 100,
+        },
+        { rulePriority: 2, description: 'Expire dev/staging churn', maxImageCount: 25 },
+      ],
     });
 
     this.zone = new route53.PublicHostedZone(this, 'CollabZone', {

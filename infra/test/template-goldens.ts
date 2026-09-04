@@ -40,7 +40,7 @@ export const TEMPLATE_GOLDENS: Record<string, unknown> = {
           },
           "ImageTagMutability": "IMMUTABLE",
           "LifecyclePolicy": {
-            "LifecyclePolicyText": "{\"rules\":[{\"rulePriority\":1,\"selection\":{\"tagStatus\":\"any\",\"countType\":\"imageCountMoreThan\",\"countNumber\":25},\"action\":{\"type\":\"expire\"}}]}"
+            "LifecyclePolicyText": "{\"rules\":[{\"rulePriority\":1,\"description\":\"Retain release images (the rollback target)\",\"selection\":{\"tagStatus\":\"tagged\",\"tagPrefixList\":[\"v\"],\"countType\":\"imageCountMoreThan\",\"countNumber\":100},\"action\":{\"type\":\"expire\"}},{\"rulePriority\":2,\"description\":\"Expire dev/staging churn\",\"selection\":{\"tagStatus\":\"any\",\"countType\":\"imageCountMoreThan\",\"countNumber\":25},\"action\":{\"type\":\"expire\"}}]}"
           },
           "RepositoryName": "obsidian-ee/collab-relay"
         },

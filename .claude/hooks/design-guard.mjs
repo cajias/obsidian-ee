@@ -37,11 +37,7 @@ process.stdin.on('end', () => {
     process.exit(0);
   } catch (e) {
     const out = (e.stdout?.toString() || '') + (e.stderr?.toString() || '');
-    process.stderr.write(
-      `design-integrity-guard failed after editing ${rel}:\n${out}\n` +
-        'The join key, the .feature copies and the 6-row ledger are definition-of-done ' +
-        'criteria — update BOTH documents, not just one.\n',
-    );
+    process.stderr.write(`design-integrity-guard failed after editing ${rel}:\n${out}\n`);
     process.exit(2);
   }
 });

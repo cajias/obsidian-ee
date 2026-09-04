@@ -124,20 +124,17 @@ otherwise-unused code is a signal to delete the code, not keep it.
 
 ## Current build state — aws-deploy
 
-Branch `feat/aws-deploy`, 9 commits, rebased onto `origin/main` (`f96fe69`) on
-2026-09-02, unpushed, no PR. Plan: `docs/design/aws-deploy/03-implementation-plan.md`
+Branch `feat/aws-deploy`. Plan: `docs/design/aws-deploy/03-implementation-plan.md`
 (M1–M4). Design set `00`–`04` is ratified; changes to it are recorded as numbered
-"Plan change" notes inside the milestone sections.
+"Plan change" notes inside the milestone sections. Commit shas are deliberately not
+listed here — they do not survive a squash merge.
 
-| Milestone | Commit | Gate | State |
-|---|---|---|---|
-| M1 STOPSIGNAL | `6ddc9bb` | `bash tests/features/run-m1.sh` | green at commit; needs a running Docker daemon to re-verify |
-| M2 CDK infra | `c95b961` | `bash tests/features/run-m2.sh` | **green, exit 0** |
-| M3 release + deploy | `f1ff1fc` | `bash tests/features/run-m3.sh` | code-complete; **exit 2 BLOCKED** on human steps |
-| M4 verified rollout | `b3a7046` | `bash tests/features/run-m4.sh` | harness + runbook shipped; **exit 2 BLOCKED** on human steps |
-
-Plus `254824a` (simplify pass), `5c92a7c` (design-integrity CI guard), `fd5beed`
-(toolchain fix + runbook move), `72f2655` (design-guard hook + `xtask gates`).
+| Milestone | Gate | State |
+|---|---|---|
+| M1 STOPSIGNAL | `bash tests/features/run-m1.sh` | green; needs a running Docker daemon to re-verify |
+| M2 CDK infra | `bash tests/features/run-m2.sh` | **green, exit 0** |
+| M3 release + deploy | `bash tests/features/run-m3.sh` | code-complete; **exit 2 BLOCKED** on human steps |
+| M4 verified rollout | `bash tests/features/run-m4.sh` | harness + runbook shipped; **exit 2 BLOCKED** on human steps |
 
 **Nothing is blocked on the agent.** Every remaining step needs the maintainer's AWS
 account.

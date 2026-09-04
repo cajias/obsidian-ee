@@ -136,6 +136,25 @@ jobs:
             exit 1
           fi
 
+      # A prod deploy PROMOTES an image staging already validated; it must never
+      # manufacture one. If the sha image is absent here the cause is retention
+      # (RelayShared's ECR lifecycle rules), not "not built yet" — and rebuilding
+      # would push a NEVER-VALIDATED digest to prod under the release tag,
+      # defeating from the registry end the same byte-identity invariant the
+      # imagetools retag and deploy-buildx-guard.sh protect from the build end.
+      # Fail loudly instead: the operator re-cuts the release or picks a ref whose
+      # image still exists.
+      - name: Refuse to rebuild for a prod deploy
+        if: needs.meta.outputs.environment == 'prod' && steps.exists.outputs.found == 'false'
+        env:
+          SHA_TAG: ${{ needs.meta.outputs.sha_tag }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          echo "refusing to deploy: image '$ECR_REPOSITORY:$SHA_TAG' is not in ECR." >&2
+          echo "prod promotes an existing validated image and never rebuilds one." >&2
+          echo "The image was most likely expired by the repository lifecycle policy." >&2
+          exit 1
+
       # Registry tags are immutable, so an existing sha tag can never be re-pushed.
       - name: Build and push (native arm64)
         if: steps.exists.outputs.found == 'false'
@@ -211,12 +230,31 @@ jobs:
             --document-name AWS-RunShellScript \
             --parameters commands="/opt/relay/deploy.sh $IMAGE" \
             --query Command.CommandId --output text)
-          for i in $(seq 1 30); do
+          # 90 polls x 5s = 7.5 min, inside this job's timeout-minutes: 15. The
+          # previous 150s could not cover a FIRST deploy on a t4g.micro, which
+          # pays docker login + ssm get-parameter + a cold pull of BOTH the relay
+          # image and caddy:2 + an image prune. Timing out there failed the job
+          # while the deploy was still succeeding — a false red on the very
+          # dispatch M3's gate is measured by.
+          #
+          # Cancelled/TimedOut/Cancelling are terminal too: treating them as
+          # pending burned all the polls and then reported the wrong reason.
+          # StandardErrorContent is what actually says why the instance-side
+          # script failed, so print it before exiting.
+          for i in $(seq 1 90); do
             STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" \
               --instance-id "$RELAY_INSTANCE_ID" --query Status --output text) || STATUS=Pending
             echo "attempt $i: $STATUS"
             [ "$STATUS" = Success ] && exit 0
-            [ "$STATUS" = Failed ] && exit 1
+            case "$STATUS" in
+              Failed | Cancelled | Cancelling | TimedOut)
+                echo "SSM command $CMD_ID terminated as $STATUS; instance stderr follows:" >&2
+                aws ssm get-command-invocation --command-id "$CMD_ID" \
+                  --instance-id "$RELAY_INSTANCE_ID" \
+                  --query StandardErrorContent --output text >&2 || true
+                exit 1
+                ;;
+            esac
             sleep 5
           done
           echo "SSM command $CMD_ID never reached a terminal state" >&2
