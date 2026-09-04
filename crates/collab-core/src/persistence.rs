@@ -20,6 +20,14 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 
 /// Snapshot format version. Bump on any layout change so an old snapshot is
 /// rejected (`Err`) rather than mis-parsed.
+///
+/// Deliberately NOT bumped for the issue-#76 doc-id AEAD binding: this byte sits
+/// at offset 0 of the SEALED plaintext, so it is only readable after a successful
+/// AEAD open, which a pre-#76 blob can no longer achieve. It cannot discriminate
+/// those blobs, so a bump would buy nothing. That is only harmless while nothing
+/// persists snapshots — a pre-#76 blob restored today fails with "AEAD open
+/// failed", not a graceful `Ok(None)` re-join. Whoever wires the plugin / CLI
+/// data-dir storage owns that migration decision.
 pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// AES-GCM nonce length in bytes.
@@ -439,9 +447,16 @@ mod tests {
 
         let zeros = [0u8; 32];
         let blob = seal_with_key(&plaintext, &zeros);
+        // Assert the MESSAGE, not just `is_err()`: `seal_with_key` now seals with
+        // the DOC_ID aad, so a bare `is_err()` could not tell "the up-front
+        // all-zeros guard fired" from "the AEAD rejected an aad mismatch". Pinning
+        // the guard's own words keeps this test proving the layer it names.
+        let Err(err) = MlsDocumentGroup::restore_encrypted(DOC_ID, &blob, &zeros, 0) else {
+            panic!("all-zeros restore must be Err")
+        };
         assert!(
-            MlsDocumentGroup::restore_encrypted(DOC_ID, &blob, &zeros, 0).is_err(),
-            "all-zeros restore must be Err via the guard"
+            err.to_string().contains("refusing all-zeros key"),
+            "must be rejected by the up-front guard, not the AEAD; got: {err}"
         );
     }
 

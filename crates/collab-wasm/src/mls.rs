@@ -175,6 +175,9 @@ impl WasmEncryptedDocument {
     /// persistence (issue #30). `key` MUST be exactly 32 bytes (all-zeros
     /// rejected). Returns `nonce || ciphertext`. The caller owns key provenance
     /// (OS keychain / passphrase) and where the blob is stored (plugin data dir).
+    ///
+    /// The blob is AEAD-bound to THIS document's id (issue #76), so it can only
+    /// be restored under the same id — see [`Self::restore_encrypted`].
     pub fn snapshot_encrypted(&self, key: &[u8]) -> Result<Vec<u8>, JsError> {
         let key = to_key(key)?;
         self.0.snapshot_encrypted(&key).map_err(js_err)
@@ -185,6 +188,16 @@ impl WasmEncryptedDocument {
     /// (`epoch < min_epoch`) or one with no group surfaces as a JsError
     /// ("stale snapshot; re-join required") since JS cannot easily express
     /// `Option` — the caller must treat that error as "do a clean re-join".
+    ///
+    /// `doc_id` is an AUTHENTICATION input, not just a label (issue #76): it is
+    /// the AEAD associated data, which is what stops a snapshot sealed for one
+    /// document from being restored under another when both are sealed with the
+    /// same at-rest key. So it MUST be the caller's own LOCALLY-TRUSTED value —
+    /// `config.docId` — and NEVER a value read back from the environment the
+    /// attacker is assumed to control: not the snapshot filename, not a sidecar,
+    /// not an inbound frame field. Deriving it from the file's own name hands the
+    /// attacker the aad as well, and a rename then defeats the binding entirely.
+    /// Same rule as [`WasmInvite::from_welcome`].
     pub fn restore_encrypted(
         doc_id: &str,
         snapshot: &[u8],
