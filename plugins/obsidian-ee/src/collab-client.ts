@@ -18,6 +18,16 @@ export type CollabRole = 'owner' | 'joiner';
 // bounds every array parsed out of it.
 const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 
+// Lifetime of a minted subscribe capability (#72), mirroring the CLI's
+// CAPABILITY_TTL_SECS (crates/collab-cli/src/commands.rs): short enough that a
+// leaked capability expires quickly, long enough to outlive a handshake.
+const CAPABILITY_TTL_SECS = 300n;
+
+/** Whole seconds since the Unix epoch, as the u64 the wasm boundary expects. */
+function nowUnix(): bigint {
+    return BigInt(Math.max(0, Math.floor(Date.now() / 1000)));
+}
+
 // Reconnect policy defaults, mirroring the Rust side so the two implementations
 // of this logic cannot drift again: MIN_STABLE_CONNECTION in
 // crates/collab-cli/src/commands.rs and RetryPolicy::default()'s max_delay in
@@ -196,6 +206,19 @@ function validateVaultSyncConfig(config: CollabClientConfig): void {
 }
 
 /**
+ * The anchor material a `register_doc_key` frame carries (#29). Structurally
+ * the wasm `WasmAnchorRotation`, so a rotation emitted by a commit is passed
+ * straight through; a first (TOFU) registration is built by hand with an empty
+ * `rotation_proof`.
+ */
+interface DocKeyAnchor {
+    epoch: bigint;
+    public_key: Uint8Array;
+    proof: Uint8Array;
+    rotation_proof: Uint8Array;
+}
+
+/**
  * A view onto one MLS group's mutable doc/pending slot (#32). The file group
  * (`doc`/`pending`) and the manifest group (`manifestDoc`/`manifestPending`)
  * run the exact same owner/joiner bootstrap and key_package/welcome/commit
@@ -285,6 +308,12 @@ export class CollabClient {
     private bootstrapGroup(slot: GroupSlot): void {
         if (this.config.role === 'owner') {
             slot.setDoc(WasmEncryptedDocument.create(slot.docId, this.config.userId));
+            // The group exists now, so (a) the relay's verification anchor can be
+            // registered — nothing a member mints verifies without it — and (b)
+            // the capability-less subscription sent moments ago in onopen can be
+            // upgraded from handshake-only to content-authorized (#72).
+            this.registerAnchor(slot);
+            this.subscribeTo(slot);
             return;
         }
         const pending = generate_key_package(this.config.userId);
@@ -350,15 +379,21 @@ export class CollabClient {
     }
 
     /**
-     * Run establishGroup(), rejecting this connect() attempt and tearing down the
-     * socket if it throws instead of letting the throw abort onopen unhandled.
-     * WasmEncryptedDocument.create()/generate_key_package() are wasm-bindgen
-     * Result<T, JsError> calls that throw on a crypto-provider/entropy failure;
-     * without this guard connectPromise would never settle (the exact hang class
-     * already fixed once for the sibling identify/subscribe branch in connect()).
+     * Run the whole onopen initialization, rejecting this connect() attempt and
+     * tearing down the socket if any of it throws instead of letting the throw
+     * abort onopen unhandled. Every step is a wasm-bindgen `Result<T, JsError>`
+     * call away from throwing: establishGroup() creates groups/key packages, and
+     * subscribe() now MINTS a capability (#72). Without this guard
+     * connectPromise would never settle (the exact hang class CLAUDE.md's
+     * connect-settles-exactly-once invariant names).
      */
-    private tryEstablishGroup(reject: (reason?: unknown) => void): boolean {
+    private tryInitialize(reject: (reason?: unknown) => void): boolean {
         try {
+            const identified = this.sendIdentify();
+            const subscribed = this.subscribe();
+            if (!identified || !subscribed) {
+                throw new Error('Failed to send initialization messages');
+            }
             this.establishGroup();
             return true;
         } catch (error) {
@@ -397,19 +432,9 @@ export class CollabClient {
                     // Note: Don't clear connectPromise here - the finally block handles that
                     // to avoid race conditions with concurrent connection attempts
 
-                    // Critical: verify initialization messages are sent
-                    const identified = this.sendIdentify();
-                    const subscribed = this.subscribe();
-
-                    if (!identified || !subscribed) {
-                        this.failConnect(
-                            reject,
-                            new Error('Failed to send initialization messages')
-                        );
-                        return;
-                    }
-
-                    if (!this.tryEstablishGroup(reject)) {
+                    // Critical: identify, subscribe and establish the group, or
+                    // settle this attempt as failed.
+                    if (!this.tryInitialize(reject)) {
                         return;
                     }
 
@@ -486,19 +511,75 @@ export class CollabClient {
     }
 
     private subscribe(): boolean {
-        const subscribed = this.send({
-            type: 'subscribe',
-            doc_id: this.config.docId,
-        });
-        // Vault sync rides the same connection: also subscribe to the manifest doc.
+        const subscribed = this.subscribeTo(this.fileSlot());
+        // Vault sync rides the same connection: also subscribe to the manifest
+        // doc, whose capability comes from its OWN group (#32).
         if (this.config.vaultSync && this.config.manifestDocId) {
-            const manifestSubscribed = this.send({
-                type: 'subscribe',
-                doc_id: this.config.manifestDocId,
-            });
+            const manifestSubscribed = this.subscribeTo(this.manifestSlot());
             return subscribed && manifestSubscribed;
         }
         return subscribed;
+    }
+
+    /**
+     * Subscribe (or re-subscribe) to one group `slot`, presenting a freshly
+     * minted capability whenever that group exists (#72).
+     *
+     * Re-subscribing RE-STATES the relay-side authorization: presenting a
+     * capability upgrades the subscription to content-authorized, and a bare
+     * subscribe DOWNGRADES it back to handshake-only. So every subscribe after
+     * a group exists — including the one every reconnect sends — must carry one.
+     *
+     * The capability is bound to the slot's LOCALLY-TRUSTED doc id and to this
+     * client's own identity, never to a value taken from an inbound frame. The
+     * field is omitted (the relay's `Option` default, `None`) while no group
+     * exists: a joiner must be subscribed to RECEIVE the Welcome that makes it a
+     * member, and only a member can mint.
+     */
+    private subscribeTo(slot: GroupSlot): boolean {
+        const doc = slot.getDoc();
+        const capability: unknown = doc
+            ? JSON.parse(
+                  doc.mint_subscribe_capability(
+                      this.config.userId,
+                      slot.docId,
+                      nowUnix(),
+                      CAPABILITY_TTL_SECS
+                  )
+              )
+            : undefined;
+        return this.send({ type: 'subscribe', doc_id: slot.docId, capability });
+    }
+
+    /**
+     * Register this group's FIRST (TOFU) verification anchor with the relay,
+     * which is what every capability minted for the document verifies against.
+     */
+    private registerAnchor(slot: GroupSlot): boolean {
+        const doc = slot.getDoc();
+        if (!doc) {
+            return false;
+        }
+        return this.registerDocKey(slot.docId, {
+            epoch: doc.epoch,
+            public_key: doc.subscribe_verifying_key(),
+            proof: doc.sign_doc_key_proof(slot.docId),
+            // A first registration has no current anchor to prove continuity
+            // against; the relay requires a rotation proof only once one exists.
+            rotation_proof: new Uint8Array(),
+        });
+    }
+
+    /** Send one `register_doc_key` frame: a TOFU registration or a rotation. */
+    private registerDocKey(docId: string, anchor: DocKeyAnchor): boolean {
+        return this.send({
+            type: 'register_doc_key',
+            doc_id: docId,
+            epoch: Number(anchor.epoch),
+            public_key: [...anchor.public_key],
+            proof: [...anchor.proof],
+            rotation_proof: [...anchor.rotation_proof],
+        });
     }
 
     private send(message: object): boolean {
@@ -667,12 +748,22 @@ export class CollabClient {
                     return;
                 }
                 const invite = doc.create_invite(payload);
+                // The invite's commit advanced this group's epoch, so the relay's
+                // anchor must move with it BEFORE the Welcome goes out: the
+                // joiner mints at the new epoch the moment it joins, and a
+                // capability whose epoch is ahead of the anchor is REJECTED.
+                if (invite.rotation) {
+                    this.registerDocKey(slot.docId, invite.rotation);
+                }
                 this.send({
                     type: 'mls_handshake',
                     doc_id: slot.docId,
                     payload: [...invite.welcome],
                     message_type: 'welcome',
                 });
+                // This client's own capability was minted at the previous epoch
+                // and no longer verifies; re-present at the new one.
+                this.subscribeTo(slot);
                 break;
             }
             case 'welcome': {
@@ -701,9 +792,20 @@ export class CollabClient {
                 // session is required to retry.
                 slot.setPending(null);
                 slot.setDoc(WasmEncryptedDocument.join(invite, pending));
+                // A member only now, so able to mint only now: re-subscribing with
+                // a capability upgrades this connection from handshake-only to
+                // content-authorized. Without it the relay withholds every
+                // yrs_update (#72) — this ordering is the deadlock the issue exists
+                // to fix, so it must stay AFTER the join, never before.
+                this.subscribeTo(slot);
                 break;
             }
             case 'commit': {
+                // ponytail: the returned anchor rotation is dropped and no
+                // capability is re-presented at the new epoch. Dead in this
+                // plugin's own choreography — the owner forwards only the
+                // Welcome, never `invite.commit` — so this path never runs today.
+                // Wire both up when 3+-party groups ship (#72 follow-up).
                 slot.getDoc()?.process_commit(payload);
                 break;
             }
@@ -765,6 +867,11 @@ export class CollabClient {
             const plaintext = this.manifestDoc.decrypt_bytes(encrypted);
             const newPaths = this.config.vaultSync!.apply_remote_manifest(plaintext);
             for (const path of newPaths) {
+                // Capability-less on purpose: a newly-announced path has no MLS
+                // group on this client yet, so there is nothing to mint from.
+                // Under subscribe authorization these subscriptions are
+                // handshake-only and receive no content until a group for the
+                // path is established (#72 follow-up).
                 this.send({ type: 'subscribe', doc_id: path });
             }
             if (this.onManifestPathsCallback) {
