@@ -177,9 +177,13 @@ impl TestClient {
     ///
     /// Returns an error if subscription fails.
     pub async fn subscribe(&mut self, doc_id: &DocumentId) -> anyhow::Result<()> {
-        // capability: None — these helpers exercise the default (un-gated) relay
-        // where subscribe authorization (issue #29) is off; the MLS-handshake
-        // bootstrap needs an un-gated subscribe to deliver the Welcome.
+        // capability: None — these helpers exercise an UN-GATED relay. Two
+        // different defaults get you there: `TestServer::start()` builds a
+        // `RelayServer::new()`, whose flag is off, and the Docker wire tests
+        // point at docker/docker-compose.yml, which sets RELAY_SUBSCRIBE_AUTHZ=0
+        // because the relay BINARY defaults it on since #72. Against a gated
+        // relay these subscriptions are handshake-only and receive no content —
+        // see tests/e2e-tests/tests/subscribe_authz.rs for the gated flows.
         self.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await?;
         let response = self.recv().await?;
         if !matches!(response, ServerMessage::Subscribed { .. }) {
@@ -272,6 +276,13 @@ impl MlsTestGroup {
     }
 }
 
+/// Build the invite a JOINER can reconstruct: its own LOCALLY-TRUSTED `doc_id`
+/// plus the Welcome bytes read off the wire. `commit` and `rotation` belong to
+/// existing members, so a joiner has neither.
+fn joiner_invite(doc_id: &DocumentId, welcome: Vec<u8>, epoch: u64) -> Invite {
+    Invite { doc_id: doc_id.clone(), welcome, commit: vec![], epoch, rotation: None }
+}
+
 /// Set up a complete two-user MLS group via the relay.
 ///
 /// This handles all the WebSocket handshaking needed to establish an MLS group
@@ -324,9 +335,7 @@ pub async fn setup_two_user_group(
     // the commit when creating the invite, and there are no other existing members to
     // notify. For 3+ user groups, the commit would contain updates that existing members
     // must process to learn about Bob.
-    let bob_invite =
-        Invite { doc_id: doc_id.clone(), welcome: welcome_payload, commit: vec![], epoch: 1 };
-    let bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
+    let bob_doc = EncryptedDocument::join(&joiner_invite(doc_id, welcome_payload, 1), bob_pending)?;
 
     Ok((alice_doc, bob_doc))
 }
@@ -383,10 +392,7 @@ pub async fn setup_three_user_group(
         .await
         .expect("Connection error while draining broadcast message");
 
-    let bob_doc = EncryptedDocument::join(
-        &Invite { doc_id: doc_id.clone(), welcome: bob_welcome, commit: vec![], epoch: 1 },
-        bob_pending,
-    )?;
+    let bob_doc = EncryptedDocument::join(&joiner_invite(doc_id, bob_welcome, 1), bob_pending)?;
 
     // Charlie generates his key package and joins
     let charlie_pending = MlsDocumentGroup::generate_key_package(&charlie.user_id)?;
@@ -413,10 +419,8 @@ pub async fn setup_three_user_group(
         .await
         .expect("Connection error while draining broadcast message");
 
-    let charlie_doc = EncryptedDocument::join(
-        &Invite { doc_id: doc_id.clone(), welcome: charlie_welcome, commit: vec![], epoch: 2 },
-        charlie_pending,
-    )?;
+    let charlie_doc =
+        EncryptedDocument::join(&joiner_invite(doc_id, charlie_welcome, 2), charlie_pending)?;
 
     Ok((alice_doc, bob_doc, charlie_doc))
 }

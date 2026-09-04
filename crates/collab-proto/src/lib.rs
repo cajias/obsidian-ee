@@ -53,9 +53,11 @@ pub enum ClientMessage {
     /// Subscribe to document updates.
     ///
     /// `capability` proves current-epoch membership of the document's group
-    /// (issue #29). It is `Option` for a clean migration: older clients omit it,
-    /// but once subscribe authorization is enabled the relay rejects a `None`
-    /// (fail closed) with [`ErrorCode::Unauthorized`].
+    /// (issue #29). It stays `Option` because the MLS join bootstraps over the
+    /// relay: since #72 a `None` subscribes **handshake-only** — the
+    /// subscription succeeds and no `YrsUpdate` ever reaches it — rather than
+    /// being rejected. A capability that FAILS to verify is still refused with
+    /// [`ErrorCode::Unauthorized`]; the allowance is for an absent one only.
     Subscribe {
         doc_id: DocumentId,
         #[serde(default)]

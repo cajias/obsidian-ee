@@ -13,6 +13,7 @@ export function createMockClientInstance() {
     return {
         connect: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
         disconnect: jest.fn(),
+        destroy: jest.fn(),
         getText: jest.fn().mockReturnValue(''),
         sendUpdate: jest.fn(),
         sendManifestUpdate: jest.fn(),

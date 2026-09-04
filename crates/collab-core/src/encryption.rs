@@ -1,5 +1,6 @@
 //! Encrypted document wrapper combining Yrs CRDT with MLS encryption.
 
+use crate::mls::AnchorRotation;
 use crate::{CollabDocument, DocumentId, MlsDocumentGroup, PendingMember, Result};
 
 /// An encrypted collaborative document.
@@ -122,9 +123,17 @@ impl EncryptedDocument {
     ///
     /// Returns an error if creating the invite fails.
     pub fn create_invite(&mut self, key_package: &[u8]) -> Result<Invite> {
-        let (commit, welcome) = self.mls.add_member(key_package)?;
+        // `self.doc.id()` is the LOCALLY-TRUSTED document id — never a value read
+        // off the wire — which is what the emitted rotation proof binds.
+        let (commit, welcome, rotation) = self.mls.add_member(key_package, self.doc.id())?;
 
-        Ok(Invite { doc_id: self.doc.id().to_string(), welcome, commit, epoch: self.mls.epoch() })
+        Ok(Invite {
+            doc_id: self.doc.id().to_string(),
+            welcome,
+            commit,
+            epoch: self.mls.epoch(),
+            rotation: Some(rotation),
+        })
     }
 
     /// Process a commit message from another member (e.g., when a new member is added).
@@ -137,8 +146,8 @@ impl EncryptedDocument {
     /// # Errors
     ///
     /// Returns an error if processing the commit fails.
-    pub fn process_commit(&mut self, commit: &[u8]) -> Result<()> {
-        self.mls.process_commit(commit)
+    pub fn process_commit(&mut self, commit: &[u8]) -> Result<AnchorRotation> {
+        self.mls.process_commit(commit, self.doc.id())
     }
 
     /// Owner-only: remove the member identified by `member_user_id`, advancing
@@ -149,8 +158,8 @@ impl EncryptedDocument {
     ///
     /// Returns an error if this member is not the owner, the target is not a
     /// current member (or is the owner), or the MLS operation fails.
-    pub fn remove_member(&mut self, member_user_id: &str) -> Result<Vec<u8>> {
-        self.mls.remove_member(member_user_id)
+    pub fn remove_member(&mut self, member_user_id: &str) -> Result<(Vec<u8>, AnchorRotation)> {
+        self.mls.remove_member(member_user_id, self.doc.id())
     }
 
     /// True iff this member created the document's group (is the owner).
@@ -254,6 +263,13 @@ pub struct Invite {
     /// MLS epoch at which this invite was created (after `add_member`).
     /// Used to detect stale invites when this epoch does not match the current group epoch.
     pub epoch: u64,
+    /// The anchor rotation the add-commit created (issue #29). `Some` when the
+    /// owner produced this invite via [`EncryptedDocument::create_invite`] —
+    /// send it to the relay as `RegisterDocKey` so subscribe capabilities minted
+    /// at the new epoch keep verifying. `None` on a joiner-side reconstruction
+    /// from bare Welcome bytes, which carries no rotation (as `commit` there is
+    /// likewise empty): a joiner holds no outgoing-epoch key to sign one.
+    pub rotation: Option<AnchorRotation>,
 }
 
 #[cfg(test)]
@@ -336,5 +352,54 @@ mod tests {
         let manifest_op = manifest_doc.encrypt_bytes(b"manifest content").unwrap();
         // ...and vice versa.
         assert!(file_doc.decrypt_bytes(&manifest_op.ciphertext).is_err());
+    }
+
+    /// The `EncryptedDocument` layer must pass its OWN document id down to the
+    /// rotation-proof signing, on BOTH membership paths. Nothing else pins this:
+    /// every other call site discards the rotation, so binding a wrong id here
+    /// would be invisible. The proofs below only verify under `DOC`, so replacing
+    /// either `self.doc.id()` argument with any other value fails this test.
+    #[test]
+    fn rotations_bind_the_documents_own_id() {
+        const DOC: &str = "notes/rotation-binding.md";
+        let mut alice = EncryptedDocument::create(DOC, "alice").unwrap();
+        let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let invite = alice.create_invite(bob_pending.key_package()).unwrap();
+        // `create_invite` must hand the owner a rotation to register (not `None`).
+        assert!(invite.rotation.is_some(), "create_invite must emit the add-commit's rotation");
+        let mut bob = EncryptedDocument::join(&invite, bob_pending).unwrap();
+
+        // Add path: a PEER processing the commit emits the rotation, signed by the
+        // key it held before the merge.
+        let bob_outgoing = bob.subscribe_verifying_key().unwrap();
+        let carol_pending = MlsDocumentGroup::generate_key_package("carol").unwrap();
+        let add = alice.create_invite(carol_pending.key_package()).unwrap();
+        let bob_rot = bob.process_commit(&add.commit).unwrap();
+        assert_eq!(
+            collab_proto::verify_anchor_rotation(
+                DOC,
+                bob_rot.epoch,
+                &bob_rot.public_key,
+                &bob_outgoing,
+                &bob_rot.rotation_proof,
+            ),
+            Ok(()),
+            "process_commit must bind the document's own id"
+        );
+
+        // Removal path: the owner's own rotation, same binding.
+        let alice_outgoing = alice.subscribe_verifying_key().unwrap();
+        let (_commit, removal_rot) = alice.remove_member("carol").unwrap();
+        assert_eq!(
+            collab_proto::verify_anchor_rotation(
+                DOC,
+                removal_rot.epoch,
+                &removal_rot.public_key,
+                &alice_outgoing,
+                &removal_rot.rotation_proof,
+            ),
+            Ok(()),
+            "remove_member must bind the document's own id"
+        );
     }
 }

@@ -53,12 +53,12 @@ pub struct RelayServer {
     shutdown_tx: broadcast::Sender<()>,
     /// Optional bearer token required in `Identify`. `None` disables auth.
     auth_token: Option<String>,
-    /// When true, `Subscribe` requires a valid current-epoch membership
+    /// When true, receiving document content requires a current-epoch membership
     /// capability verified against the doc's registered anchor (issue #29).
-    /// Default off for a clean migration: the MLS-handshake-over-relay bootstrap
-    /// needs an un-gated subscribe to deliver the `Welcome` that makes a joiner a
-    /// member (and able to mint a capability). Turn on where every subscriber is
-    /// already a member by another path.
+    /// A capability-less `Subscribe` still succeeds, but for the MLS handshake
+    /// only — that is what keeps the join bootstrap working under authz (issue
+    /// #72). Default off pending the client-side work to mint and present
+    /// capabilities on the normal subscribe path.
     require_subscribe_authz: bool,
     /// Maximum number of concurrent connections.
     max_connections: usize,
@@ -161,15 +161,20 @@ impl RelayServer {
         self
     }
 
-    /// Enable per-document subscribe authorization (issue #29).
+    /// Enable per-document subscribe authorization (issues #29, #72).
     ///
-    /// When enabled, `Subscribe` is rejected with [`ErrorCode::Unauthorized`]
-    /// unless it carries a [`SubscribeCapability`] that verifies against the
-    /// doc's registered anchor (current epoch + verifying key). Fail closed: no
-    /// anchor or no capability means rejected.
+    /// When enabled, a `Subscribe` carrying a [`SubscribeCapability`] is
+    /// rejected with [`ErrorCode::Unauthorized`] unless the capability verifies
+    /// against the doc's registered anchor (current epoch + verifying key) — no
+    /// anchor, or a capability that fails to verify, means rejected. A
+    /// `Subscribe` carrying NO capability succeeds but authorizes no content:
+    /// the router then delivers handshake traffic to it and withholds
+    /// `YrsUpdate`.
     #[must_use]
-    pub const fn with_subscribe_authz(mut self, enabled: bool) -> Self {
+    pub fn with_subscribe_authz(mut self, enabled: bool) -> Self {
         self.require_subscribe_authz = enabled;
+        // The router applies the content half of the gate on fan-out (#72).
+        self.router.set_content_gating(enabled);
         self
     }
 
@@ -428,13 +433,21 @@ impl RelayServer {
 
     /// Handle the Subscribe message.
     ///
-    /// When subscribe authorization is enabled (issue #29), the client must
-    /// prove current-epoch membership: the doc must have a registered anchor and
-    /// `capability` must verify against it. The relay binds the LOCAL `doc_id`
-    /// (the subscribe target) and the LOCALLY-stored `anchor.epoch` /
+    /// When subscribe authorization is enabled (issue #29), a `capability` proves
+    /// current-epoch membership: the doc must have a registered anchor and the
+    /// capability must verify against it. The relay binds the LOCAL `doc_id` (the
+    /// subscribe target) and the LOCALLY-stored `anchor.epoch` /
     /// `anchor.verifying_key` as the expected values — never `cap.epoch` or any
-    /// other inbound frame field. Fail closed: no anchor or no capability =
-    /// rejected.
+    /// other inbound frame field.
+    ///
+    /// Subscribing and receiving document content are separate (issue #72). A
+    /// subscribe with NO capability succeeds for the MLS handshake only: it is
+    /// the join bootstrap, where a joiner must be subscribed to receive the
+    /// `Welcome` that makes it a member — only then can it mint a capability.
+    /// Such a subscription carries no content authorization, so
+    /// [`MessageRouter::route_message`] withholds `YrsUpdate` from it. A
+    /// capability that is PRESENT but fails to verify still fails closed:
+    /// `Unauthorized`, no subscription.
     async fn handle_subscribe(
         &self,
         user_id: Option<&String>,
@@ -450,13 +463,17 @@ impl RelayServer {
             return;
         }
 
-        if self.require_subscribe_authz
-            && !self.authorize_subscribe(tx, uid, &doc_id, capability).await
-        {
-            return;
-        }
+        let authorized_epoch = if self.require_subscribe_authz {
+            match self.authorize_subscribe(tx, uid, &doc_id, capability).await {
+                Ok(epoch) => epoch,
+                Err(()) => return,
+            }
+        } else {
+            // Authz off means content gating is off too, so this is never read.
+            None
+        };
 
-        if self.router.subscribe(uid, &doc_id).await {
+        if self.router.subscribe(uid, &doc_id, authorized_epoch).await {
             send_msg(tx, ServerMessage::Subscribed { doc_id }).await;
         } else {
             send_msg(
@@ -470,24 +487,34 @@ impl RelayServer {
         }
     }
 
-    /// Verify a subscribe capability against the doc's anchor. Returns `true`
-    /// (proceed) only if authorized; otherwise sends `Unauthorized` and returns
-    /// `false`. Only called when `require_subscribe_authz` is on.
+    /// Verify a subscribe capability against the doc's anchor. Only called when
+    /// `require_subscribe_authz` is on.
+    ///
+    /// Returns the subscription's content-authorization state: `Ok(Some(epoch))`
+    /// when a capability verified against the anchor at that epoch, `Ok(None)`
+    /// for a capability-less handshake-only subscribe (issue #72). Returns
+    /// `Err(())` when the client is rejected, having already been sent
+    /// `Unauthorized`.
     async fn authorize_subscribe(
         &self,
         tx: &mpsc::Sender<ServerMessage>,
         uid: &str,
         doc_id: &str,
         capability: Option<SubscribeCapability>,
-    ) -> bool {
-        // No anchor → membership cannot be proven → fail closed.
+    ) -> Result<Option<u64>, ()> {
+        let Some(cap) = capability else {
+            // No capability: subscribe for the MLS handshake only. A joiner has
+            // no way to mint one before it has consumed its Welcome, and the
+            // relay cannot tell that joiner from any other capability-less
+            // client — so it authorizes no content and the router withholds
+            // `YrsUpdate` (issue #72).
+            return Ok(None);
+        };
+        // A capability WAS presented: from here it must check out, or the client
+        // is rejected. No anchor → membership cannot be proven → fail closed.
         let Some(anchor) = self.router.get_anchor(doc_id).await else {
             send_unauthorized(tx, "no subscribe anchor registered for this document").await;
-            return false;
-        };
-        let Some(cap) = capability else {
-            send_unauthorized(tx, "subscribe capability required").await;
-            return false;
+            return Err(());
         };
         // Bind the LOCALLY-trusted values as expected: the CONNECTION's identified
         // `uid`, the subscribe-target `doc_id`, and the LOCALLY-stored anchor
@@ -504,9 +531,11 @@ impl RelayServer {
         ) {
             tracing::warn!(doc_id = %doc_id, error = %e, "Rejecting subscribe: capability failed");
             send_unauthorized(tx, "subscribe capability verification failed").await;
-            return false;
+            return Err(());
         }
-        true
+        // Bind the LOCALLY-stored anchor epoch as the authorized epoch, never
+        // `cap.epoch`: a rotation past it then revokes this subscription.
+        Ok(Some(anchor.epoch))
     }
 
     /// Handle the `RegisterDocKey` message: (re)anchor a doc's subscribe
@@ -818,6 +847,8 @@ mod tests {
     use super::*;
     use futures::stream::{SplitSink, SplitStream};
     use futures::SinkExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
     use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
     /// Test helper for starting a server on a random port.
@@ -861,6 +892,26 @@ mod tests {
             Self { write, read }
         }
 
+        /// Connect and `Identify` as `user_id`, asserting the reply — the
+        /// three-line preamble every authz test opens with. Mirrors
+        /// `e2e_tests::helpers::TestClient::connect_as`.
+        async fn connect_as(server: &TestServer, user_id: &str) -> Self {
+            let mut client = Self::connect(server).await;
+            client.send(ClientMessage::Identify { user_id: user_id.into(), token: None }).await;
+            assert!(matches!(client.recv().await, ServerMessage::Identified { .. }));
+            client
+        }
+
+        /// `Subscribe` to [`AUTHZ_DOC`] with `capability`, asserting it succeeds.
+        async fn subscribe_ok(&mut self, capability: SubscribeCapability) {
+            self.send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(capability),
+            })
+            .await;
+            assert!(matches!(self.recv().await, ServerMessage::Subscribed { .. }));
+        }
+
         async fn send(&mut self, msg: ClientMessage) {
             let json = serde_json::to_string(&msg).unwrap();
             self.write.send(Message::Text(json)).await.unwrap();
@@ -874,7 +925,23 @@ mod tests {
                 return serde_json::from_str(&text).unwrap();
             }
         }
+
+        /// Receive within `duration`, returning `None` only on a real timeout —
+        /// the shape of `e2e_tests::helpers::TestClient::try_recv`. Needed to
+        /// assert a message does NOT arrive; `recv` would block forever.
+        async fn try_recv(&mut self, duration: Duration) -> Option<ServerMessage> {
+            match timeout(duration, self.read.next()).await {
+                Err(_elapsed) => None,
+                Ok(Some(Ok(Message::Text(text)))) => Some(serde_json::from_str(&text).unwrap()),
+                Ok(other) => panic!("unexpected websocket frame: {other:?}"),
+            }
+        }
     }
+
+    /// Long enough that a delivery the relay actually made lands, short enough
+    /// that asserting absence stays cheap. Absence is only ever asserted AFTER a
+    /// positive control has received the same fan-out, so this is not a race.
+    const QUIET: Duration = Duration::from_millis(300);
 
     #[tokio::test]
     async fn test_client_connects() {
@@ -1142,33 +1209,103 @@ mod tests {
         ));
     }
 
-    /// With authz on, a subscribe carrying NO capability is rejected and the
-    /// client is not added to the subscription set.
+    /// With authz on, a subscribe carrying NO capability SUCCEEDS as
+    /// handshake-only (issue #72). This is the join bootstrap: a joiner must be
+    /// subscribed to receive the `Welcome` that makes it a member, and only then
+    /// can it mint a capability. It is not content-authorized by this subscribe —
+    /// the router withholds `YrsUpdate` from it (see the routing.rs content-gating
+    /// tests and the `subscribe_authz` wire test).
+    ///
+    /// Asserting the `Subscribed` reply alone is not enough: a mutation storing
+    /// the capability-less subscribe as `Some(anchor.epoch)` still replies
+    /// `Subscribed`. So this drives a real `YrsUpdate` through and asserts the
+    /// CONTENT half — with a content-authorized `member2` as the positive
+    /// control. Fan-out is one synchronous pass, so once `member2` holds the
+    /// update the gating decision for `joiner` has already been made.
     #[tokio::test]
-    async fn test_authz_rejects_missing_capability() {
+    async fn test_authz_missing_capability_subscribes_handshake_only() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
         let signer = member_key();
 
-        // Register the anchor (via a member) so the failure is due to the missing
-        // capability, not a missing anchor.
+        // Register the anchor (via a member) first: the doc IS anchored and the
+        // client still presents nothing — the strict handshake-only case, not a
+        // subscribe that slipped through because the doc was unanchored.
         let mut member = TestClient::connect(&server).await;
         member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
         assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
         register_anchor(&mut member, &signer).await;
 
-        let mut intruder = TestClient::connect(&server).await;
-        intruder.send(ClientMessage::Identify { user_id: "intruder".into(), token: None }).await;
-        assert!(matches!(intruder.recv().await, ServerMessage::Identified { .. }));
-        intruder
-            .send(ClientMessage::Subscribe { doc_id: AUTHZ_DOC.into(), capability: None })
+        let mut joiner = TestClient::connect(&server).await;
+        joiner.send(ClientMessage::Identify { user_id: "joiner".into(), token: None }).await;
+        assert!(matches!(joiner.recv().await, ServerMessage::Identified { .. }));
+        joiner.send(ClientMessage::Subscribe { doc_id: AUTHZ_DOC.into(), capability: None }).await;
+        assert!(matches!(
+            joiner.recv().await,
+            ServerMessage::Subscribed { doc_id } if doc_id == AUTHZ_DOC
+        ));
+
+        // Positive control: a second member subscribed WITH a valid capability.
+        let mut member2 = TestClient::connect(&server).await;
+        member2.send(ClientMessage::Identify { user_id: "member2".into(), token: None }).await;
+        assert!(matches!(member2.recv().await, ServerMessage::Identified { .. }));
+        member2
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member2")),
+            })
+            .await;
+        assert!(matches!(member2.recv().await, ServerMessage::Subscribed { .. }));
+
+        member
+            .send(ClientMessage::YrsUpdate {
+                doc_id: AUTHZ_DOC.into(),
+                encrypted: vec![1, 2, 3],
+                epoch: AUTHZ_EPOCH,
+            })
+            .await;
+        assert!(
+            matches!(member2.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a content-authorized subscriber must still receive the update"
+        );
+        assert!(
+            joiner.try_recv(QUIET).await.is_none(),
+            "a capability-less subscribe authorizes the handshake only: no content"
+        );
+    }
+
+    /// With authz on, a subscribe carrying a capability that FAILS verification
+    /// is still rejected — the #72 bootstrap allowance is for an ABSENT
+    /// capability only. An explicitly bad one is an attack signal, and rejecting
+    /// it cannot reintroduce the deadlock: a joiner presents none at all.
+    #[tokio::test]
+    async fn test_authz_still_rejects_invalid_capability() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut member = TestClient::connect(&server).await;
+        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
+        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        register_anchor(&mut member, &signer).await;
+
+        // A capability at the WRONG epoch, signed by the real anchor key.
+        let stale =
+            sign_subscribe_capability(&signer, "member", AUTHZ_DOC, AUTHZ_EPOCH + 1, u64::MAX);
+        member
+            .send(ClientMessage::Subscribe { doc_id: AUTHZ_DOC.into(), capability: Some(stale) })
             .await;
         assert!(matches!(
-            intruder.recv().await,
+            member.recv().await,
             ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
         ));
     }
 
-    /// A capability signed by a NON-anchor key (a non-member) is rejected.
+    /// A capability signed by a NON-anchor key (a non-member) is rejected — and
+    /// the rejection means no subscription, so no content reaches Eve either.
+    ///
+    /// The second half is the load-bearing one: a mutation that sends
+    /// `Unauthorized` but still subscribes Eve content-authorized passes the
+    /// reply assertion. `member2` is the positive control that proves the update
+    /// was fanned out at all.
     #[tokio::test]
     async fn test_authz_rejects_non_member_capability() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
@@ -1193,6 +1330,34 @@ mod tests {
             eve.recv().await,
             ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
         ));
+
+        // Positive control: a second member subscribed WITH a valid capability.
+        let mut member2 = TestClient::connect(&server).await;
+        member2.send(ClientMessage::Identify { user_id: "member2".into(), token: None }).await;
+        assert!(matches!(member2.recv().await, ServerMessage::Identified { .. }));
+        member2
+            .send(ClientMessage::Subscribe {
+                doc_id: AUTHZ_DOC.into(),
+                capability: Some(cap_for(&signer, "member2")),
+            })
+            .await;
+        assert!(matches!(member2.recv().await, ServerMessage::Subscribed { .. }));
+
+        member
+            .send(ClientMessage::YrsUpdate {
+                doc_id: AUTHZ_DOC.into(),
+                encrypted: vec![4, 5, 6],
+                epoch: AUTHZ_EPOCH,
+            })
+            .await;
+        assert!(
+            matches!(member2.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a content-authorized subscriber must still receive the update"
+        );
+        assert!(
+            eve.try_recv(QUIET).await.is_none(),
+            "a REJECTED capability must leave no subscription and deliver no content"
+        );
     }
 
     /// A capability minted for a DIFFERENT doc is rejected on this doc (the
@@ -1359,16 +1524,20 @@ mod tests {
 
     /// Rotation continuity POSITIVE (PR #73 review): a rotation authorized by the
     /// CURRENT anchor key succeeds. The new anchor (new key + higher epoch) then
-    /// governs subscribe.
+    /// governs subscribe — AND revokes content for a subscriber still authorized
+    /// at the old epoch, which is the half that matters for a removed member.
     #[tokio::test]
     async fn test_register_doc_key_accepts_rotation_signed_by_current_key() {
         let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
         let member_signer = member_key();
 
-        let mut member = TestClient::connect(&server).await;
-        member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
-        assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
+        let mut member = TestClient::connect_as(&server, "member").await;
         register_anchor(&mut member, &member_signer).await;
+
+        // A second member subscribes NOW, at epoch 1, and is not told about the
+        // rotation about to happen — the removed-member shape.
+        let mut stale = TestClient::connect_as(&server, "stale").await;
+        stale.subscribe_ok(cap_for(&member_signer, "stale")).await;
 
         // Rekey: the member now holds the epoch-2 exporter key and rotates to it,
         // authorizing the rotation with a continuity proof under the CURRENT
@@ -1394,12 +1563,26 @@ mod tests {
         // new key at epoch 2 subscribes.
         let new_epoch_cap =
             sign_subscribe_capability(&next_signer, "member", AUTHZ_DOC, AUTHZ_EPOCH + 1, u64::MAX);
-        member
-            .send(ClientMessage::Subscribe {
+        member.subscribe_ok(new_epoch_cap).await;
+
+        // Content half: `stale` keeps its subscription across the rotation but its
+        // stored epoch no longer matches the anchor, so post-rotation content is
+        // withheld. `member` (re-authorized at epoch 2) is the positive control.
+        let mut sender = TestClient::connect_as(&server, "sender").await;
+        sender
+            .send(ClientMessage::YrsUpdate {
                 doc_id: AUTHZ_DOC.into(),
-                capability: Some(new_epoch_cap),
+                encrypted: vec![7, 8, 9],
+                epoch: AUTHZ_EPOCH + 1,
             })
             .await;
-        assert!(matches!(member.recv().await, ServerMessage::Subscribed { .. }));
+        assert!(
+            matches!(member.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a member re-authorized at the NEW epoch still receives content"
+        );
+        assert!(
+            stale.try_recv(QUIET).await.is_none(),
+            "a rotation revokes content for a subscriber authorized at the OLD epoch"
+        );
     }
 }

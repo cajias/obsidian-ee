@@ -339,19 +339,21 @@ describe('CollabPlugin', () => {
             expect((plugin as any).editorChangeHandler).toBeNull();
         });
 
-        it('should disconnect and null the CollabClient (which frees the MLS document)', async () => {
+        it('should destroy and null the CollabClient (which frees the MLS document)', async () => {
             const plugin = createReadyPlugin();
 
             await plugin.onload();
             await plugin.startSession('owner');
 
             const client = (plugin as any).collabClient;
-            const disconnectSpy = jest.spyOn(client, 'disconnect');
+            const destroySpy = jest.spyOn(client, 'destroy');
 
             plugin.stopSession();
 
-            // CollabClient owns and frees the MLS document in disconnect().
-            expect(disconnectSpy).toHaveBeenCalled();
+            // CollabClient owns and frees the MLS document in destroy();
+            // disconnect() deliberately keeps an established group alive so a
+            // later connect() resumes it.
+            expect(destroySpy).toHaveBeenCalled();
             expect((plugin as any).collabClient).toBeNull();
             expect((plugin as any).editorSync).toBeNull();
         });

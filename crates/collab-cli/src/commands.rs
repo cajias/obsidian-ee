@@ -8,7 +8,7 @@ use collab_core::{
     ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument, EncryptedOp,
     MlsDocumentGroup,
 };
-use collab_proto::{ClientMessage, Invite, MlsMessageType, ServerMessage};
+use collab_proto::{ClientMessage, Invite, MlsMessageType, ServerMessage, SubscribeCapability};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
@@ -291,6 +291,18 @@ pub struct DemoResult {
 // ponytail: fixed timeout; make configurable only if a slow relay ever needs it.
 const PEER_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Lifetime of a minted subscribe capability (issue #29's design default). Short
+/// enough that a leaked capability expires quickly, long enough to outlive a
+/// session's handshake.
+// ponytail: fixed TTL; make configurable only if a long-lived session needs it.
+const CAPABILITY_TTL_SECS: u64 = 300;
+
+/// Whole seconds since the Unix epoch, for capability expiry. A clock before
+/// 1970 yields 0, which mints an already-expired capability — fail closed.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// A client-side WebSocket connection to the relay, used by [`session_check`].
 type PeerWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -300,6 +312,9 @@ type PeerWs =
 struct Peer {
     write: futures::stream::SplitSink<PeerWs, Message>,
     read: futures::stream::SplitStream<PeerWs>,
+    /// This connection's identified user id — the identity a minted capability
+    /// must name, or the relay rejects it as `UserIdMismatch`.
+    user_id: String,
 }
 
 impl Peer {
@@ -308,7 +323,7 @@ impl Peer {
     async fn connect(url: &str, user_id: &str, doc_id: &str) -> anyhow::Result<Self> {
         let (ws, _) = connect_async(url).await?;
         let (write, read) = ws.split();
-        let mut peer = Self { write, read };
+        let mut peer = Self { write, read, user_id: user_id.to_string() };
 
         peer.send(ClientMessage::Identify { user_id: user_id.to_string(), token: None }).await?;
         match peer.recv().await? {
@@ -316,18 +331,73 @@ impl Peer {
             other => return Err(anyhow::anyhow!("expected Identified, got {other:?}")),
         }
 
-        // capability: None — the CLI targets the default (un-gated) relay, where
-        // subscribe authorization (issue #29) is off. The relay accepts None when
-        // authz is disabled; a member mints a real capability only against an
-        // authz-enabled relay.
-        peer.send(ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability: None })
-            .await?;
-        match peer.recv().await? {
-            ServerMessage::Subscribed { .. } => {}
-            other => return Err(anyhow::anyhow!("expected Subscribed, got {other:?}")),
-        }
+        // capability: None — nothing can be minted yet. A joiner must be
+        // subscribed to RECEIVE the Welcome that makes it a member, and only a
+        // member can mint (issue #72). This subscription authorizes the MLS
+        // handshake alone; `present_capability` upgrades it once a group exists.
+        peer.subscribe(doc_id, None).await?;
 
         Ok(peer)
+    }
+
+    /// Subscribe (or re-subscribe) to `doc_id`, awaiting the relay's acceptance.
+    ///
+    /// Re-subscribing re-states the authorization: presenting a capability
+    /// upgrades the subscription to content-authorized, and a bare `Subscribe`
+    /// DOWNGRADES it back to handshake-only. So every subscribe after the group
+    /// exists must carry a capability.
+    async fn subscribe(
+        &mut self,
+        doc_id: &str,
+        capability: Option<SubscribeCapability>,
+    ) -> anyhow::Result<()> {
+        self.send(ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability }).await?;
+        match self.recv().await? {
+            ServerMessage::Subscribed { .. } => Ok(()),
+            other => Err(anyhow::anyhow!("expected Subscribed, got {other:?}")),
+        }
+    }
+
+    /// Register `doc`'s current-epoch subscribe anchor so members' capabilities
+    /// have something to verify against (issue #29).
+    ///
+    /// `rotation_proof` is empty: the CLI only ever registers a document it has
+    /// just created, which is the first (TOFU) registration. It never forges
+    /// continuity for an anchor someone else owns — such a registration is
+    /// refused, and the capability that follows then fails to verify.
+    ///
+    /// A successful registration is silent, so this does not wait for a reply;
+    /// a rejection arrives as an `Error` frame that the next [`Self::recv`]
+    /// surfaces (fail closed).
+    async fn register_anchor(
+        &mut self,
+        doc: &EncryptedDocument,
+        doc_id: &str,
+    ) -> anyhow::Result<()> {
+        self.send(ClientMessage::RegisterDocKey {
+            doc_id: doc_id.to_string(),
+            epoch: doc.epoch(),
+            public_key: doc.subscribe_verifying_key()?.to_vec(),
+            proof: doc.sign_doc_key_proof(doc_id)?,
+            rotation_proof: Vec::new(),
+        })
+        .await
+    }
+
+    /// Mint a capability at `doc`'s current epoch and re-subscribe with it,
+    /// upgrading this connection from handshake-only to content-authorized.
+    ///
+    /// The capability is bound to the LOCALLY-trusted `doc_id` the caller
+    /// subscribed to and to this connection's own identity — never to a value
+    /// taken from an inbound frame.
+    async fn present_capability(
+        &mut self,
+        doc: &EncryptedDocument,
+        doc_id: &str,
+    ) -> anyhow::Result<()> {
+        let capability =
+            doc.mint_subscribe_capability(&self.user_id, doc_id, now_unix(), CAPABILITY_TTL_SECS)?;
+        self.subscribe(doc_id, Some(capability)).await
     }
 
     /// Serialize and send one client message.
@@ -442,6 +512,39 @@ pub async fn session_check(
     outcome
 }
 
+/// The joiner half of the bootstrap: receive the `Welcome` over the relay, join
+/// the group, then present a freshly minted capability.
+///
+/// The ordering is the crux of issue #72. A joiner cannot mint before it has
+/// joined — the capability key derives from the group's per-epoch exporter
+/// secret — so it must subscribe capability-less to receive the `Welcome`, and
+/// only re-subscribe with a capability afterwards.
+async fn join_via_welcome(
+    peer: &mut Peer,
+    pending: collab_core::PendingMember,
+    doc_id: &str,
+) -> anyhow::Result<EncryptedDocument> {
+    // A 2-party joiner reads only the welcome — correct MLS semantics; the
+    // KeyPackage genuinely crossed the wire.
+    let welcome = peer.recv_mls(MlsMessageType::Welcome).await?;
+    // A joiner-side reconstruction: no commit and no anchor rotation — the
+    // joiner holds no outgoing-epoch key to sign one with.
+    let invite = collab_core::Invite {
+        doc_id: doc_id.to_string(),
+        welcome,
+        commit: vec![],
+        epoch: 1,
+        rotation: None,
+    };
+    let doc = EncryptedDocument::join(&invite, pending)?;
+
+    // A member only now, so able to mint only now. Re-subscribing with the
+    // capability upgrades this connection from handshake-only to
+    // content-authorized — without it the relay withholds every `YrsUpdate`.
+    peer.present_capability(&doc, doc_id).await?;
+    Ok(doc)
+}
+
 /// Drive the two-client choreography over an already-known relay URL.
 async fn run_session(
     url: &str,
@@ -466,6 +569,13 @@ async fn run_session(
     let key_package = alice.recv_mls(MlsMessageType::KeyPackage).await?;
     let mut alice_doc = EncryptedDocument::create(doc_id, "alice")?;
     let invite = alice_doc.create_invite(&key_package)?;
+
+    // The group now exists, so the anchor can be registered and Alice can
+    // upgrade her own handshake-only subscription. Both must happen BEFORE Bob
+    // presents his capability — his verifies against this anchor.
+    alice.register_anchor(&alice_doc, doc_id).await?;
+    alice.present_capability(&alice_doc, doc_id).await?;
+
     alice
         .send(ClientMessage::MlsHandshake {
             doc_id: doc_id.to_string(),
@@ -474,12 +584,7 @@ async fn run_session(
         })
         .await?;
 
-    // Bob receives the welcome and joins the group (a 2-party joiner reads only
-    // the welcome — correct MLS semantics; the KeyPackage genuinely crossed the wire).
-    let welcome = bob.recv_mls(MlsMessageType::Welcome).await?;
-    let bob_invite =
-        collab_core::Invite { doc_id: doc_id.to_string(), welcome, commit: vec![], epoch: 1 };
-    let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending)?;
+    let mut bob_doc = join_via_welcome(&mut bob, bob_pending, doc_id).await?;
 
     // Alice writes the text and publishes the encrypted update.
     alice_doc.insert(0, send_text);
@@ -558,8 +663,12 @@ async fn run_ws_session(
     let identify = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
     write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 
-    // capability: None — see `Peer::connect`; the CLI's default relay has
-    // subscribe authorization (issue #29) disabled.
+    // capability: None — this listener holds no MLS group (the CLI persists no
+    // MLS state, see `keygen`), so it has nothing to mint from and can only
+    // subscribe handshake-only. Against a relay with subscribe authorization on
+    // it therefore receives no YrsUpdate — including after a reconnect, since a
+    // bare Subscribe re-states the authorization as handshake-only. Presenting a
+    // capability here needs persisted group state first (issue #72 follow-up).
     let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability: None };
     write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 

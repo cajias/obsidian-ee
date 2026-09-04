@@ -18,6 +18,16 @@ export type CollabRole = 'owner' | 'joiner';
 // bounds every array parsed out of it.
 const MAX_INBOUND_FRAME_BYTES = 2 * 1024 * 1024;
 
+// Lifetime of a minted subscribe capability (#72), mirroring the CLI's
+// CAPABILITY_TTL_SECS (crates/collab-cli/src/commands.rs): short enough that a
+// leaked capability expires quickly, long enough to outlive a handshake.
+const CAPABILITY_TTL_SECS = 300n;
+
+/** Whole seconds since the Unix epoch, as the u64 the wasm boundary expects. */
+function nowUnix(): bigint {
+    return BigInt(Math.max(0, Math.floor(Date.now() / 1000)));
+}
+
 // Reconnect policy defaults, mirroring the Rust side so the two implementations
 // of this logic cannot drift again: MIN_STABLE_CONNECTION in
 // crates/collab-cli/src/commands.rs and RetryPolicy::default()'s max_delay in
@@ -196,6 +206,19 @@ function validateVaultSyncConfig(config: CollabClientConfig): void {
 }
 
 /**
+ * The anchor material a `register_doc_key` frame carries (#29). Structurally
+ * the wasm `WasmAnchorRotation`, so a rotation emitted by a commit is passed
+ * straight through; a first (TOFU) registration is built by hand with an empty
+ * `rotation_proof`.
+ */
+interface DocKeyAnchor {
+    epoch: bigint;
+    public_key: Uint8Array;
+    proof: Uint8Array;
+    rotation_proof: Uint8Array;
+}
+
+/**
  * A view onto one MLS group's mutable doc/pending slot (#32). The file group
  * (`doc`/`pending`) and the manifest group (`manifestDoc`/`manifestPending`)
  * run the exact same owner/joiner bootstrap and key_package/welcome/commit
@@ -219,7 +242,11 @@ export class CollabClient {
     // (owner) or until the Welcome arrives (joiner).
     private manifestDoc: WasmEncryptedDocument | null = null;
     private manifestPending: WasmPendingMember | null = null;
-    private groupEstablished = false;
+    // Terminal: set by destroy(), which frees the groups. Post-destroy() slot
+    // state is indistinguishable from a never-connected client's, so nothing
+    // derivable stops a later connect() from bootstrapping a fresh epoch-0
+    // group — this flag does.
+    private destroyed = false;
     private config: CollabClientConfig;
     private onUpdateCallback: UpdateCallback | null = null;
     private onManifestPathsCallback: ManifestPathsCallback | null = null;
@@ -285,6 +312,11 @@ export class CollabClient {
     private bootstrapGroup(slot: GroupSlot): void {
         if (this.config.role === 'owner') {
             slot.setDoc(WasmEncryptedDocument.create(slot.docId, this.config.userId));
+            // The group exists now, so the relay's verification anchor can be
+            // registered — nothing a member mints verifies without it (#72).
+            // Presenting the capability is establishGroup's job, deliberately
+            // after this: see the comment there.
+            this.registerAnchor(slot);
             return;
         }
         const pending = generate_key_package(this.config.userId);
@@ -298,13 +330,17 @@ export class CollabClient {
     }
 
     /**
-     * Establish the MLS group(s) EXACTLY ONCE, on the first successful connect.
-     * MLS group state is long-lived and persists across reconnects (only
-     * `this.ws` is recreated), so onopen must NOT re-run this on a reconnect:
+     * Establish the MLS group(s) EXACTLY ONCE EACH, per slot. MLS group state is
+     * long-lived and persists across reconnects (only `this.ws` is recreated),
+     * so onopen must NOT re-run this for a slot that already has one:
      * re-creating would spawn a NEW empty solo group at epoch 0 and orphan the
-     * real group. This guard satisfies the CLAUDE.md reconnect-lifecycle
-     * invariant "guard against a second start that would orphan the prior
-     * client/handle."
+     * real group. The per-slot filter below satisfies the CLAUDE.md
+     * reconnect-lifecycle invariant "guard against a second start that would
+     * orphan the prior client/handle."
+     *
+     * Per-slot, not one flag over both: a vault-sync joiner can be admitted to
+     * the file group and NOT the manifest group (the Welcomes are independent),
+     * and an all-or-nothing latch left that second group permanently unjoinable.
      *
      * ponytail: first-cut behavior — a joiner whose socket drops mid-handshake
      * (before the Welcome) stays un-joined and fails closed (no plaintext), which
@@ -312,18 +348,70 @@ export class CollabClient {
      * machine is deliberately NOT built here (YAGNI).
      */
     private establishGroup(): void {
-        if (this.groupEstablished) {
-            return;
-        }
-        this.groupEstablished = true;
-        this.bootstrapGroup(this.fileSlot());
         // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
         // established by the same handshake. Same role: whoever owns the file doc
-        // owns the manifest group. Throws here fail the connect() attempt via
-        // tryEstablishGroup, exactly like the file group.
-        if (this.config.vaultSync && this.config.manifestDocId) {
-            this.bootstrapGroup(this.manifestSlot());
+        // owns the manifest group. Throws below fail the connect() attempt via
+        // tryInitialize, exactly like the file group.
+        const slots =
+            this.config.vaultSync && this.config.manifestDocId
+                ? [this.fileSlot(), this.manifestSlot()]
+                : [this.fileSlot()];
+        // A slot with a live doc is a group to RESUME; a slot with a live pending
+        // is a joiner still mid-handshake, whose one-time key package is already
+        // on the wire. Only a slot with neither needs bootstrapping.
+        const toBootstrap = slots.filter((slot) => !slot.getDoc() && !slot.getPending());
+        for (const slot of toBootstrap) {
+            try {
+                this.bootstrapGroup(slot);
+            } catch (error) {
+                // bootstrapGroup can throw AFTER slot.setDoc() (the anchor's
+                // signing/verifying-key calls do), so a half-done slot would
+                // otherwise be left with a doc set and register_doc_key never
+                // sent. Every later connect would then skip that slot's
+                // bootstrap and present capabilities for a document the relay
+                // has no anchor for — it rejects the subscribe, and the client
+                // goes silently deaf while resolving normally. Undo the slot so
+                // a retry re-runs it from scratch.
+                //
+                // Exactly the ONE slot that threw, never the whole loop. The
+                // "nothing was sent yet" claim holds only PER SLOT: everything
+                // that can throw for THIS slot runs before its own frame goes
+                // out, so its retry's TOFU registration is still the relay's
+                // first for that document. It does NOT hold across slots — a
+                // slot that already completed has its register_doc_key on the
+                // wire, and freeing it would make the retry re-create it at
+                // epoch 0 and re-register, which the relay refuses twice over
+                // (rotation continuity, then stale epoch). Same reason a group
+                // that survived a disconnect is not in `toBootstrap` at all,
+                // and the same reason this teardown is not in failConnect,
+                // which is shared with the identify/subscribe branch that also
+                // fires on a RECONNECT whose long-lived group must survive.
+                //
+                // The joiner variant of the same over-broad teardown was a leak
+                // rather than a lockout — a completed slot's pending was freed
+                // with its key package already sent, so the owner could add a
+                // leaf for a member that then re-bootstraps with a fresh one (a
+                // phantom leaf: an epoch, no anchor damage). Per-slot undo
+                // closes that too, and the slot it DOES free has nothing on the
+                // wire: a joiner throws in generate_key_package, before both
+                // setPending and the send.
+                this.freeSlot(slot);
+                throw error;
+            }
         }
+        // Anchors are registered, so the capability-less subscribes sent moments
+        // ago in subscribe() can be upgraded to content-authorized (#72). This
+        // runs OUTSIDE the teardown above on purpose: minting is the one step
+        // that happens after register_doc_key is already on the wire, and
+        // discarding the doc then would strand a relay-side anchor a fresh TOFU
+        // registration cannot replace (the relay demands a rotation continuity
+        // proof once an anchor exists). A throw here still fails the connect; the
+        // group survives and the next attempt's subscribe() re-presents.
+        //
+        // Only the slots THIS call bootstrapped: a slot that already had a group
+        // was re-presented moments ago by subscribe(), so re-minting it here is a
+        // wasted wasm call.
+        toBootstrap.filter((slot) => slot.getDoc()).forEach((slot) => this.subscribeTo(slot));
     }
 
     /** True when this frame's doc_id is the configured manifest group. */
@@ -350,15 +438,21 @@ export class CollabClient {
     }
 
     /**
-     * Run establishGroup(), rejecting this connect() attempt and tearing down the
-     * socket if it throws instead of letting the throw abort onopen unhandled.
-     * WasmEncryptedDocument.create()/generate_key_package() are wasm-bindgen
-     * Result<T, JsError> calls that throw on a crypto-provider/entropy failure;
-     * without this guard connectPromise would never settle (the exact hang class
-     * already fixed once for the sibling identify/subscribe branch in connect()).
+     * Run the whole onopen initialization, rejecting this connect() attempt and
+     * tearing down the socket if any of it throws instead of letting the throw
+     * abort onopen unhandled. Every step is a wasm-bindgen `Result<T, JsError>`
+     * call away from throwing: establishGroup() creates groups/key packages, and
+     * subscribe() now MINTS a capability (#72). Without this guard
+     * connectPromise would never settle (the exact hang class CLAUDE.md's
+     * connect-settles-exactly-once invariant names).
      */
-    private tryEstablishGroup(reject: (reason?: unknown) => void): boolean {
+    private tryInitialize(reject: (reason?: unknown) => void): boolean {
         try {
+            const identified = this.sendIdentify();
+            const subscribed = this.subscribe();
+            if (!identified || !subscribed) {
+                throw new Error('Failed to send initialization messages');
+            }
             this.establishGroup();
             return true;
         } catch (error) {
@@ -368,15 +462,22 @@ export class CollabClient {
     }
 
     connect(): Promise<void> {
+        // destroy() freed the groups, so reconnecting would bootstrap a FRESH
+        // epoch-0 solo group: divergent from every other member and announced
+        // with a TOFU registration the relay rejects. Fail closed.
+        if (this.destroyed) {
+            return Promise.reject(new Error('CollabClient has been destroyed'));
+        }
         // Prevent concurrent connection attempts
         if (this.connectPromise) {
             return this.connectPromise;
         }
 
-        // An explicit connect() restarts a stopped client, matching the
-        // groupEstablished reset disconnect() already does for exactly that case.
-        // Only reached on a real connect() call: the reconnect timer checks
-        // `stopped` before it gets here, so this cannot revive a stopped client.
+        // An explicit connect() restarts a stopped client. A group that survived
+        // the disconnect is RESUMED (establishGroup skips a slot that still has
+        // one); a slot that disconnect() emptied is re-bootstrapped. Only reached
+        // on a real connect() call: the reconnect timer checks `stopped` before
+        // it gets here, so this cannot revive a stopped client.
         this.stopped = false;
         this.connectionState = 'connecting';
         this.connectPromise = new Promise<void>((resolve, reject) => {
@@ -397,19 +498,9 @@ export class CollabClient {
                     // Note: Don't clear connectPromise here - the finally block handles that
                     // to avoid race conditions with concurrent connection attempts
 
-                    // Critical: verify initialization messages are sent
-                    const identified = this.sendIdentify();
-                    const subscribed = this.subscribe();
-
-                    if (!identified || !subscribed) {
-                        this.failConnect(
-                            reject,
-                            new Error('Failed to send initialization messages')
-                        );
-                        return;
-                    }
-
-                    if (!this.tryEstablishGroup(reject)) {
+                    // Critical: identify, subscribe and establish the group, or
+                    // settle this attempt as failed.
+                    if (!this.tryInitialize(reject)) {
                         return;
                     }
 
@@ -486,19 +577,75 @@ export class CollabClient {
     }
 
     private subscribe(): boolean {
-        const subscribed = this.send({
-            type: 'subscribe',
-            doc_id: this.config.docId,
-        });
-        // Vault sync rides the same connection: also subscribe to the manifest doc.
+        const subscribed = this.subscribeTo(this.fileSlot());
+        // Vault sync rides the same connection: also subscribe to the manifest
+        // doc, whose capability comes from its OWN group (#32).
         if (this.config.vaultSync && this.config.manifestDocId) {
-            const manifestSubscribed = this.send({
-                type: 'subscribe',
-                doc_id: this.config.manifestDocId,
-            });
+            const manifestSubscribed = this.subscribeTo(this.manifestSlot());
             return subscribed && manifestSubscribed;
         }
         return subscribed;
+    }
+
+    /**
+     * Subscribe (or re-subscribe) to one group `slot`, presenting a freshly
+     * minted capability whenever that group exists (#72).
+     *
+     * Re-subscribing RE-STATES the relay-side authorization: presenting a
+     * capability upgrades the subscription to content-authorized, and a bare
+     * subscribe DOWNGRADES it back to handshake-only. So every subscribe after
+     * a group exists — including the one every reconnect sends — must carry one.
+     *
+     * The capability is bound to the slot's LOCALLY-TRUSTED doc id and to this
+     * client's own identity, never to a value taken from an inbound frame. The
+     * field is omitted (the relay's `Option` default, `None`) while no group
+     * exists: a joiner must be subscribed to RECEIVE the Welcome that makes it a
+     * member, and only a member can mint.
+     */
+    private subscribeTo(slot: GroupSlot): boolean {
+        const doc = slot.getDoc();
+        const capability: unknown = doc
+            ? JSON.parse(
+                  doc.mint_subscribe_capability(
+                      this.config.userId,
+                      slot.docId,
+                      nowUnix(),
+                      CAPABILITY_TTL_SECS
+                  )
+              )
+            : undefined;
+        return this.send({ type: 'subscribe', doc_id: slot.docId, capability });
+    }
+
+    /**
+     * Register this group's FIRST (TOFU) verification anchor with the relay,
+     * which is what every capability minted for the document verifies against.
+     */
+    private registerAnchor(slot: GroupSlot): boolean {
+        const doc = slot.getDoc();
+        if (!doc) {
+            return false;
+        }
+        return this.registerDocKey(slot.docId, {
+            epoch: doc.epoch,
+            public_key: doc.subscribe_verifying_key(),
+            proof: doc.sign_doc_key_proof(slot.docId),
+            // A first registration has no current anchor to prove continuity
+            // against; the relay requires a rotation proof only once one exists.
+            rotation_proof: new Uint8Array(),
+        });
+    }
+
+    /** Send one `register_doc_key` frame: a TOFU registration or a rotation. */
+    private registerDocKey(docId: string, anchor: DocKeyAnchor): boolean {
+        return this.send({
+            type: 'register_doc_key',
+            doc_id: docId,
+            epoch: Number(anchor.epoch),
+            public_key: [...anchor.public_key],
+            proof: [...anchor.proof],
+            rotation_proof: [...anchor.rotation_proof],
+        });
     }
 
     private send(message: object): boolean {
@@ -667,6 +814,33 @@ export class CollabClient {
                     return;
                 }
                 const invite = doc.create_invite(payload);
+                // The invite's commit advanced this group's epoch, so the relay's
+                // anchor must move with it BEFORE the Welcome goes out: the
+                // joiner mints at the new epoch the moment it joins, and a
+                // capability whose epoch is ahead of the anchor is REJECTED.
+                if (invite.rotation) {
+                    this.registerDocKey(slot.docId, invite.rotation);
+                }
+                // This client's own capability was minted at the previous epoch
+                // and no longer verifies; re-present at the new one. Before the
+                // Welcome, not after: the rotation just revoked THIS client's own
+                // content authorization (the relay gates fan-out on strict epoch
+                // equality), and the Welcome is what makes the joiner start
+                // sending. Matches the Rust half's register -> present -> welcome
+                // order in collab-cli's commands.rs.
+                this.subscribeTo(slot);
+                // The commit is what carries EXISTING members to the new epoch;
+                // forwarding only the Welcome works for exactly two parties and
+                // diverges the group at the third. It goes out BEFORE the
+                // Welcome: the relay fans every handshake frame out to all other
+                // subscribers in order, so the new member sees this too, and only
+                // no-ops it while it still has no group (see `case 'commit'`).
+                this.send({
+                    type: 'mls_handshake',
+                    doc_id: slot.docId,
+                    payload: [...invite.commit],
+                    message_type: 'commit',
+                });
                 this.send({
                     type: 'mls_handshake',
                     doc_id: slot.docId,
@@ -701,10 +875,39 @@ export class CollabClient {
                 // session is required to retry.
                 slot.setPending(null);
                 slot.setDoc(WasmEncryptedDocument.join(invite, pending));
+                // A member only now, so able to mint only now: re-subscribing with
+                // a capability upgrades this connection from handshake-only to
+                // content-authorized. Without it the relay withholds every
+                // yrs_update (#72) — this ordering is the deadlock the issue exists
+                // to fix, so it must stay AFTER the join, never before.
+                this.subscribeTo(slot);
                 break;
             }
             case 'commit': {
-                slot.getDoc()?.process_commit(payload);
+                // No group yet: this is the add-commit that admits THIS client,
+                // fanned out to every subscriber ahead of its own Welcome. There
+                // is nothing to advance and nothing to re-present — a bare
+                // subscribe here would only downgrade what is already
+                // handshake-only.
+                const doc = slot.getDoc();
+                if (!doc) {
+                    return;
+                }
+                // An existing member follows the owner's commit to the new epoch.
+                // The rotation it returns is DELIBERATELY dropped: the owner
+                // already registered the identical anchor for this epoch, and
+                // only one registration can win. The relay verifies continuity
+                // under the CURRENT anchor key and then demands a strictly higher
+                // epoch, so a second registration of the same rotation is
+                // rejected twice over (crates/collab-relay/src/relay.rs,
+                // `handle_register_doc_key`). Mirrors the Rust choreography in
+                // `three_real_members` (tests/e2e-tests/tests/subscribe_authz.rs),
+                // where only the owner registers.
+                doc.process_commit(payload);
+                // This client's capability was minted at the previous epoch and
+                // no longer verifies against the rotated anchor; re-present at
+                // the new one or the relay withholds every yrs_update (#72).
+                this.subscribeTo(slot);
                 break;
             }
             default:
@@ -765,6 +968,11 @@ export class CollabClient {
             const plaintext = this.manifestDoc.decrypt_bytes(encrypted);
             const newPaths = this.config.vaultSync!.apply_remote_manifest(plaintext);
             for (const path of newPaths) {
+                // Capability-less on purpose: a newly-announced path has no MLS
+                // group on this client yet, so there is nothing to mint from.
+                // Under subscribe authorization these subscriptions are
+                // handshake-only and receive no content until a group for the
+                // path is established (#72 follow-up).
                 this.send({ type: 'subscribe', doc_id: path });
             }
             if (this.onManifestPathsCallback) {
@@ -1017,12 +1225,37 @@ export class CollabClient {
         this.clearStabilityTimer();
         this.ws?.close();
         this.ws = null;
-        // Free a still-unconsumed key package (a joiner that never got its
-        // Welcome); see freeSlot's doc comment for the double-free hazard.
+        // An ESTABLISHED MLS group outlives the socket and must survive an
+        // explicit stop. Freeing it here made the next connect() build a FRESH
+        // epoch-0 group: silently divergent from every other member, and
+        // announced with a TOFU register_doc_key the relay rejects — an anchor
+        // for the document already exists, so it demands a rotation-continuity
+        // proof — followed by an epoch-0 capability it rejects as Unauthorized.
+        //
+        // Only a slot with NO group is torn down. That releases a still-
+        // unconsumed key package (a joiner that never got its Welcome) and lets
+        // the next connect() re-bootstrap that slot from scratch; see freeSlot's
+        // doc comment for the double-free hazard. destroy() releases the groups.
+        // Emptying that slot is also what tells the next connect() to
+        // re-bootstrap it: establishGroup() bootstraps exactly the slots with
+        // neither a doc nor a pending.
+        [this.fileSlot(), this.manifestSlot()]
+            .filter((slot) => !slot.getDoc())
+            .forEach((slot) => this.freeSlot(slot));
+    }
+
+    /**
+     * End the session: stop the client and release its MLS groups.
+     *
+     * `disconnect()` is a pause — it keeps an established group so a later
+     * `connect()` RESUMES it rather than re-creating one. `destroy()` is the
+     * end, freeing the wasm handles `disconnect()` deliberately holds. The
+     * client is not reusable afterwards — `connect()` rejects.
+     */
+    destroy(): void {
+        this.disconnect();
         this.freeSlot(this.fileSlot());
-        // Same lifecycle for the manifest group (#32).
         this.freeSlot(this.manifestSlot());
-        // Allow a future reconnect after an explicit disconnect to re-establish.
-        this.groupEstablished = false;
+        this.destroyed = true;
     }
 }
