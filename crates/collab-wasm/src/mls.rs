@@ -231,6 +231,56 @@ impl WasmEncryptedDocument {
         self.0.epoch()
     }
 
+    /// Mint a subscribe capability for this document, as the JSON the relay
+    /// expects in `Subscribe.capability` (issues #29, #72).
+    ///
+    /// Returned as JSON rather than as a getter struct so the shape crossing to
+    /// JS is produced by the very `Serialize` impl the relay deserializes with:
+    /// the caller does `JSON.parse` and puts the object on the wire verbatim,
+    /// and no hand-written field mapping can drift from the protocol.
+    ///
+    /// `doc_id` must be the caller's LOCALLY-TRUSTED document id, never one read
+    /// off an inbound frame, and `user_id` must be the identity the caller used
+    /// to `Identify` — the relay checks it against the presenting connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no MLS group is established (nothing to mint from).
+    pub fn mint_subscribe_capability(
+        &self,
+        user_id: &str,
+        doc_id: &str,
+        now_unix: u64,
+        ttl_secs: u64,
+    ) -> Result<String, JsError> {
+        let cap = self
+            .0
+            .mint_subscribe_capability(user_id, doc_id, now_unix, ttl_secs)
+            .map_err(js_err)?;
+        serde_json::to_string(&cap).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Sign the `RegisterDocKey` self-proof for this document's current epoch —
+    /// the TOFU half of anchor registration, paired with
+    /// [`Self::subscribe_verifying_key`] (issue #29).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no MLS group is established.
+    pub fn sign_doc_key_proof(&self, doc_id: &str) -> Result<Vec<u8>, JsError> {
+        self.0.sign_doc_key_proof(doc_id).map_err(js_err)
+    }
+
+    /// The public anchor key for this document's current epoch: what the relay
+    /// stores and verifies every presented capability against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no MLS group is established.
+    pub fn subscribe_verifying_key(&self) -> Result<Vec<u8>, JsError> {
+        self.0.subscribe_verifying_key().map(|k| k.to_vec()).map_err(js_err)
+    }
+
     /// Snapshot + encrypt this document's MLS group state for at-rest
     /// persistence (issue #30). `key` MUST be exactly 32 bytes (all-zeros
     /// rejected). Returns `nonce || ciphertext`. The caller owns key provenance
@@ -264,4 +314,82 @@ impl WasmEncryptedDocument {
 /// length up front (a short/long key can never be a valid AES-256 key).
 fn to_key(key: &[u8]) -> Result<[u8; 32], JsError> {
     key.try_into().map_err(|_| JsError::new("key must be exactly 32 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Native tests for the capability surface (issue #72). The point of these
+    //! is the WIRE SHAPE: a capability minted here must deserialize and verify
+    //! with the protocol crate's own code, which is what the relay runs.
+    use super::*;
+
+    #[test]
+    fn minted_capability_json_verifies_under_the_registered_anchor() {
+        let doc = WasmEncryptedDocument::create("doc-a", "alice").unwrap();
+        let json = doc.mint_subscribe_capability("alice", "doc-a", 1_000, 300).unwrap();
+
+        let cap: collab_proto::SubscribeCapability = serde_json::from_str(&json).unwrap();
+        let key: [u8; 32] = doc.subscribe_verifying_key().unwrap().try_into().unwrap();
+        collab_proto::verify_subscribe_capability(&cap, &key, "alice", "doc-a", doc.epoch(), 1_000)
+            .unwrap();
+        // The registration proof rides the same anchor key.
+        assert!(collab_proto::verify_doc_key_proof(
+            "doc-a",
+            doc.epoch(),
+            &key,
+            &doc.sign_doc_key_proof("doc-a").unwrap(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_subscribe_frame_a_client_builds_round_trips() {
+        // The plugin does `JSON.parse(mint(...))` and drops the object straight
+        // into a subscribe frame; JSON round-tripping is identity, so this is
+        // the exact envelope the relay receives.
+        let doc = WasmEncryptedDocument::create("doc-a", "alice").unwrap();
+        let cap_json = doc.mint_subscribe_capability("alice", "doc-a", 1_000, 300).unwrap();
+        let frame = format!(r#"{{"type":"subscribe","doc_id":"doc-a","capability":{cap_json}}}"#);
+
+        let msg: collab_proto::ClientMessage = serde_json::from_str(&frame).unwrap();
+        let collab_proto::ClientMessage::Subscribe { doc_id, capability } = msg else {
+            panic!("frame did not decode as Subscribe");
+        };
+        assert_eq!(doc_id, "doc-a");
+        assert_eq!(capability.expect("capability decoded").user_id, "alice");
+    }
+
+    #[test]
+    fn a_capability_for_another_document_is_rejected() {
+        let doc = WasmEncryptedDocument::create("doc-a", "alice").unwrap();
+        let json = doc.mint_subscribe_capability("alice", "doc-a", 1_000, 300).unwrap();
+        let cap: collab_proto::SubscribeCapability = serde_json::from_str(&json).unwrap();
+        let key: [u8; 32] = doc.subscribe_verifying_key().unwrap().try_into().unwrap();
+
+        // Presented against a different document (a misroute or a replay), the
+        // capability must fail — it is bound to the doc id it was minted for.
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &key,
+                "alice",
+                "doc-b",
+                doc.epoch(),
+                1_000
+            ),
+            Err(collab_proto::CapabilityError::DocIdMismatch)
+        );
+        // And presented by another identity within its TTL.
+        assert_eq!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &key,
+                "eve",
+                "doc-a",
+                doc.epoch(),
+                1_000
+            ),
+            Err(collab_proto::CapabilityError::UserIdMismatch)
+        );
+    }
 }

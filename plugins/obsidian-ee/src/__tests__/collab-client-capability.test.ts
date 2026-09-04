@@ -1,0 +1,377 @@
+import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import type { CollabClientConfig } from '../collab-client';
+
+// Subscribe authorization (#72): every subscribe for a document whose MLS group
+// exists must carry a freshly minted capability, because a bare Subscribe
+// DOWNGRADES an existing authorization back to handshake-only at the relay.
+// These tests observe the wire frames the client emits, which is the only thing
+// the relay judges.
+
+const sockets: MockWebSocket[] = [];
+
+// Sockets that open on the next timer tick and stay open until a test closes
+// them explicitly. Every construction is recorded so a reconnect test can read
+// the frames of the SECOND socket.
+class MockWebSocket {
+    static OPEN = 1;
+    static CONNECTING = 0;
+    static CLOSING = 2;
+    static CLOSED = 3;
+
+    readyState = MockWebSocket.CONNECTING;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onerror: ((error: unknown) => void) | null = null;
+    onclose: (() => void) | null = null;
+    sentMessages: string[] = [];
+
+    constructor() {
+        sockets.push(this);
+        setTimeout(() => {
+            this.readyState = MockWebSocket.OPEN;
+            this.onopen?.();
+        }, 0);
+    }
+
+    send(data: string): void {
+        this.sentMessages.push(data);
+    }
+
+    close(): void {
+        this.readyState = MockWebSocket.CLOSED;
+    }
+
+    /** Drop the connection the way a relay restart would. */
+    drop(): void {
+        this.readyState = MockWebSocket.CLOSED;
+        this.onclose?.();
+    }
+
+    simulateMessage(data: object): void {
+        this.onmessage?.({ data: JSON.stringify(data) });
+    }
+}
+
+// @ts-expect-error - Override global WebSocket
+global.WebSocket = MockWebSocket;
+
+// The capability shape the relay deserializes into
+// `Option<SubscribeCapability>` (crates/collab-proto/src/capability.rs). The
+// mock mints a JSON string exactly like the wasm binding does, echoing the
+// doc_id it was minted for so a test can tell WHICH group minted it.
+const MOCK_EPOCH = 3n;
+const makeMockDoc = (docId: string) => ({
+    docId,
+    get_content: jest.fn<() => string>().mockReturnValue(''),
+    insert: jest.fn(),
+    delete: jest.fn(),
+    get_encrypted_update: jest
+        .fn<() => { ciphertext: Uint8Array; epoch: bigint }>()
+        .mockReturnValue({ ciphertext: new Uint8Array([1, 2, 3]), epoch: MOCK_EPOCH }),
+    apply_encrypted_update: jest.fn(),
+    encrypt_bytes: jest
+        .fn<() => { ciphertext: Uint8Array; epoch: bigint }>()
+        .mockReturnValue({ ciphertext: new Uint8Array([4, 5]), epoch: MOCK_EPOCH }),
+    decrypt_bytes: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([6])),
+    create_invite: jest.fn(() => ({
+        welcome: new Uint8Array([9, 9]),
+        // A real create_invite advances the epoch and emits the anchor rotation
+        // for the epoch it just created.
+        rotation: {
+            epoch: 4n,
+            public_key: new Uint8Array([11, 11]),
+            proof: new Uint8Array([12]),
+            rotation_proof: new Uint8Array([13]),
+        },
+    })),
+    process_commit: jest.fn(),
+    epoch: MOCK_EPOCH,
+    mint_subscribe_capability: jest.fn(
+        (user_id: string, capDocId: string, _now: bigint, _ttl: bigint) =>
+            JSON.stringify({
+                user_id,
+                doc_id: capDocId,
+                epoch: Number(MOCK_EPOCH),
+                expiry_unix: 1_000_000,
+                signature: [1, 2, 3],
+                // Not a wire field: proves WHICH group's doc minted this.
+                minted_by: docId,
+            })
+    ),
+    sign_doc_key_proof: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([7, 7])),
+    subscribe_verifying_key: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([8, 8])),
+    free: jest.fn(),
+});
+
+type MockDoc = ReturnType<typeof makeMockDoc>;
+const createdDocs: MockDoc[] = [];
+const joinedDocs: MockDoc[] = [];
+
+jest.unstable_mockModule('../wasm/collab_wasm', () => ({
+    __esModule: true,
+    WasmEncryptedDocument: {
+        create: jest.fn((docId: string) => {
+            const doc = makeMockDoc(docId);
+            createdDocs.push(doc);
+            return doc;
+        }),
+        join: jest.fn((invite: { doc_id?: string }) => {
+            const doc = makeMockDoc(invite.doc_id ?? 'joined');
+            joinedDocs.push(doc);
+            return doc;
+        }),
+    },
+    WasmInvite: {
+        from_welcome: jest.fn((docId: string) => ({ doc_id: docId, welcome: new Uint8Array() })),
+    },
+    generate_key_package: jest.fn(() => ({
+        key_package: new Uint8Array([7, 7, 7]),
+        free: jest.fn(),
+    })),
+}));
+
+const { CollabClient } = await import('../collab-client');
+type CollabClient = InstanceType<typeof CollabClient>;
+
+interface SubscribeFrame {
+    type: string;
+    doc_id: string;
+    capability?: { user_id: string; doc_id: string; epoch: number; minted_by?: string };
+}
+
+function frames(socket: MockWebSocket): { type: string; [k: string]: unknown }[] {
+    return socket.sentMessages.map((m) => JSON.parse(m));
+}
+
+function subscribes(socket: MockWebSocket, docId?: string): SubscribeFrame[] {
+    return (frames(socket) as unknown as SubscribeFrame[]).filter(
+        (f) => f.type === 'subscribe' && (docId === undefined || f.doc_id === docId)
+    );
+}
+
+function makeConfig(overrides: Partial<CollabClientConfig> = {}): CollabClientConfig {
+    return {
+        relayUrl: 'ws://localhost:8080',
+        userId: 'user1',
+        docId: 'doc1',
+        role: 'owner',
+        ...overrides,
+    };
+}
+
+async function connectClient(client: CollabClient): Promise<void> {
+    const promise = client.connect();
+    jest.runAllTimers();
+    await promise;
+}
+
+describe('subscribe capability (#72)', () => {
+    let client: CollabClient | null = null;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        sockets.length = 0;
+        createdDocs.length = 0;
+        joinedDocs.length = 0;
+    });
+
+    afterEach(() => {
+        client?.disconnect();
+        client = null;
+        jest.useRealTimers();
+    });
+
+    it('presents a capability once the owner group exists', async () => {
+        client = new CollabClient(makeConfig());
+        await connectClient(client);
+
+        const presented = subscribes(sockets[0], 'doc1').filter((f) => f.capability);
+        expect(presented).toHaveLength(1);
+        expect(presented[0].capability).toMatchObject({
+            user_id: 'user1',
+            doc_id: 'doc1',
+            minted_by: 'doc1',
+        });
+        // Bound to the LOCALLY-trusted doc id, at the group's current epoch.
+        expect(createdDocs[0].mint_subscribe_capability).toHaveBeenCalledWith(
+            'user1',
+            'doc1',
+            expect.any(BigInt),
+            expect.any(BigInt)
+        );
+    });
+
+    it('registers the doc anchor as owner so a capability can verify', async () => {
+        client = new CollabClient(makeConfig());
+        await connectClient(client);
+
+        const registrations = frames(sockets[0]).filter((f) => f.type === 'register_doc_key');
+        expect(registrations).toHaveLength(1);
+        expect(registrations[0]).toMatchObject({
+            doc_id: 'doc1',
+            epoch: Number(MOCK_EPOCH),
+            public_key: [8, 8],
+            proof: [7, 7],
+            // First registration is TOFU: no continuity proof exists yet.
+            rotation_proof: [],
+        });
+    });
+
+    it('subscribes capability-less first, then re-presents after joining', async () => {
+        client = new CollabClient(makeConfig({ role: 'joiner' }));
+        await connectClient(client);
+
+        // A joiner MUST be subscribed to receive the Welcome, and cannot mint
+        // before it is a member — so the first subscribe carries nothing.
+        const beforeJoin = subscribes(sockets[0], 'doc1');
+        expect(beforeJoin).toHaveLength(1);
+        expect(beforeJoin[0].capability).toBeUndefined();
+
+        sockets[0].onmessage?.({
+            data: JSON.stringify({
+                type: 'mls_handshake',
+                doc_id: 'doc1',
+                payload: [1, 2, 3],
+                message_type: 'welcome',
+            }),
+        });
+
+        const afterJoin = subscribes(sockets[0], 'doc1');
+        expect(afterJoin).toHaveLength(2);
+        expect(afterJoin[1].capability).toMatchObject({ user_id: 'user1', doc_id: 'doc1' });
+        expect(joinedDocs).toHaveLength(1);
+    });
+
+    it('re-presents a capability on reconnect instead of a bare subscribe', async () => {
+        client = new CollabClient(makeConfig({ maxReconnectAttempts: 3 }));
+        await connectClient(client);
+        expect(sockets).toHaveLength(1);
+
+        sockets[0].drop();
+        jest.runAllTimers();
+        await Promise.resolve();
+        jest.runAllTimers();
+
+        expect(sockets.length).toBeGreaterThan(1);
+        const reconnected = subscribes(sockets[1], 'doc1');
+        expect(reconnected).toHaveLength(1);
+        // A bare Subscribe here would DOWNGRADE the relay-side authorization to
+        // handshake-only and silently stop all content.
+        expect(reconnected[0].capability).toMatchObject({ user_id: 'user1', doc_id: 'doc1' });
+    });
+
+    it('settles the connect attempt when minting throws on reconnect', async () => {
+        const errors: { type: string; message: string }[] = [];
+        client = new CollabClient(makeConfig({ maxReconnectAttempts: 3 }));
+        client.onError((e) => errors.push(e));
+        await connectClient(client);
+
+        // Minting is a wasm-bindgen call that can throw. A throw escaping onopen
+        // would leave connectPromise unsettled forever and deadlock the reconnect
+        // loop (CLAUDE.md: every connect attempt settles exactly once).
+        createdDocs[0].mint_subscribe_capability.mockImplementation(() => {
+            throw new Error('mint exploded');
+        });
+
+        sockets[0].drop();
+        jest.runAllTimers();
+        await Promise.resolve();
+        jest.runAllTimers();
+        // Drain the microtask chain the rejection travels: reject -> .finally
+        // (clears connectPromise) -> the reconnect loop's .catch -> onError.
+        for (let i = 0; i < 10; i++) {
+            await Promise.resolve();
+        }
+
+        expect(sockets).toHaveLength(2);
+        // The attempt failed BEFORE any subscribe went out, and it settled: the
+        // rejection surfaced as a connection error instead of hanging.
+        expect(subscribes(sockets[1])).toHaveLength(0);
+        expect(sockets[1].readyState).toBe(3);
+        expect(errors).toContainEqual(
+            expect.objectContaining({ type: 'connection', message: 'mint exploded' })
+        );
+    });
+
+    it('mints the manifest capability from the manifest group, not the file group', async () => {
+        client = new CollabClient(
+            makeConfig({
+                vaultSync: { apply_remote_manifest: jest.fn(() => []) },
+                manifestDocId: 'manifest1',
+            })
+        );
+        await connectClient(client);
+
+        const presented = subscribes(sockets[0], 'manifest1').filter((f) => f.capability);
+        expect(presented).toHaveLength(1);
+        // The manifest rides its OWN MLS group: its capability must be minted by
+        // that group's document, never by the file group's.
+        expect(presented[0].capability).toMatchObject({
+            doc_id: 'manifest1',
+            minted_by: 'manifest1',
+        });
+
+        const [fileDoc, manifestDoc] = createdDocs;
+        expect(manifestDoc.mint_subscribe_capability).toHaveBeenCalledWith(
+            'user1',
+            'manifest1',
+            expect.any(BigInt),
+            expect.any(BigInt)
+        );
+        expect(fileDoc.mint_subscribe_capability).not.toHaveBeenCalledWith(
+            'user1',
+            'manifest1',
+            expect.any(BigInt),
+            expect.any(BigInt)
+        );
+    });
+
+    it('rotates the anchor and re-presents when inviting a member', async () => {
+        client = new CollabClient(makeConfig());
+        await connectClient(client);
+        const before = frames(sockets[0]).length;
+
+        sockets[0].simulateMessage({
+            type: 'mls_handshake',
+            doc_id: 'doc1',
+            payload: [1, 2, 3],
+            message_type: 'key_package',
+        });
+
+        const emitted = frames(sockets[0]).slice(before);
+        // create_invite advanced the epoch, so the relay's anchor must move with
+        // it BEFORE the joiner presents an epoch-4 capability.
+        expect(emitted.map((f) => f.type)).toEqual([
+            'register_doc_key',
+            'mls_handshake',
+            'subscribe',
+        ]);
+        expect(emitted[0]).toMatchObject({
+            doc_id: 'doc1',
+            epoch: 4,
+            public_key: [11, 11],
+            proof: [12],
+            rotation_proof: [13],
+        });
+        expect((emitted[2] as unknown as SubscribeFrame).capability).toBeDefined();
+    });
+
+    it('CHARACTERIZATION: manifest-discovered paths stay capability-less (no group yet)', async () => {
+        const vaultSync = { apply_remote_manifest: jest.fn(() => ['notes/new.md']) };
+        client = new CollabClient(makeConfig({ vaultSync, manifestDocId: 'manifest1' }));
+        await connectClient(client);
+
+        sockets[0].simulateMessage({
+            type: 'yrs_update',
+            doc_id: 'manifest1',
+            encrypted: [1, 2],
+            epoch: 3,
+        });
+
+        const discovered = subscribes(sockets[0], 'notes/new.md');
+        expect(discovered).toHaveLength(1);
+        // Honest limitation: no MLS group exists for a newly-announced path, so
+        // there is nothing to mint from. Handshake-only until one is established.
+        expect(discovered[0].capability).toBeUndefined();
+    });
+});

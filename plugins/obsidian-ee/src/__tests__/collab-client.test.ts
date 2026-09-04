@@ -117,6 +117,21 @@ function installStaysOpenWebSocket(): () => number {
     return () => constructions;
 }
 
+// The anchor rotation a real create_invite emits for the epoch its commit
+// creates; the owner forwards it as a register_doc_key frame (#29).
+interface MockRotation {
+    epoch: bigint;
+    public_key: Uint8Array;
+    proof: Uint8Array;
+    rotation_proof: Uint8Array;
+}
+const MOCK_ROTATION: MockRotation = {
+    epoch: 2n,
+    public_key: new Uint8Array([11, 11]),
+    proof: new Uint8Array([12]),
+    rotation_proof: new Uint8Array([13]),
+};
+
 // A mock of the MLS document surface the client drives. There is NO
 // set_encryption_key / has_encryption_key / encode_state_encrypted here — the AES
 // CollabCore is gone; MLS derives keys from group membership.
@@ -129,9 +144,18 @@ const makeMockDoc = () => ({
         .mockReturnValue({ ciphertext: new Uint8Array([1, 2, 3]), epoch: 1n }),
     apply_encrypted_update: jest.fn(),
     create_invite: jest
-        .fn<() => { welcome: Uint8Array }>()
-        .mockReturnValue({ welcome: new Uint8Array([9, 9]) }),
+        .fn<() => { welcome: Uint8Array; rotation: MockRotation }>()
+        .mockReturnValue({ welcome: new Uint8Array([9, 9]), rotation: MOCK_ROTATION }),
     process_commit: jest.fn(),
+    // Subscribe-authorization surface (#72): the owner registers an anchor and
+    // every subscribe for an established group presents a minted capability.
+    epoch: 1n,
+    mint_subscribe_capability: jest.fn(
+        (user_id: string, docId: string) =>
+            `{"user_id":"${user_id}","doc_id":"${docId}","epoch":1,"expiry_unix":1000,"signature":[1]}`
+    ),
+    sign_doc_key_proof: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([7, 7])),
+    subscribe_verifying_key: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([8, 8])),
     free: jest.fn(),
 });
 

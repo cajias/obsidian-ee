@@ -13,6 +13,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen.workspace = true
 yrs.workspace = true
+# The minted capability crosses to JS as JSON produced by the SAME serde impl the
+# relay deserializes with, so the wire shape cannot drift (issue #72).
+serde_json.workspace = true
 # MLS engine reused across the wasm-bindgen boundary (issue #28).
 collab-core = { path = "../collab-core" }
 
@@ -20,3 +23,7 @@ collab-core = { path = "../collab-core" }
 # native dependency graph, so feature unification can never turn it on for native.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 collab-core = { path = "../collab-core", features = ["wasm-clock"] }
+
+[dev-dependencies]
+# Native tests verify a minted capability against the protocol's own verifier.
+collab-proto = { path = "../collab-proto" }
