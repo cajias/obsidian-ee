@@ -7,6 +7,17 @@
 - Node.js (for Obsidian plugin development)
 - `wasm-pack` (for building WASM module)
 
+Gate tooling, so `cargo xtask gates` runs the full set rather than skipping rows:
+
+```bash
+brew install cargo-deny shellcheck actionlint   # or any prebuilt equivalent
+```
+
+`cargo-deny` must be installed **prebuilt**, not with `cargo install`: the
+version CI pins (0.20.2) requires rustc 1.88, while `rust-toolchain.toml` pins
+the 1.87 MSRV, so a source build cannot resolve under this workspace's
+toolchain. CI has the same constraint and installs a prebuilt binary too.
+
 ## Quick Start
 
 ```bash

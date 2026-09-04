@@ -116,6 +116,20 @@ Test the state, not the promise: asserting that a retry RESOLVES proves nothing,
 because these failures resolve normally and go quiet. Assert the post-retry state
 is USABLE — the handle exists, the registration was sent exactly once.
 
+### Gate assertions
+A gate must assert the scenario it names actually HAPPENED, not merely that one failure
+mode was absent. `run-m1.sh` asserted `exit_code != 137` — "not SIGKILLed" — and so printed
+`OK: stopped via SIGINT` for a relay that died at boot and never received the signal, and
+for one that panicked mid-shutdown (exit 101). The fix is a positive reading: the container
+was `Running` before the stop, AND exited `0`. Prefer asserting the expected value over
+excluding a known-bad one, and where a gate depends on a process actually starting, assert
+that separately — a command that "succeeds" against nothing is the most expensive kind of
+green. `run-m2`/`run-m3` already do this (a resource count and four stack names; code 101).
+
+A CI gate also needs a local counterpart, or it only ever fails after a push: `GATES` in
+`xtask/src/main.rs` is that mirror. Adding a CI step that can run without cloud credentials
+means adding it there too.
+
 ### Dead code / YAGNI
 Keep internal-crate APIs `pub(crate)` (not `pub`) so `rustc`'s `dead_code` lint flags
 unused items — `pub` items in a workspace-internal crate are never reported as dead.
