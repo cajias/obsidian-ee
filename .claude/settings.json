@@ -6,7 +6,6 @@
       "Bash(rtk git log *)",
       "Bash(rtk git diff *)",
       "Bash(rtk git show *)",
-      "Bash(rtk git branch *)",
       "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
       "mcp__plugin_context-mode_context-mode__ctx_execute",
       "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index"
