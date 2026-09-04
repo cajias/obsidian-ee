@@ -18,6 +18,21 @@ services:
       - RUST_LOG=info
       # To require client authentication, set a token here or in a .env file:
       # - RELAY_AUTH_TOKEN=change-me
+      #
+      # Subscribe authorization is ON by default in the binary since #72. This
+      # test fixture turns it OFF **explicitly** because the three Docker-gated
+      # wire tests subscribe capability-less and need `YrsUpdate` fan-out:
+      #   tests/e2e-tests/tests/fail_closed.rs
+      #     test_wrong_key_client_observes_nothing_over_relay
+      #   tests/e2e-tests/tests/full_flow.rs
+      #     test_two_users_collaborate, test_offline_message_delivery
+      # fail_closed in particular CANNOT be upgraded to mint a capability: its
+      # whole point is that Eve *receives* the ciphertext off the wire and still
+      # fails to decrypt it, proving MLS fail-closed independently of the relay
+      # gate. Deleting this line makes those three tests fail, not pass harder.
+      # This is a local dev/test fixture, NOT a deployment template — a real
+      # relay should leave the variable unset and run with authz on.
+      - RELAY_SUBSCRIBE_AUTHZ=0
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "8080"]
