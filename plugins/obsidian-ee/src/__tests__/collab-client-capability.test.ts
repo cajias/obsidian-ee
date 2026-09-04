@@ -179,7 +179,10 @@ describe('subscribe capability (#72)', () => {
     });
 
     afterEach(() => {
-        client?.disconnect();
+        // destroy(), not disconnect(): disconnect deliberately KEEPS an
+        // established group, so the wasm handles these tests create would leak.
+        // It is also the only suite-level exercise destroy() gets.
+        client?.destroy();
         client = null;
         jest.useRealTimers();
     });
@@ -223,10 +226,10 @@ describe('subscribe capability (#72)', () => {
     it('re-bootstraps a usable group after the first anchor registration throws', async () => {
         // registerAnchor() runs AFTER slot.setDoc(), and sign_doc_key_proof is a
         // wasm-bindgen Result<T, JsError> call away from throwing. A partial
-        // bootstrap must leave NOTHING behind: a doc that survives with
-        // groupEstablished still set makes every later connect skip bootstrap, so
-        // register_doc_key is NEVER sent while the client keeps presenting
-        // capabilities for it. The relay answers "no subscribe anchor registered"
+        // bootstrap must leave NOTHING behind: a doc that survives makes every
+        // later connect treat that slot as an established group and skip its
+        // bootstrap, so register_doc_key is NEVER sent while the client keeps
+        // presenting capabilities for it. The relay answers "no subscribe anchor registered"
         // and the subscription dies, but the client resolves, arms its stability
         // timer and refills its retry budget — silently deaf forever.
         (WasmEncryptedDocument.create as unknown as jest.Mock).mockImplementationOnce(
