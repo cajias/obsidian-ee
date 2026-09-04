@@ -23,7 +23,8 @@ better than the design below on both axes. Read the section below as the reasoni
 led to a hook, not as a recommendation to restore it.
 
 One deviation that survived: `cargo xtask gates` runs **8** gates, not the 6 this report
-listed. `CLAUDE.local.md`'s prose list had omitted the CDK app type-check — the only
+listed. The prose list in the then-untracked `CLAUDE.local.md` (since folded into
+`CLAUDE.md`) had omitted the CDK app type-check — the only
 type check in the whole pipeline, per `integration.yml`'s own comment — and shellcheck
 over the guard scripts. Both are AWS-free and were already in CI, so leaving them out
 of a runner named `gates` would have made a green result mean less than it looks.
@@ -138,10 +139,11 @@ start/stop, backoff schedule. Read-only; reports, does not edit.
 
 ### `/gates` — run the known-green local gate set
 
-**Why:** the list of gates that pass without AWS lives only as prose in `CLAUDE.local.md`:
-`design-integrity-guard.sh`, `deploy-tag-guard.sh`, `deploy-buildx-guard.sh`, `run-m2.sh`,
-`cd infra && npm test`, `actionlint` on three workflows. Six commands, hand-copied, easy to
-run four of.
+**Why:** at the time of this analysis the list of gates that pass without AWS lived only
+as prose in the untracked `CLAUDE.local.md`: `design-integrity-guard.sh`,
+`deploy-tag-guard.sh`, `deploy-buildx-guard.sh`, `run-m2.sh`, `cd infra && npm test`,
+`actionlint` on three workflows. Six commands, hand-copied, easy to run four of. (That
+file has since been folded into `CLAUDE.md`, and the list itself now lives in `GATES`.)
 
 **The lazier form first:** you already have an `xtask` crate and no Makefile. A
 `cargo xtask gates` subcommand next to the existing `xtask lint` puts this on the same
