@@ -180,12 +180,12 @@ gh pr merge <release-pr-number> --squash
 Observe: release-please publishes `v0.1.1`, and the `deploy` workflow fires on `release: published` and resolves `environment=prod`. In the build job, `Build and push (native arm64)` is **skipped** (the canary's `sha-` tag is already in the registry) while `Retag the released digest` runs — that skip-plus-retag is the same-digest promotion. Then take the incremental reading:
 
 ```bash
-bash tests/features/run-m4.sh
+bash tests/deployment-verify.sh
 ```
 
 Observe: gates (a)–(c) print `OK` and the script exits 2 naming the rollback drill as the one outstanding step.
 
-**4. Run the rollback dispatch.** This is a REAL prod deploy, which is why `run-m4.sh` never issues it.
+**4. Run the rollback dispatch.** This is a REAL prod deploy, which is why `tests/deployment-verify.sh` never issues it.
 
 ```bash
 gh workflow run deploy.yml -f environment=prod --ref v0.1.0
@@ -197,7 +197,7 @@ Observe: `Build and push` is skipped again and `Retag the released digest` does 
 **5. Verify.**
 
 ```bash
-M4_ROLLBACK_DRILL=done bash tests/features/run-m4.sh
+M4_ROLLBACK_DRILL=done bash tests/deployment-verify.sh
 ```
 
 Observe: exit 0 and `PASS: all four M4 scenarios verified`. Any non-zero exit prints either a `FAIL:` line naming the assertion that broke or a `BLOCKED:` block naming the human step still outstanding.

@@ -75,7 +75,7 @@ clearing, and skill invocations can't happen inside a workflow script, and
 
 | # | Phase | How |
 |---|---|---|
-| 1 | Author the feature | Write the BDD Gherkin verbatim into `tests/features/<milestone>.feature` <!-- ASSUMPTION: features dir not fixed by the structural design; confirm or point elsewhere -->, copied from the fenced blocks in `docs/design/aws-deploy/04-bdd-test-plan.md`, plus step-def skeletons. Confirm it fails for the right reason. |
+| 1 | Author the feature | Write the BDD Gherkin verbatim into `tests/features/<behavior>.feature` — named for the behavior, never the milestone — copied from the fenced blocks in `docs/design/aws-deploy/04-bdd-test-plan.md`. Then write the runner where the scenario's *needs* put it: needs nothing → a Rust test under `xtask/tests/` or a spec under `infra/test/`; needs Docker → an `#[ignore]`d test in `tests/e2e-tests/`; needs a deployed environment → `tests/deployment-verify.sh`. Confirm it fails for the right reason. |
 | 2 | Gap analysis | **Workflow**, parallel fan-out. One agent per lens: contract conformance vs `01 — Logic Design`, layout conformance vs `02 — Structural Design`'s canonical tree, existing-code reuse, security, test honesty (does the step assert the behavior or the mechanics?), residual closure. Structured output. |
 | 3 | Implement | Subagent per gap (`superpowers:subagent-driven-development`). Strong model for novel logic against frozen contracts; cheap model for mechanical work. `ponytail` governs — climb the ladder before writing. |
 | 4 | Gate | Run the verbatim exit command. Red → back to 2. |

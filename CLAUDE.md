@@ -118,17 +118,19 @@ is USABLE — the handle exists, the registration was sent exactly once.
 
 ### Gate assertions
 A gate must assert the scenario it names actually HAPPENED, not merely that one failure
-mode was absent. `run-m1.sh` asserted `exit_code != 137` — "not SIGKILLed" — and so printed
+mode was absent. The container-stop gate — now `tests/e2e-tests/tests/relay_container_stop.rs`
+— was first written asserting `exit_code != 137`, "not SIGKILLed", and so printed
 `OK: stopped via SIGINT` for a relay that died at boot and never received the signal, and
 for one that panicked mid-shutdown (exit 101). The fix is a positive reading: the container
 was `Running` before the stop, AND exited `0`. Prefer asserting the expected value over
 excluding a known-bad one, and where a gate depends on a process actually starting, assert
 that separately — a command that "succeeds" against nothing is the most expensive kind of
-green. `run-m2`/`run-m3` already do this (a resource count and four stack names; code 101).
+green. The CDK assertions in `infra/test/*.test.ts` (a resource count and four stack names)
+and the 101 reading in `tests/deployment-verify.sh` already do this.
 
-A CI gate also needs a local counterpart, or it only ever fails after a push: `GATES` in
-`xtask/src/main.rs` is that mirror. Adding a CI step that can run without cloud credentials
-means adding it there too.
+A CI gate also needs a local counterpart, or it only ever fails after a push. That
+counterpart is no longer a mirror to maintain: CI and developers both invoke the make
+targets, so a new gate is a line in the target CI already calls, and the two cannot drift.
 
 ### Dead code / YAGNI
 Keep internal-crate APIs `pub(crate)` (not `pub`) so `rustc`'s `dead_code` lint flags
@@ -145,10 +147,10 @@ listed here — they do not survive a squash merge.
 
 | Milestone | Gate | State |
 |---|---|---|
-| M1 STOPSIGNAL | `bash tests/features/run-m1.sh` | green; needs a running Docker daemon to re-verify |
-| M2 CDK infra | `bash tests/features/run-m2.sh` | **green, exit 0** |
-| M3 release + deploy | `bash tests/features/run-m3.sh` | code-complete; **exit 2 BLOCKED** on human steps |
-| M4 verified rollout | `bash tests/features/run-m4.sh` | harness + runbook shipped; **exit 2 BLOCKED** on human steps |
+| M1 STOPSIGNAL | `cargo test -p e2e-tests --test relay_container_stop -- --ignored` | green; needs a running Docker daemon to re-verify |
+| M2 CDK infra | `make test` | **green, exit 0** |
+| M3 release + deploy | `RELAY_CHECKS=probe RELAY_ENVS=dev bash tests/deployment-verify.sh` | code-complete; **exit 2 BLOCKED** on human steps |
+| M4 verified rollout | `bash tests/deployment-verify.sh` | harness + runbook shipped; **exit 2 BLOCKED** on human steps |
 
 **Nothing is blocked on the agent.** Every remaining step needs the maintainer's AWS
 account.
@@ -156,15 +158,16 @@ account.
 ### Verified green locally (no AWS needed)
 
 ```bash
-cargo xtask gates    # all 8, cheapest first; last run 8/8 green
+make test    # cargo test --workspace + the infra tsc type check + the infra CDK assertions
+make lint    # fmt, clippy, cargo-deny, actionlint, shellcheck
 ```
 
-`GATES` in `xtask/src/main.rs` is the single source of truth, kept byte-identical to
-the matching `integration.yml` steps and covered by a test that fails if a gate names a
-file that no longer exists. It supersedes a six-command prose list that had drifted —
-it was missing the CDK app type-check (`npx --no-install tsc --noEmit`, the only type
-check in the pipeline) and shellcheck over the guard scripts. `run-m3.sh` / `run-m4.sh`
-stay out: they need AWS.
+The Makefile is the single source of truth, and CI invokes these same targets rather than
+restating their steps — so there is nothing to keep in sync and no drift to detect. A new
+gate that runs without cloud credentials is a line in `make test` or `make lint`, and CI
+picks it up by construction. `make test-e2e` (`cargo xtask e2e` plus
+`bash tests/deployment-verify.sh`) stays separate: it needs Docker, and its deployment
+half needs AWS.
 
 ### The one open item
 
@@ -184,18 +187,20 @@ without the reading.
 3. **Verify M3**, then walk M4:
    ```bash
    export AWS_PROFILE=<profile> AWS_REGION=<region> RELAY_DOMAIN=<apex domain>
-   bash tests/features/run-m3.sh      # expects 101 from relay-dev
-   bash tests/features/run-m4.sh      # names the next outstanding step each run
+   RELAY_CHECKS=probe RELAY_ENVS=dev bash tests/deployment-verify.sh   # 101 from relay-dev
+   bash tests/deployment-verify.sh   # all three envs, all four scenarios; names the
+                                     # next outstanding step each run
    ```
    M4's ordered procedure: `docs/aws-deployment-plan.md` → `## Rollout runbook (M4)`.
-   `run-m4.sh` verifies the rollback drill but never issues it — that dispatch is a real
-   prod deploy and stays a human step.
+   The script verifies the rollback drill but never issues it — that dispatch is a real
+   prod deploy and stays a human step; re-run with `M4_ROLLBACK_DRILL=done` once it has
+   happened.
 
 ### Conventions this build follows (keep them)
 
 - BDD scenario names are a byte-frozen join key between `03` and `04`; `.feature` files are
-  verbatim copies. `design-integrity-guard.sh` enforces both in CI, and
-  `.claude/hooks/design-guard.mjs` enforces them at edit time.
+  verbatim copies. `xtask/tests/design_integrity.rs` enforces both in CI, and
+  `.claude/hooks/design-guard.mjs` enforces them at edit time by running that same test.
 - Amending a ratified gate command requires a numbered **Plan change** note in `03` with the
-  empirical justification — see the four already there.
+  empirical justification — see the ones already there, through Plan change 6.
 - One commit per milestone, so `/code-review` and `/simplify` get a scoped diff.

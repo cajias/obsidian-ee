@@ -4,11 +4,16 @@ description: Run the AWS-free gate set and report what is green. Use when asked 
 disable-model-invocation: true
 ---
 
-Run `cargo xtask gates` from the workspace root. Report each gate's PASS / FAIL /
-SKIP line and the summary, then stop.
+Run `make test` and then `make lint` from the workspace root. Report each
+target's PASS / FAIL line — including any `skip:` notice `make lint` prints for a
+linter that is not installed locally — then stop.
 
-The gate list lives in `GATES` in `xtask/src/main.rs`, kept byte-identical to the
-matching `integration.yml` steps. Do not restate or re-implement it here — a second
-copy is a copy that drifts. Add a gate by editing that list.
+Those two targets are the AWS-free set: `make test` needs neither Docker nor AWS
+(Rust workspace tests, which include the design-integrity and deploy-workflow
+guards, plus the CDK type check and assertions), and `make lint` needs only the
+linters. The Makefile is the single definition — CI runs the same targets — so do
+not restate or re-implement the command list here. Add a check by editing the
+Makefile.
 
-Gates needing AWS credentials (`run-m3.sh`, `run-m4.sh`) are deliberately excluded.
+`make test-e2e` is deliberately excluded: it needs a running Docker daemon, and
+`tests/deployment-verify.sh` inside it needs AWS credentials.

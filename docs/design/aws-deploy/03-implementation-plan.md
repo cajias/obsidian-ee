@@ -19,11 +19,13 @@ graph LR
 
 **Depends on:** none.
 
-**Exit criterion** — the behavior scenario `relay-container-stops-on-sigint` in `04 — BDD Test Plan` runs green. Gate command:
+**Exit criterion** — the behavior scenario `relay-container-stops-on-sigint` in `04 — BDD Test Plan` runs green. Gate command (Docker-requiring, so it is `#[ignore]`d by default and runs under `make test-e2e`):
 
 ```bash
-grep -q '^STOPSIGNAL SIGINT' docker/Dockerfile.relay && docker build -f docker/Dockerfile.relay -t relay-test .
+cargo test -p e2e-tests --test relay_container_stop -- --ignored
 ```
+
+The static `grep -q '^STOPSIGNAL SIGINT'` assertion the ratified gate opened with is unchanged — it is now the test's first assertion, ahead of the build and the stop, per Plan change 6 below.
 
 **Context to load**
 
@@ -33,6 +35,7 @@ grep -q '^STOPSIGNAL SIGINT' docker/Dockerfile.relay && docker build -f docker/D
 - `docs/design/aws-deploy/03-implementation-plan.md` (this document) and the `relay-container-stops-on-sigint` scenario in `04 — BDD Test Plan`.
 - `docs/aws-deployment-plan.md` — Code-level constraints encoded, and item 3 of Files to create/edit.
 - `docker/Dockerfile.relay` — the file to edit.
+- `tests/e2e-tests/tests/relay_container_stop.rs` — the gate test: the STOPSIGNAL assertion, the image build, and the run-then-stop reading.
 
 **Deliverable** — `docker/Dockerfile.relay` declares `STOPSIGNAL SIGINT` immediately after `USER appuser`, with a comment noting the relay handles only SIGINT while docker stop defaults to SIGTERM; the image still builds.
 
@@ -44,12 +47,13 @@ grep -q '^STOPSIGNAL SIGINT' docker/Dockerfile.relay && docker build -f docker/D
 
 **Depends on:** none.
 
-**Exit criterion** — the behavior scenario `cdk-synth-emits-four-stacks` in `04 — BDD Test Plan` runs green. Gate commands (the first must print `3`; the second must list `RelayShared`, `Relay-dev`, `Relay-staging`, `Relay-prod` — the stack names the deployment plan's Bootstrap runbook deploys):
+**Exit criterion** — the behavior scenario `cdk-synth-emits-four-stacks` in `04 — BDD Test Plan` runs green. Gate command (it runs the infrastructure app's type check and its CDK assertion suite, which asserts the four stack names `RelayShared`, `Relay-dev`, `Relay-staging`, `Relay-prod` — the ones the deployment plan's Bootstrap runbook deploys — and one relay instance per environment stack):
 
 ```bash
-cd infra && npm ci && npx cdk synth --quiet && cat cdk.out/*.template.json | grep -c 'AWS::EC2::Instance'
-npx cdk list
+make test
 ```
+
+The earlier synth-then-`grep -c` pair is superseded rather than dropped: both of its readings are assertions inside `infra/test/shared-stack.test.ts` and `infra/test/relay-stack.test.ts`, which reach them from a synthesized template without spending an `npm ci` and a full CLI synth to assert less. See Plan change 6 below.
 
 **Context to load**
 
@@ -86,15 +90,10 @@ npx cdk list
 **Exit criterion** — the behavior scenario `dev-deploys-without-gate` in `04 — BDD Test Plan` runs green: after the maintainer approves and runs the first dev dispatch (a human-only halt step below), the deployment plan's WS-upgrade check against `relay-dev` returns HTTP `101`. Gate command:
 
 ```bash
-CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --http1.1 \
-  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  https://relay-dev.collab.<domain>/) || true
-[ -z "$CODE" ] && CODE=000
-echo "$CODE"
+RELAY_CHECKS=probe RELAY_ENVS=dev RELAY_DOMAIN=<apex domain> bash tests/deployment-verify.sh
 ```
 
-Expected output: `101` (retry within the ~2-minute budget the deploy workflow allows for first-deploy DNS propagation and certificate issuance).
+Expected: exit 0 and `OK (handshake-returns-101): dev answered 101` (the script retries within the ~2-minute budget the deploy workflow allows for first-deploy DNS propagation and certificate issuance). The two knobs are what make this M3's gate rather than M4's: `RELAY_ENVS=dev` probes the one environment that exists at this point in the sequence, and `RELAY_CHECKS=probe` stops after that reading rather than continuing into M4's same-digest, admission and rollback checks, which have no release to observe yet. Without `RELAY_DOMAIN` the script exits 2 BLOCKED, naming the outstanding human step — `<domain>` has no resolved value until the environments are bootstrapped. The probe's curl invocation, with the corrections recorded in the plan changes below, lives inside the script.
 
 **Also unlocks:** `staging-waits-for-review`.
 
@@ -107,6 +106,7 @@ Expected output: `101` (retry within the ~2-minute budget the deploy workflow al
 - `docs/aws-deployment-plan.md` — Files to create/edit items 1–2, Architecture, and Image strategy.
 - `version.txt`, `release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release.yml`, `.github/workflows/deploy.yml` — the files to create.
 - `infra/lib/shared-stack.ts`, `infra/test/template-goldens.ts` (edit) — the `RepositoryName` CfnOutput and its regenerated golden, per Plan change 4 below.
+- `tests/deployment-verify.sh` — the gate script; its header states which scenario each check carries and which human step each BLOCKED path is waiting on.
 
 **Deliverable** — the versioned release process and the delivery lane: release-please with the `simple` strategy (version file, changelog, tag), `release.yml` on push to main authenticated with the `RELEASE_PLEASE_TOKEN` fine-grained PAT so published releases fire release-triggered workflows, and `deploy.yml` (meta, build with skip-if-exists and same-digest retag, deploy via env-scoped OIDC role and SSM run-command, 101 verify) — merged, with the first dev deploy green and a staging dispatch observed pausing at its required reviewer.
 
@@ -130,31 +130,18 @@ Expected output: `101` (retry within the ~2-minute budget the deploy workflow al
 
 **Depends on:** M3.
 
-**Exit criterion** — the behavior scenario `prod-deploys-on-release-cut` in `04 — BDD Test Plan` runs green. Gate commands, taken from the Verification section of `docs/aws-deployment-plan.md`:
+**Exit criterion** — the behavior scenario `prod-deploys-on-release-cut` in `04 — BDD Test Plan` runs green. Gate command — one script carrying all four of this milestone's scenarios, each check taken from the Verification section of `docs/aws-deployment-plan.md`:
 
 ```bash
-# Canary: merge a fix: commit -> release PR (only version.txt/CHANGELOG, CI stays
-# green under --locked) -> merge -> v0.1.1 published -> prod deploy fires.
-# Same-digest check: v0.1.1 and the canary's sha- tag must name ONE digest.
-aws ecr describe-images --repository-name obsidian-ee/collab-relay \
-  --query 'imageDetails[?contains(imageTags, `v0.1.1`)].[imageDigest,imageTags]' --output text
+# All three environments: WS-upgrade probe, same-digest promotion, Identify admission.
+# Run it after each rollout step; it names the next outstanding step every time.
+RELAY_DOMAIN=<apex domain> RELAY_TOKEN=<dev token> bash tests/deployment-verify.sh
 
-# Rollback drill: re-deploys the old digest, no rebuild
-gh workflow run deploy.yml -f environment=prod --ref v0.1.0
-
-# Per env: WS-upgrade probe returns 101
-for env in dev staging prod; do
-  OUT=$(curl -s -o /dev/null -w "%{http_code} relay-$env\n" --max-time 5 --http1.1 \
-    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-    "https://relay-$env.collab.<domain>/") || true
-  [ -z "$OUT" ] && OUT="000 relay-$env"
-  echo "$OUT"
-done
-
-# Admission proof: Identify with the env token -> ack; without a token -> rejection
-websocat wss://relay-dev.collab.<domain>/
+# Final reading, once the maintainer has run the rollback dispatch (halt step 3):
+M4_ROLLBACK_DRILL=done RELAY_DOMAIN=<apex domain> bash tests/deployment-verify.sh
 ```
+
+Expected: exit 0 and `PASS: all four M4 scenarios verified`. Exit 2 is BLOCKED, not a failure — it names the human step still outstanding; exit 1 is a `FAIL:` line naming the assertion that broke. The script never issues the rollback dispatch: that is a real prod deploy and stays halt step 3 below, and the script only reads its outcome once the maintainer states it happened.
 
 **Also unlocks:** `handshake-returns-101`, `unauthenticated-identify-rejected`, `rollback-redeploys-old-digest`.
 
@@ -196,6 +183,26 @@ The Accepted tradeoffs section of `docs/aws-deployment-plan.md` enumerates exact
 | R6 | No HTTP/3 (UDP 443 closed) | M2 |
 
 Claims per milestone: M1=0, M2=3, M3=1, M4=2 → **6/6 claimed**.
+
+## Plan change 6 — the test suite is organized by type, not by milestone
+
+**Plan change 6 (recorded after M4's harness shipped, spanning all four milestones)** — the four `run-m<N>.sh` step runners and the `tests/features/` directory M1's plan change introduced named milestones in the source tree. Milestones are a planning artifact of this document: they order work for the sessions that execute it, and once executed they say nothing a reader of the tree needs. Worse, the name answers the wrong question — someone deciding what to run wants to know what a check *needs*, not which planning slot it was written under. `run-m1.sh` needed Docker; `run-m2.sh` needed nothing; `run-m3.sh` and `run-m4.sh` needed a deployed environment, and the naming hid that a developer with no AWS account could run half the suite. The suite is now cut along that line and invoked through two targets: `make test` for the checks that need nothing, `make test-e2e` for the ones that need Docker, with AWS optional.
+
+**No assertion changed.** Every invariant checked before is still checked, by the same logic, in a different location. This note records where each one moved:
+
+| Was | Is now | Why |
+|---|---|---|
+| `tests/features/run-m1.sh` | `tests/e2e-tests/tests/relay_container_stop.rs`, `#[ignore]`d | Needs Docker; the `#[ignore]` marks that and `make test-e2e` supplies it. The `^STOPSIGNAL SIGINT` line assertion is the test's first statement. |
+| `tests/features/run-m2.sh` | deleted, no replacement | Fully redundant. `infra/test/shared-stack.test.ts` already asserted the four-stack set and `relay-stack.test.ts` one EC2 instance per environment stack, inside a 66-assertion suite that also pins whole-template goldens. The script spent an `npm ci` and a full CLI synth to assert a strict subset. Deleted rather than renamed: a check that asserts less than the suite beside it is not worth an entry point. |
+| `tests/features/run-m3.sh`, `tests/features/run-m4.sh` | `tests/deployment-verify.sh`, scoped by `RELAY_CHECKS` and `RELAY_ENVS` | M3's probe was a strict subset of M4's — the same WS-upgrade reading against one environment instead of three. One script, one set of BLOCKED messages, same exit-code contract (0 pass, 1 FAIL, 2 BLOCKED). |
+| `tests/features/design-integrity-guard.sh` | `xtask/tests/design_integrity.rs` (4 tests) | Runs in `cargo test` with no separate invocation. |
+| `tests/features/deploy-tag-guard.sh`, `tests/features/deploy-buildx-guard.sh` | `xtask/tests/deploy_workflow_guards.rs` | Same: the release-tag injection cases and the buildx/imagetools invariants of Plan change 2 above, now a `cargo test` target. |
+| `m1.feature`, `m2.feature`, `m3.feature`, `m4.feature` | `relay-container-shutdown.feature`, `infrastructure-synth.feature`, `promotion-gates.feature`, `verified-rollout.feature` | Content byte-identical — these are still the verbatim copies of `04 — BDD Test Plan`'s fenced blocks that `design_integrity.rs` enforces. Only the filenames changed, from the planning slot to the behavior described. |
+| `cargo xtask gates` and its `GATES` const | `make test`, `make test-e2e`, `make lint` | `GATES` was a hand-maintained mirror of the CI steps, and a mirror only ever detects drift after it has happened. CI and developers now invoke the same make targets, so the Makefile *is* the shared implementation and the two cannot drift. |
+
+One substantive point rode in with the merge rather than being a rename. Folding `run-m3.sh` into `run-m4.sh` collapsed two different verdicts into one exit code: a healthy dev environment answered `101` and the script then fell through to M4's AWS-credential prerequisites and exited 2, so M3 could never read green no matter how well dev behaved — an exit code meaning "your scenario passed, but something else is blocked". That is the failure this repo's Gate assertions rule names: a gate must give a positive reading of the scenario it names. `RELAY_CHECKS` restores it by making the scope explicit, so `probe` exits 0 on the reading M3 actually gates and never 2 for a credential it does not need. The assertion is unchanged; only its scoping is now stated rather than assumed.
+
+The exit-criterion gate command of each milestone above is amended to the new invocation, per the rule that amending a ratified gate takes a numbered note with its justification. Files: `tests/deployment-verify.sh`, `tests/e2e-tests/tests/relay_container_stop.rs`, `xtask/tests/design_integrity.rs`, `xtask/tests/deploy_workflow_guards.rs`, the four renamed `tests/features/*.feature` files, `Makefile`, `xtask/src/main.rs`, `.github/workflows/integration.yml`, and this document with `04 — BDD Test Plan`. The plan change notes above are left as written: they record what was true when each was recorded, and the table here is the map from the paths they name to the code that carries those assertions today.
 
 ## Execution notes
 

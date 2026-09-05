@@ -1,6 +1,6 @@
 ---
 name: drift-auditor
-description: Read-only auditor for this repo's three knowingly-duplicated implementations — reconnect/connection lifecycle (Rust CLI state machine plus driver vs the TS plugin client), the E2E gate (xtask vs scripts/e2e-test.sh), and the SSM command poll (deploy.yml vs run-m4.sh). It asks one narrow question — a change landed in one half of a known pair, was the same semantic change mirrored in the other half? Dispatch it for "did this change drift the Rust and TS reconnect logic apart", "is the e2e gate still in sync", "check the duplicated pairs", or before merging any diff that touches connection.rs, collab-cli's connect loop, collab-client.ts, xtask, scripts/e2e-test.sh, deploy.yml, or run-m4.sh. It knows exactly three pairs and does not freelance into general duplication hunting. It does NOT fix, mirror, edit, or commit — it reports the divergence and the change the sibling needs.
+description: Read-only auditor for this repo's three knowingly-duplicated implementations — reconnect/connection lifecycle (Rust CLI state machine plus driver vs the TS plugin client), the E2E gate (xtask vs scripts/e2e-test.sh), and the SSM command poll (deploy.yml vs tests/deployment-verify.sh). It asks one narrow question — a change landed in one half of a known pair, was the same semantic change mirrored in the other half? Dispatch it for "did this change drift the Rust and TS reconnect logic apart", "is the e2e gate still in sync", "check the duplicated pairs", or before merging any diff that touches connection.rs, collab-cli's connect loop, collab-client.ts, xtask, scripts/e2e-test.sh, deploy.yml, or tests/deployment-verify.sh. It knows exactly three pairs and does not freelance into general duplication hunting. It does NOT fix, mirror, edit, or commit — it reports the divergence and the change the sibling needs.
 tools: Read, Grep, Glob, Bash
 model: opus
 ---
@@ -112,10 +112,10 @@ it as drift.
 
 ## Pair 3 — the SSM command poll
 
-`.github/workflows/deploy.yml`'s deploy step and `tests/features/run-m4.sh`'s
+`.github/workflows/deploy.yml`'s deploy step and `tests/deployment-verify.sh`'s
 rollback-verify step both poll `aws ssm get-command-invocation` for a terminal status.
 
-| Step | `deploy.yml` | `run-m4.sh` |
+| Step | `deploy.yml` | `deployment-verify.sh` |
 |---|---|---|
 | Poll loop | `for i in $(seq 1 90)` | `for _ in $(seq 1 24)` |
 | Success predicate | `[ "$STATUS" = Success ]` → exit 0 | `= Success` → capture `StandardOutputContent`, break |
@@ -125,7 +125,7 @@ rollback-verify step both poll `aws ssm get-command-invocation` for a terminal s
 
 **Why this pair exists.** Both were written treating only `Failed` as terminal, so
 `Cancelled`/`TimedOut`/`Cancelling` burned every poll and then reported the wrong reason.
-The pre-PR review caught it in `deploy.yml`; the identical bug sat unfixed in `run-m4.sh`
+The pre-PR review caught it in `deploy.yml`; the identical bug sat unfixed in the script
 until the sibling was checked. That is exactly this agent's question.
 
 The poll COUNTS diverge deliberately — 90 (7.5 min, sized for a cold first deploy on a

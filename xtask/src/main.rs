@@ -5,7 +5,12 @@
 //!   cargo xtask docker-down  # Stop Docker Compose environment
 //!   cargo xtask e2e          # Run E2E tests (starts Docker if needed)
 //!   cargo xtask lint         # Run all linters (clippy, fmt, rust-code-analysis)
-//!   cargo xtask gates        # Run every CI gate that needs no AWS credentials
+//!
+//! `cargo xtask gates` is gone. It ran a `GATES` const that was a hand-maintained
+//! mirror of `integration.yml`'s steps, kept byte-identical and policed by a test.
+//! CI and developers now both invoke the SAME `make` targets, so the Makefile IS
+//! the shared implementation and there is no second copy to drift. Run `make test`
+//! and `make lint` (see the root Makefile) for what `gates` used to cover.
 
 use std::env;
 use std::process::{Command, ExitCode};
@@ -29,7 +34,6 @@ fn main() -> ExitCode {
         "docker-down" | "down" => docker_down(),
         "e2e" => run_e2e(),
         "lint" => run_lint(),
-        "gates" => run_gates(),
         "help" | "-h" | "--help" => {
             print_help();
             ExitCode::SUCCESS
@@ -55,7 +59,6 @@ COMMANDS:
     docker-down, down  Stop Docker Compose environment
     e2e                Run E2E tests (starts Docker if needed)
     lint               Run all linters (clippy, fmt check, rust-code-analysis)
-    gates              Run every CI gate that needs no AWS credentials
     help               Show this help message
 "
     );
@@ -283,88 +286,6 @@ fn check_function_complexity(space: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Every gate that passes locally with no AWS credentials: the AWS-free half of
-/// `integration.yml`, in cheapest-first order. Each entry is
-/// (label, optional required binary, shell command).
-///
-/// The command strings are written to match the corresponding workflow steps
-/// verbatim, so the two can be compared by eye. Nothing enforces that — the test
-/// below only checks that the files a gate names still exist — so a reviewer
-/// changing a step in `integration.yml` has to update this list by hand. The
-/// list this replaces lived only as prose in the untracked hand-off notes, where
-/// running five of the six and calling it green cost nothing.
-///
-/// Ordering is load-bearing in one place: `run-m2.sh` installs
-/// `infra/node_modules`, so it must precede the two gates that need it — the
-/// same dependency `integration.yml` relies on by putting them in one job.
-///
-/// `requires` is set only for the two genuinely optional developer tools. node
-/// and npm are hard requirements of this repo (the plugin and the CDK app), so
-/// their absence is a real failure, not a skip.
-const GATES: &[(&str, &str, &str)] = &[
-    ("design-set integrity (join key + residual ledger)", "", "bash tests/features/design-integrity-guard.sh"),
-    ("deploy release-tag injection guard", "", "bash tests/features/deploy-tag-guard.sh"),
-    ("deploy build and promotion invariants", "", "bash tests/features/deploy-buildx-guard.sh"),
-    (
-        "shellcheck the gate and guard scripts",
-        "shellcheck",
-        "shellcheck tests/features/run-m3.sh tests/features/run-m4.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh tests/features/design-integrity-guard.sh",
-    ),
-    (
-        "actionlint the release, deploy and integration workflows",
-        "actionlint",
-        "actionlint .github/workflows/release.yml .github/workflows/deploy.yml .github/workflows/integration.yml",
-    ),
-    // ci.yml gates on this, but it had never run locally, so a dependency
-    // advisory would surface only after a push. Install it with
-    // `cargo install cargo-deny --locked --version 0.20.2` (see
-    // docs/development.md). Pin the version: it is the one CI installs.
-    ("cargo-deny (advisories, bans, licenses, sources)", "cargo-deny", "cargo deny check"),
-    ("M2 exit gate (cdk-synth-emits-four-stacks)", "", "bash tests/features/run-m2.sh"),
-    ("CDK app type-check", "", "cd infra && npx --no-install tsc --noEmit"),
-    ("CDK assertion tests", "", "cd infra && npm test"),
-];
-
-/// Run every gate in `GATES`, then summarise. Unlike `run_lint`, this does NOT
-/// stop at the first failure: the question a gate run answers is "what is red?",
-/// and stopping early hides the rest of the answer.
-fn run_gates() -> ExitCode {
-    println!("Running the AWS-free gate set ({} gates)...\n", GATES.len());
-    let mut failed: Vec<&str> = Vec::new();
-    let mut skipped: Vec<&str> = Vec::new();
-
-    for (label, requires, cmd) in GATES {
-        if !requires.is_empty() && !is_command_available(requires) {
-            println!("⊘ SKIP {label} — {requires} is not installed\n");
-            skipped.push(label);
-            continue;
-        }
-        println!("=== {label} ===");
-        if run_shell(cmd) == ExitCode::SUCCESS {
-            println!("✓ {label}\n");
-        } else {
-            eprintln!("❌ {label}\n");
-            failed.push(label);
-        }
-    }
-
-    if !skipped.is_empty() {
-        println!("Skipped {} gate(s): {}", skipped.len(), skipped.join(", "));
-    }
-    if failed.is_empty() {
-        println!("✓ All {} gate(s) run passed.", GATES.len() - skipped.len());
-        return ExitCode::SUCCESS;
-    }
-    eprintln!("❌ {} gate(s) failed: {}", failed.len(), failed.join(", "));
-    ExitCode::FAILURE
-}
-
-/// Run a gate command through `bash -c` so the strings can stay byte-identical
-/// to the workflow steps they mirror, `cd` and all.
-fn run_shell(cmd: &str) -> ExitCode {
-    run_cmd("bash", &["-c", cmd])
-}
-
 fn run_cmd(cmd: &str, args: &[&str]) -> ExitCode {
     match Command::new(cmd).args(args).status() {
         Ok(status) => {
@@ -431,26 +352,5 @@ mod tests {
         );
         assert!(ok, "success after transient failures must return true");
         assert_eq!(calls.get(), 3, "false twice then true → polled three times");
-    }
-
-    #[test]
-    fn every_gate_references_a_file_that_exists() {
-        // GATES is hand-maintained and names scripts and workflows by path.
-        // integration.yml's own list has already fallen behind once (run-m4.sh
-        // shipped unlinted), so a rename that misses this list must fail here
-        // rather than at run time inside a gate that then reads as red.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask/ always has a workspace-root parent");
-        let missing: Vec<String> = GATES
-            .iter()
-            .flat_map(|(label, _, cmd)| cmd.split_whitespace().map(move |t| (*label, t)))
-            .filter(|(_, t)| {
-                t.starts_with("tests/features/") || t.starts_with(".github/workflows/")
-            })
-            .filter(|(_, t)| !root.join(t).exists())
-            .map(|(label, t)| format!("gate '{label}' references {t}, which does not exist"))
-            .collect();
-        assert!(missing.is_empty(), "{}", missing.join("\n"));
     }
 }

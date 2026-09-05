@@ -10,21 +10,22 @@ concurrency:
   group: integration-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job below runs a `make` target from the root Makefile — the same command
+# a developer runs locally. The Makefile is the shared implementation, so a step
+# and its local counterpart cannot drift apart.
+
 jobs:
-  relay-image:
-    name: relay-container-stops-on-sigint
+  test:
+    name: test (no Docker, no AWS)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run M1 integration check
-        run: bash tests/features/run-m1.sh
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
 
-  cdk-assertions:
-    name: cdk-synth-emits-four-stacks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -33,74 +34,45 @@ jobs:
           cache: 'npm'
           cache-dependency-path: infra/package-lock.json
 
-      - name: Run M2 integration check
-        run: bash tests/features/run-m2.sh
+      # Covers the CDK synth assertions, the CDK type check (`cdk.json` and
+      # `npm test` both run ts-node in --transpile-only mode, so it is the ONLY
+      # type check in the pipeline) and the three guards ported to Rust tests:
+      # xtask/tests/design_integrity.rs (the scenario-name join key between the
+      # 03 and 04 design documents, each .feature a verbatim copy, and the
+      # residual ledger) and xtask/tests/deploy_workflow_guards.rs (the
+      # deploy.yml release-tag injection guard and the image build/promotion
+      # invariants). Those are definition-of-done criteria that were once
+      # checked only by a script outside this repository, so a reworded scenario
+      # name would have shipped silently. They live HERE, in a job that touches
+      # no network beyond the checkout — the property the old step ordering
+      # bought by running them before the actionlint download, now structural:
+      # a failed fetch in the `lint` job cannot skip them.
+      - name: make test
+        run: make test
 
-      # `cdk.json` and `npm test` both run ts-node in --transpile-only mode, so
-      # this is the ONLY type check in the pipeline. Without it a type error
-      # ships green. run-m2.sh above has already installed infra/node_modules.
-      - name: Type-check the CDK app
-        run: |
-          cd infra
-          npx --no-install tsc --noEmit
-
-      - name: Run CDK assertion tests
-        run: |
-          cd infra
-          npm test
-
-  workflow-lint:
-    name: actionlint-release-and-deploy
+  lint:
+    name: lint (fmt, clippy, cargo-deny, actionlint, shellcheck)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The two guard scripts run FIRST, before anything that reaches the
-      # network. They need nothing but the checkout, so a failure while
-      # fetching actionlint can no longer silently skip them — which is what
-      # happened while this job installed actionlint via
-      # `taiki-e/install-action`: that action ships no actionlint manifest, so
-      # it fell through to `cargo-binstall actionlint@1.7.12`, and actionlint is
-      # a Go program with no crates.io entry, so the step 404'd on every run.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
 
-      # The join key (scenario names cited in both 03 and 04, and each .feature
-      # a verbatim copy) and the 6-row residual ledger are definition-of-done
-      # criteria that were previously checked only by a script outside this
-      # repository — so a reworded scenario name would have shipped silently.
-      - name: Check design-set integrity (join key + residual ledger)
-        run: bash tests/features/design-integrity-guard.sh
-
-      # Negative-path regression test for the release-tag guard in deploy.yml's
-      # `meta` job: the tag is re-parsed as a shell script AS ROOT by SSM
-      # downstream, so the guard must refuse shell metacharacters.
-      - name: Check the deploy release-tag guard rejects injection
-        run: bash tests/features/deploy-tag-guard.sh
-
-      # Config-invariant regression test for the class that has now bitten M3
-      # twice: a step whose ACTION DEFAULTS silently invalidate a later step's
-      # assumption (setup-buildx-action making a container-driver builder
-      # current under `docker build`; imagetools defaulting to --prefer-index).
-      - name: Check the deploy image build and promotion invariants
-        run: bash tests/features/deploy-buildx-guard.sh
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
 
       # Pinned release binary verified against its published sha256 — the same
       # shape as the docker-compose plugin download in infra/lib/relay-stack.ts.
-      # Fetch and lint are ONE step so there is no "installed but never ran"
-      # seam between them.
-      # The gate runners and guard scripts are security-relevant, so lint them
-      # too. shellcheck is preinstalled on ubuntu-latest. This list is
-      # hand-maintained and has already fallen behind once (run-m4.sh shipped
-      # unlinted), so APPEND EVERY NEW tests/features/*.sh HERE. It is not a
-      # glob only because run-m1.sh and run-m2.sh predate the step and have
-      # never been linted — widening it to *.sh is a separate, deliberate change.
-      - name: Shellcheck the gate and guard scripts
-        run: shellcheck tests/features/run-m3.sh tests/features/run-m4.sh tests/features/deploy-tag-guard.sh tests/features/deploy-buildx-guard.sh tests/features/design-integrity-guard.sh
-
-      # integration.yml lints ITSELF as well: a semantic error here (unknown
-      # runner label, bad context reference) does not stop the workflow running,
-      # it just makes it misbehave silently. ci.yml is deliberately excluded —
-      # it is frozen by the structural design and outside this milestone.
-      - name: Lint the release, deploy and integration workflows
+      # Fetch, verify and PATH-install are ONE step so there is no "installed
+      # but never ran" seam. The previous install path used
+      # `taiki-e/install-action`, which ships no actionlint manifest and so fell
+      # through to `cargo-binstall actionlint@1.7.12`; actionlint is a Go
+      # program with no crates.io entry, so the step 404'd on every run and the
+      # lint silently never happened.
+      - name: Install actionlint (pinned, sha256-verified)
         env:
           ACTIONLINT_VERSION: 1.7.12
           ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -110,4 +82,50 @@ jobs:
           echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -version
-          "$RUNNER_TEMP/actionlint" .github/workflows/release.yml .github/workflows/deploy.yml .github/workflows/integration.yml
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Install cargo-deny (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      # `make lint` SKIPS an absent optional tool with a notice — right for a
+      # developer laptop, wrong for CI, where a missing binary would turn into a
+      # green run that linted nothing. Assert all three are present first, so
+      # the skip path can never be taken here. shellcheck is preinstalled on
+      # ubuntu-latest.
+      - name: Assert the optional linters are actually installed
+        # One `command -v` per line, not one call with three names: `command -v a
+        # b c` exits 0 when ANY name resolves, so the three-name form would pass
+        # with two of them missing — the guard would itself be a no-op. The
+        # default shell is `bash -e`, so the first missing binary aborts.
+        run: |
+          command -v cargo-deny
+          command -v actionlint
+          command -v shellcheck
+
+      # actionlint covers release.yml, deploy.yml and integration.yml — this
+      # file lints ITSELF, because a semantic error here (unknown runner label,
+      # bad context reference) does not stop the workflow running, it just makes
+      # it misbehave silently. ci.yml is deliberately excluded: it is frozen by
+      # the structural design and outside this milestone.
+      - name: make lint
+        run: make lint
+
+  container-stop:
+    name: relay-container-stops-on-sigint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      # Run the Docker-gated test directly rather than via `make test-e2e`:
+      # that target also runs tests/deployment-verify.sh, which needs AWS
+      # credentials this job does not have.
+      - name: Run the container-shutdown test
+        run: cargo test -p e2e-tests --test relay_container_stop -- --ignored

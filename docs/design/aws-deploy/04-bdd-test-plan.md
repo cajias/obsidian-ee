@@ -144,16 +144,16 @@ Checks below the behavior gate, each runnable with nothing deployed:
 
 | Check | Tool | Asserts |
 |---|---|---|
-| Synth snapshot: the stack set is RelayShared plus the three Relay environment stacks | CDK synth | backs `cdk-synth-emits-four-stacks` |
-| Exactly one EC2 instance per environment stack | CDK assertions | the singleton invariant of `01 — Logic Design` |
+| Synth snapshot: the stack set is RelayShared plus the three Relay environment stacks | CDK assertions (`make test`) | backs `cdk-synth-emits-four-stacks` |
+| Exactly one EC2 instance per environment stack | CDK assertions (`make test`) | the singleton invariant of `01 — Logic Design` |
 | Security group ingress allows TCP 80 and 443 only; port 22 appears nowhere | CDK assertions | SC4's no-SSH posture; R6's no-UDP posture |
 | Each deploy role trusts only its own GitHub environment; every CI credential is OIDC-issued and expiring | CDK assertions | SC4 |
 | Registry repository declares immutable tags and scan on push | CDK assertions | SC3's tag immutability |
 | Each instance role reads only its own token parameter | CDK assertions | SC2's per-environment credential isolation |
 | Workflow lint over the release and deploy workflows | actionlint | the delivery lane parses cleanly and references valid contexts |
-| Deploy's release-tag guard refuses shell metacharacters, embedded newlines and CR | `bash tests/features/deploy-tag-guard.sh` | SC4 — the tag reaches SSM `AWS-RunShellScript` as root, so the guard is the trust boundary |
-| Deploy's image build and promotion invariants survive action defaults | `bash tests/features/deploy-buildx-guard.sh` | SC3 — the built and promoted artifact stays the single arm64 digest the deploy resolves |
-| Relay image builds, with the SIGINT stop signal declared | docker build | backs `relay-container-stops-on-sigint` |
+| Deploy's release-tag guard refuses shell metacharacters, embedded newlines and CR | `cargo test -p xtask --test deploy_workflow_guards` | SC4 — the tag reaches SSM `AWS-RunShellScript` as root, so the guard is the trust boundary |
+| Deploy's image build and promotion invariants survive action defaults | `cargo test -p xtask --test deploy_workflow_guards` | SC3 — the built and promoted artifact stays the single arm64 digest the deploy resolves |
+| Relay image builds, with the SIGINT stop signal declared | `cargo test -p e2e-tests --test relay_container_stop -- --ignored` | backs `relay-container-stops-on-sigint` |
 | Cost estimate review: roughly $32/month total across environments, under the $40 ceiling | documented-accepted, reviewed at bootstrap and monthly | SC7 |
 
 ## Unit tier
@@ -169,7 +169,7 @@ The traceability and burn-down table for the ledger in the Residual ledger secti
 
 | ID | Residual (short) | Claimed by | Closing check | Status |
 |---|---|---|---|---|
-| R1 | Brief downtime and offline-queue loss per deploy; no HA | M4 | `handshake-returns-101` green after a stop-then-start deploy proves the interruption stays brief and the service returns | pending the M4 rollout — the closing check is a *reading*, not an artifact: the per-env 101 probe in `tests/features/run-m4.sh` and deploy.yml's own post-deploy verify are both in place, but `handshake-returns-101` has not yet run against a deployed target. Closes when the maintainer completes M4's runbook step 5 green |
+| R1 | Brief downtime and offline-queue loss per deploy; no HA | M4 | `handshake-returns-101` green after a stop-then-start deploy proves the interruption stays brief and the service returns | pending the M4 rollout — the closing check is a *reading*, not an artifact: the per-env 101 probe in `tests/deployment-verify.sh` and deploy.yml's own post-deploy verify are both in place, but `handshake-returns-101` has not yet run against a deployed target. Closes when the maintainer completes M4's runbook step 5 green |
 | R2 | Idle WebSocket connections reaped (no keepalive yet) | M4 | documented-accepted — keepalive is a named future direction of `01 — Logic Design`; clients reconnect | closed — Future directions bullet in `docs/design/aws-deploy/01-logic-design.md`, plus the client reconnect loop in `plugins/obsidian-ee/src/collab-client.ts` |
 | R3 | Instance replacement loses caddy_data; certificates re-issue. Also triggers on any `cdk deploy` of a Relay-* stack after AWS publishes a newer AL2023 arm64 AMI, since the SSM-latest ImageId re-resolves and forces instance replacement — re-run the environment's deploy workflow afterward to bring the relay back up. | M2 | documented-accepted — deliberate tradeoff; the duplicate-certificate limit is noted alongside the bootstrap runbook | closed — runbook note under Bootstrap item 6 in `docs/aws-deployment-plan.md`, plus the `caddy_data` comment in `infra/assets/docker-compose.yml` |
 | R4 | Tags predating the deploy workflow cannot be dispatched | M3 | documented-accepted — deliberate consequence of dispatch-from-ref; every tag cut after the workflow lands is dispatchable | closed — Accepted tradeoffs note in docs/aws-deployment-plan.md, plus the R4 comment on deploy.yml's workflow_dispatch trigger |

@@ -55,7 +55,9 @@ obsidian-ee/
 │       ├── docker-compose.yml           (new)           # on-instance compose unit: caddy + relay
 │       ├── Caddyfile.tpl                (new)           # env-templated Caddy site block
 │       └── deploy.sh.tpl                (new)           # template of /opt/relay/deploy.sh
-├── plugins/ · scripts/ · tests/ · xtask/                # existing workspace dirs (tests/features/ added during M1: BDD feature + step runner)
+├── plugins/ · scripts/ · tests/ · xtask/                # existing workspace dirs. tests/features/ (added M1) holds the .feature files only;
+│                                                        # runners sit by what they need — xtask/tests/, tests/e2e-tests/ (Docker),
+│                                                        # tests/deployment-verify.sh (a deployed env). See Plan change 6 in 03.
 └── README.md · CLAUDE.md                                # existing top-level docs
 ```
 
