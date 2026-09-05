@@ -64,6 +64,13 @@ COMMANDS:
     );
 }
 
+/// `--build` is load-bearing. Without it, `up -d` reuses whatever relay image
+/// already exists and the wire tests measure code that is not in this tree.
+/// That has bitten this repo: an e2e run went green against an image built from
+/// a different branch, and the relay logged a startup line
+/// ("subscribe authorization is ENABLED (the default)") that no longer existed
+/// in the source under test. Compose is idempotent, so this costs nothing when
+/// the image is already current. Keep it in sync with scripts/e2e-test.sh.
 fn docker_up() -> ExitCode {
     println!("Starting Docker Compose environment...");
     run_cmd("docker", &["compose", "-f", "docker/docker-compose.yml", "up", "-d", "--build"])

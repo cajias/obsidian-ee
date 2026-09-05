@@ -19,10 +19,14 @@ cargo build --workspace --release
 # is reachable — `docker compose ps`/`up` would still fail under `set -e` with
 # the daemon stopped. `docker info` is the actual liveness check.
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    if ! $COMPOSE ps --quiet 2>/dev/null | grep -q .; then
-        echo "Starting relay via Docker Compose..."
-        $COMPOSE up -d --build
-    fi
+    # Unconditional `up -d --build`, NOT "only if nothing is running": a stale
+    # relay container would otherwise be left in place and the wire tests would
+    # measure code that is not in this tree. Both failure modes have happened —
+    # the container was already up, so the old guard skipped the rebuild
+    # entirely. Compose is idempotent and rebuilds only when the image is out of
+    # date. Keep this in sync with xtask's docker_up.
+    echo "Starting relay via Docker Compose..."
+    $COMPOSE up -d --build
 
     echo "Waiting for the relay to become healthy..."
     healthy=0

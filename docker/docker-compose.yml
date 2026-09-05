@@ -32,6 +32,10 @@ services:
       # gate. Deleting this line makes those three tests fail, not pass harder.
       # This is a local dev/test fixture, NOT a deployment template — a real
       # relay should leave the variable unset and run with authz on.
+      # Never rely on the binary's default here: that is exactly how this broke
+      # before — an image built while the default was ON withheld YrsUpdate
+      # fan-out from a capability-less subscriber, and fail_closed's positive
+      # control (Bob, a legitimate member) timed out.
       - RELAY_SUBSCRIBE_AUTHZ=0
     restart: unless-stopped
     healthcheck:

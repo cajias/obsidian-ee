@@ -42,14 +42,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // now succeeds as handshake-only, so the join still bootstraps, while content
     // reaches only subscribers authorized at the doc's current anchor epoch.
     // Set `RELAY_SUBSCRIBE_AUTHZ=0` to turn it back off.
-    let subscribe_authz =
-        subscribe_authz_enabled(std::env::var("RELAY_SUBSCRIBE_AUTHZ").ok().as_deref());
+    //
+    // Report the value as OBSERVED rather than as "the default"/"is falsey": the
+    // gate ends up off for an explicitly falsy value too (`RELAY_SUBSCRIBE_AUTHZ=0`,
+    // which docker/docker-compose.yml pins as a wire-test fixture), and a line that
+    // does not name what the process actually read sends whoever is debugging the
+    // wrong way. This log is the first thing read when the wire tests misbehave.
+    let raw_subscribe_authz = std::env::var("RELAY_SUBSCRIBE_AUTHZ").ok();
+    let subscribe_authz = subscribe_authz_enabled(raw_subscribe_authz.as_deref());
+    let observed = raw_subscribe_authz
+        .as_deref()
+        .map_or_else(|| "unset, the default".to_string(), |v| format!("RELAY_SUBSCRIBE_AUTHZ={v}"));
     if subscribe_authz {
-        tracing::info!("Per-document subscribe authorization is ENABLED (the default)");
+        tracing::info!("Per-document subscribe authorization is ENABLED ({observed})");
     } else {
         tracing::warn!(
-            "Per-document subscribe authorization is DISABLED (RELAY_SUBSCRIBE_AUTHZ is falsey) \
-             — every subscriber receives content"
+            "Per-document subscribe authorization is DISABLED ({observed}) — every \
+             subscriber receives content"
         );
     }
 
