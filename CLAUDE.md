@@ -149,8 +149,14 @@ listed here — they do not survive a squash merge.
 |---|---|---|
 | M1 STOPSIGNAL | `cargo test -p e2e-tests --test relay_container_stop -- --ignored` | green; needs a running Docker daemon to re-verify |
 | M2 CDK infra | `make test` | **green, exit 0** |
-| M3 release + deploy | `RELAY_CHECKS=probe RELAY_ENVS=dev bash tests/deployment-verify.sh` | code-complete; **exit 2 BLOCKED** on human steps |
+| M3 release + deploy | `RELAY_CHECKS=probe RELAY_ENVS=dev bash tests/deployment-verify.sh`<br>`RELAY_CHECKS=staging-gate bash tests/deployment-verify.sh` (also needs `RELAY_DOMAIN`) | code-complete; **exit 2 BLOCKED** on human steps |
 | M4 verified rollout | `bash tests/deployment-verify.sh` | harness + runbook shipped; **exit 2 BLOCKED** on human steps |
+
+M3 carries two behavior scenarios — the ungated dev lane and the reviewer-gated staging
+lane — so its row names two gate commands, one per scenario. The staging one probes the
+staging address and reads the GitHub API, so it needs `RELAY_DOMAIN` and an authenticated
+`gh`; a missing `gh` exits 2 BLOCKED, a dead staging address exits 1. It never issues the
+staging dispatch. See Plan change 7 in `03-implementation-plan.md`.
 
 **Nothing is blocked on the agent.** Every remaining step needs the maintainer's AWS
 account.
@@ -167,7 +173,7 @@ restating their steps — so there is nothing to keep in sync and no drift to de
 gate that runs without cloud credentials is a line in `make test` or `make lint`, and CI
 picks it up by construction. `make test-e2e` (`cargo xtask e2e` plus
 `bash tests/deployment-verify.sh`) stays separate: it needs Docker, and its deployment
-half needs AWS.
+half needs AWS plus an authenticated `gh`.
 
 ### The one open item
 
@@ -188,6 +194,9 @@ without the reading.
    ```bash
    export AWS_PROFILE=<profile> AWS_REGION=<region> RELAY_DOMAIN=<apex domain>
    RELAY_CHECKS=probe RELAY_ENVS=dev bash tests/deployment-verify.sh   # 101 from relay-dev
+   RELAY_CHECKS=staging-gate bash tests/deployment-verify.sh   # staging paused for its
+                                     # reviewer, plus staging 101; needs `gh`. Green on the
+                                     # dispatch alone — approval is not a prerequisite
    bash tests/deployment-verify.sh   # all three envs, all four scenarios; names the
                                      # next outstanding step each run
    ```
@@ -202,5 +211,5 @@ without the reading.
   verbatim copies. `xtask/tests/design_integrity.rs` enforces both in CI, and
   `.claude/hooks/design-guard.mjs` enforces them at edit time by running that same test.
 - Amending a ratified gate command requires a numbered **Plan change** note in `03` with the
-  empirical justification — see the ones already there, through Plan change 6.
+  empirical justification — see the ones already there, through Plan change 7.
 - One commit per milestone, so `/code-review` and `/simplify` get a scoped diff.

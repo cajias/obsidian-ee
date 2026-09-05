@@ -153,6 +153,7 @@ Checks below the behavior gate, each runnable with nothing deployed:
 | Workflow lint over the release and deploy workflows | actionlint | the delivery lane parses cleanly and references valid contexts |
 | Deploy's release-tag guard refuses shell metacharacters, embedded newlines and CR | `cargo test -p xtask --test deploy_workflow_guards` | SC4 — the tag reaches SSM `AWS-RunShellScript` as root, so the guard is the trust boundary |
 | Deploy's image build and promotion invariants survive action defaults | `cargo test -p xtask --test deploy_workflow_guards` | SC3 — the built and promoted artifact stays the single arm64 digest the deploy resolves |
+| Staging's GitHub environment protection names a required reviewer | `gh api`, via `RELAY_CHECKS=staging-gate bash tests/deployment-verify.sh` | SC5 — the definition behind `staging-waits-for-review`; that scenario's paused-run reading and its staging 101 run in the same scope, but against a real run and a deployed environment |
 | Relay image builds, with the SIGINT stop signal declared | `cargo test -p e2e-tests --test relay_container_stop -- --ignored` | backs `relay-container-stops-on-sigint` |
 | Cost estimate review: roughly $32/month total across environments, under the $40 ceiling | documented-accepted, reviewed at bootstrap and monthly | SC7 |
 

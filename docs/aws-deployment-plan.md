@@ -28,7 +28,7 @@ AWS: SharedStack (ECR, OIDC provider, hosted zone, 4 roles) + Relay-{dev,staging
 On instance: caddy:2 (auto Let's Encrypt) → relay:8080 on the compose network (no host ports on relay)
 ```
 
-Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job **retags the existing digest** (`docker buildx imagetools create --prefer-index=false`) to `vX.Y.Z` when that sha was already built — same-digest promotion preserved; builds only if missing. `--prefer-index=false` is load-bearing: the source is a single-platform schema2 manifest, and the default would wrap it in a new image index and give the v-tag a different digest.
+Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job **retags the existing digest** (`docker buildx imagetools create --prefer-index=false`) to `vX.Y.Z` when that sha was already built, and builds it first when not. Today that is every release — `github.sha` under `release: published` is the release PR's squash commit, which nothing builds — so the release path builds rather than promotes; see the note under Verification. `--prefer-index=false` is load-bearing: the source is a single-platform schema2 manifest, and the default would wrap it in a new image index and give the v-tag a different digest.
 
 ## Code-level constraints encoded
 
@@ -127,6 +127,21 @@ Sequencing: STOPSIGNAL edit first (independent) → infra + runbook 1–8 → re
 
 ## Verification
 
+> **Read first — the release path builds; it does not promote.** Under
+> `release: published`, `github.sha` is the release PR's squash commit, which
+> nothing has ever built, so the release run builds a fresh image and tags it
+> `vX.Y.Z`. What that proves and what it does not: prod runs a real image built
+> from the released source, and the 101 check confirms it live — the *code* is
+> right. What is unproven is that it is the same *artifact* staging exercised.
+> The canary bullet below reads green either way, because the `sha-` tag sharing
+> the `v0.1.1` digest is the one that release's own build just pushed; it does
+> not presently demonstrate byte-identity with staging. Treat the same-digest
+> reading as a check on the retag mechanism, not on SC3's promotion property.
+> The mechanism that would close it, its consequence for the rollback drill and
+> the regression tests it needs are specified in
+> `docs/design/aws-deploy/release-promotion-gap.md`. Closing it is an open
+> decision, deferred deliberately in Plan change 5 of `03 — Implementation Plan`.
+
 - Per env: `curl --http1.1 --max-time 5` WS-upgrade to `https://relay-<env>.collab.<domain>/` → expect **101** (without `--http1.1` curl negotiates HTTP/2 with Caddy, which drops the `Upgrade` headers; without `--max-time` curl treats the 101 on an `https://` URL as a final response and reads the unframed body to EOF, so it hangs against a relay that holds the connection open). Capture the `-w '%{http_code}'` reading and substitute a `000` sentinel only when the capture is EMPTY — curl exits nonzero on both the timeout and the peer-closed path, but the code has already been printed.
 - `websocat wss://relay-dev…` + `Identify` with token → ack; without token → rejection (proves not an open relay).
 - Canary: merge a `fix:` commit → release PR (only version.txt/CHANGELOG → `--locked` CI stays green) → merge → `v0.1.1` published → prod deploy fires; ECR shows `v0.1.1` and `sha-…` on the same digest.
@@ -157,7 +172,7 @@ gh workflow run deploy.yml -f environment=staging
 gh run watch "$(gh run list --workflow=deploy.yml -L1 --json databaseId -q '.[0].databaseId')"
 ```
 
-Observe: the `deploy and verify` job stops in `Waiting for review`. Approve it on the run page (**Review deployments → staging → Approve and deploy**); the job then resumes and its last step logs `attempt N: 101`. That is `staging-waits-for-review` green, and it leaves staging on the digest prod will promote.
+Observe: the `deploy and verify` job stops in `Waiting for review`. Approve it on the run page (**Review deployments → staging → Approve and deploy**); the job then resumes and its last step logs `attempt N: 101`. That is `staging-waits-for-review` green. It leaves staging on the digest built for main's head at this moment, which is not the digest step 3's release deploys: the canary commit lands after this dispatch, and the release path builds its own image regardless (see the note under Verification).
 
 **2. Merge the canary `fix:` commit.**
 
@@ -177,7 +192,7 @@ gh pr list --label 'autorelease: pending'
 gh pr merge <release-pr-number> --squash
 ```
 
-Observe: release-please publishes `v0.1.1`, and the `deploy` workflow fires on `release: published` and resolves `environment=prod`. In the build job, `Build and push (native arm64)` is **skipped** (the canary's `sha-` tag is already in the registry) while `Retag the released digest` runs — that skip-plus-retag is the same-digest promotion. Then take the incremental reading:
+Observe: release-please publishes `v0.1.1`, and the `deploy` workflow fires on `release: published` and resolves `environment=prod`. In the build job, `Build and push (native arm64)` **runs**: `github.sha` here is the release PR's squash commit, not the canary's, and nothing has built it, so the `sha-` probe finds nothing and the job builds a fresh digest — which `Retag the released digest` then tags `v0.1.1`. That is a build followed by a retag, not the same-digest promotion the design intends; see the note under Verification. Then take the incremental reading:
 
 ```bash
 bash tests/deployment-verify.sh
@@ -192,7 +207,7 @@ gh workflow run deploy.yml -f environment=prod --ref v0.1.0
 gh run watch "$(gh run list --workflow=deploy.yml -L1 --json databaseId -q '.[0].databaseId')"
 ```
 
-Observe: `Build and push` is skipped again and `Retag the released digest` does not run at all (this is a dispatch, not a release), so no image is built — the deploy job simply sends the SSM command with the `:v0.1.0` ref and its 101 verify passes.
+Observe: `Build and push` is skipped and `Retag the released digest` does not run at all (this is a dispatch, not a release), so no image is built — the deploy job sends the SSM command with the `:sha-<sha12>` ref of the v0.1.0 commit (a dispatch deploys the `sha-` tag, not the `v` tag; both name the same digest) and its 101 verify passes.
 
 **5. Verify.**
 
