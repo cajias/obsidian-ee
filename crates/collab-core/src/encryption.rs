@@ -206,18 +206,24 @@ impl EncryptedDocument {
     }
 
     /// Snapshot + encrypt this document's MLS group state for at-rest
-    /// persistence (issue #30). See [`MlsDocumentGroup::snapshot_encrypted`].
+    /// persistence (issue #30). This document's own id is bound as AEAD
+    /// associated data, so the snapshot only opens under that same id (issue
+    /// #76). See [`MlsDocumentGroup::snapshot_encrypted`].
     ///
     /// # Errors
     ///
     /// Returns an error if the key is all-zeros or AEAD sealing fails.
     pub fn snapshot_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
-        self.mls.snapshot_encrypted(key)
+        self.mls.snapshot_encrypted(self.doc.id(), key)
     }
 
     /// Restore an encrypted document's MLS group from a snapshot, rebuilding a
     /// fresh (empty) CRDT doc under `doc_id`. Returns `Ok(None)` if the snapshot
     /// is stale (`epoch < min_epoch`) or holds no group; the caller re-joins.
+    ///
+    /// `doc_id` is also bound as AEAD associated data, so a snapshot sealed for
+    /// a different document fails authentication here even under the same
+    /// at-rest key (issue #76) — pass the caller's own locally-trusted id.
     /// See [`MlsDocumentGroup::restore_encrypted`].
     ///
     /// # Errors
@@ -229,7 +235,8 @@ impl EncryptedDocument {
         key: &[u8; 32],
         min_epoch: u64,
     ) -> Result<Option<Self>> {
-        let Some(mls) = MlsDocumentGroup::restore_encrypted(snapshot, key, min_epoch)? else {
+        let Some(mls) = MlsDocumentGroup::restore_encrypted(doc_id, snapshot, key, min_epoch)?
+        else {
             return Ok(None);
         };
         Ok(Some(Self { doc: CollabDocument::new(doc_id.to_string()), mls }))
@@ -336,5 +343,64 @@ mod tests {
         let manifest_op = manifest_doc.encrypt_bytes(b"manifest content").unwrap();
         // ...and vice versa.
         assert!(file_doc.decrypt_bytes(&manifest_op.ciphertext).is_err());
+    }
+
+    const SNAPSHOT_KEY: [u8; 32] = [7u8; 32];
+
+    /// NEGATIVE (issue #76): an at-rest snapshot sealed for docA must FAIL to
+    /// restore under docB, even with the SAME at-rest key. Every snapshot a
+    /// client writes uses one key, so without AAD binding the files are
+    /// interchangeable and an attacker with local write access can swap docA's
+    /// snapshot for docB's — loading docB's MLS group under the docA label.
+    #[test]
+    fn test_snapshot_does_not_restore_under_another_doc_id() {
+        let doc_a = EncryptedDocument::create("docA", "alice").unwrap();
+        let snapshot = doc_a.snapshot_encrypted(&SNAPSHOT_KEY).unwrap();
+
+        let result = EncryptedDocument::restore_encrypted("docB", &snapshot, &SNAPSHOT_KEY, 0);
+        let Err(err) = result else {
+            panic!("a docA snapshot must not restore under docB");
+        };
+        assert!(
+            err.to_string().contains("AEAD open failed"),
+            "must be rejected at the AEAD (doc id is associated data); got: {err}"
+        );
+    }
+
+    /// POSITIVE control for the above: the same doc id restores cleanly, so the
+    /// negative test cannot pass merely because restore is broken outright.
+    #[test]
+    fn test_snapshot_restores_under_same_doc_id() {
+        let doc_a = EncryptedDocument::create("docA", "alice").unwrap();
+        let snapshot = doc_a.snapshot_encrypted(&SNAPSHOT_KEY).unwrap();
+
+        let restored = EncryptedDocument::restore_encrypted("docA", &snapshot, &SNAPSHOT_KEY, 0)
+            .unwrap()
+            .expect("same doc id must restore");
+        assert_eq!(restored.epoch(), doc_a.epoch());
+    }
+
+    /// The SEAL side must bind the document's OWN id, not a constant.
+    ///
+    /// The tests above all seal under "docA", so on their own they cannot tell
+    /// "seal binds the id it was given" from "seal binds a literal that happens
+    /// to equal the fixture's id" — a hardcoded `"docA"` in `snapshot_encrypted`
+    /// passes every one of them. Sealing a DIFFERENT document and requiring that
+    /// it restore under its own id and fail under the other closes that.
+    #[test]
+    fn test_snapshot_binds_the_documents_own_id() {
+        let doc_b = EncryptedDocument::create("docB", "alice").unwrap();
+        let snapshot = doc_b.snapshot_encrypted(&SNAPSHOT_KEY).unwrap();
+
+        assert!(
+            EncryptedDocument::restore_encrypted("docB", &snapshot, &SNAPSHOT_KEY, 0)
+                .unwrap()
+                .is_some(),
+            "a docB snapshot must restore under docB"
+        );
+        assert!(
+            EncryptedDocument::restore_encrypted("docA", &snapshot, &SNAPSHOT_KEY, 0).is_err(),
+            "a docB snapshot must NOT restore under docA"
+        );
     }
 }

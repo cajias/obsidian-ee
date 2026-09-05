@@ -12,7 +12,7 @@
 //! is rejected (fail-closed), mirroring the #27/#28 guards.
 
 use crate::{Error, MlsDocumentGroup, Result};
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -20,6 +20,14 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 
 /// Snapshot format version. Bump on any layout change so an old snapshot is
 /// rejected (`Err`) rather than mis-parsed.
+///
+/// Deliberately NOT bumped for the issue-#76 doc-id AEAD binding: this byte sits
+/// at offset 0 of the SEALED plaintext, so it is only readable after a successful
+/// AEAD open, which a pre-#76 blob can no longer achieve. It cannot discriminate
+/// those blobs, so a bump would buy nothing. That is only harmless while nothing
+/// persists snapshots — a pre-#76 blob restored today fails with "AEAD open
+/// failed", not a graceful `Ok(None)` re-join. Whoever wires the plugin / CLI
+/// data-dir storage owns that migration decision.
 pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// AES-GCM nonce length in bytes.
@@ -144,11 +152,18 @@ impl MlsDocumentGroup {
     /// output is `nonce(12) || ciphertext` with a fresh random nonce, so two
     /// snapshots of the same state differ and a caller cannot reuse a nonce.
     ///
+    /// `doc_id` is bound as AEAD associated data (issue #76). Every snapshot a
+    /// client writes uses the same at-rest key, so without this binding the
+    /// files are interchangeable: an attacker with local write access could
+    /// swap docA's snapshot for docB's and have restore accept it. The doc id
+    /// is authenticated but NOT stored in the ciphertext, and restore must be
+    /// given the same locally-trusted value.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Encryption`] if the key is all-zeros or AEAD sealing
     /// fails, or [`Error::Mls`] if OS randomness for the nonce is unavailable.
-    pub fn snapshot_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+    pub fn snapshot_encrypted(&self, doc_id: &str, key: &[u8; 32]) -> Result<Vec<u8>> {
         if is_all_zeros(key) {
             return Err(Error::Encryption("refusing all-zeros key".to_string()));
         }
@@ -174,7 +189,7 @@ impl MlsDocumentGroup {
             .map_err(|e| Error::Mls(format!("nonce RNG failed: {e:?}")))?;
         let cipher = new_cipher(key);
         let ciphertext = cipher
-            .encrypt(&Nonce::from(nonce_bytes), plaintext.as_ref())
+            .encrypt(&Nonce::from(nonce_bytes), Payload { msg: &plaintext, aad: doc_id.as_bytes() })
             .map_err(|_| Error::Encryption("AEAD seal failed".to_string()))?;
 
         let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -194,12 +209,17 @@ impl MlsDocumentGroup {
     /// `min_epoch` lets the caller reject a snapshot that predates a known
     /// rotation learned out of band.
     ///
+    /// `doc_id` MUST be the caller's own locally-trusted document id: it is
+    /// bound as AEAD associated data, so a snapshot sealed for another document
+    /// fails authentication here even under the same at-rest key (issue #76).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Encryption`] for an all-zeros key, AEAD auth failure
-    /// (wrong key / tampered blob), or a truncated/corrupt/wrong-version blob,
+    /// (wrong key / wrong doc id / tampered blob), or a truncated/corrupt/wrong-version blob,
     /// and [`Error::Mls`] if the loaded group's epoch disagrees with the header.
     pub fn restore_encrypted(
+        doc_id: &str,
         snapshot: &[u8],
         key: &[u8; 32],
         min_epoch: u64,
@@ -214,8 +234,9 @@ impl MlsDocumentGroup {
             nonce_slice.try_into().map_err(|_| corrupt("bad nonce"))?;
         let sealed = &snapshot[NONCE_LEN..];
         let cipher = new_cipher(key);
-        let plaintext = cipher.decrypt(&Nonce::from(nonce_bytes), sealed).map_err(|_| {
-            Error::Encryption("AEAD open failed (wrong key or corrupt)".to_string())
+        let payload = Payload { msg: sealed, aad: doc_id.as_bytes() };
+        let plaintext = cipher.decrypt(&Nonce::from(nonce_bytes), payload).map_err(|_| {
+            Error::Encryption("AEAD open failed (wrong key, wrong doc id, or corrupt)".to_string())
         })?;
 
         // Parse header.
@@ -290,6 +311,8 @@ mod tests {
     }
 
     const KEY: [u8; 32] = [7u8; 32];
+    /// Document id bound as AEAD associated data on seal + open.
+    const DOC_ID: &str = "docA";
 
     /// True if `needle` appears as a contiguous byte window in `haystack`
     /// (mirrors #28's `containsBytes`). Empty needles never "match".
@@ -302,10 +325,15 @@ mod tests {
     /// forge blobs (all-zeros-keyed, or with a corrupt inner storage encoding)
     /// that the restore path must reject. Uses the same cipher construction as
     /// production so the forged blob is a real AEAD ciphertext.
+    /// Seals under `DOC_ID` as associated data so the forged blob still opens on
+    /// the restore path — otherwise these tests would pass at the AEAD instead
+    /// of at the guard/parser they name.
     fn seal_with_key(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
         let nonce_bytes = [0u8; NONCE_LEN];
         let cipher = new_cipher(key);
-        let ciphertext = cipher.encrypt(&Nonce::from(nonce_bytes), plaintext).unwrap();
+        let ciphertext = cipher
+            .encrypt(&Nonce::from(nonce_bytes), Payload { msg: plaintext, aad: DOC_ID.as_bytes() })
+            .unwrap();
         let mut out = nonce_bytes.to_vec();
         out.extend_from_slice(&ciphertext);
         out
@@ -319,10 +347,11 @@ mod tests {
         let hello = alice.encrypt(b"hello").unwrap();
         assert_eq!(bob.decrypt(&hello).unwrap(), b"hello");
 
-        let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
+        let snapshot = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
         drop(alice); // simulate restart: original in-memory group is gone.
 
-        let mut alice2 = MlsDocumentGroup::restore_encrypted(&snapshot, &KEY, 0).unwrap().unwrap();
+        let mut alice2 =
+            MlsDocumentGroup::restore_encrypted(DOC_ID, &snapshot, &KEY, 0).unwrap().unwrap();
         assert_eq!(alice2.epoch(), 1, "epoch preserved across restore");
 
         // Post-restore messages round-trip with the untouched other member.
@@ -340,8 +369,9 @@ mod tests {
         let (_c, _w) = alice.add_member(carol.key_package()).unwrap();
         assert_eq!(alice.epoch(), 2);
 
-        let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
-        let restored = MlsDocumentGroup::restore_encrypted(&snapshot, &KEY, 0).unwrap().unwrap();
+        let snapshot = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
+        let restored =
+            MlsDocumentGroup::restore_encrypted(DOC_ID, &snapshot, &KEY, 0).unwrap().unwrap();
         assert_eq!(restored.epoch(), 2);
     }
 
@@ -349,11 +379,61 @@ mod tests {
     #[test]
     fn test_wrong_key_is_rejected() {
         let (alice, _bob) = two_member_group();
-        let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
+        let snapshot = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
 
         let wrong = [9u8; 32];
-        let result = MlsDocumentGroup::restore_encrypted(&snapshot, &wrong, 0);
+        let result = MlsDocumentGroup::restore_encrypted(DOC_ID, &snapshot, &wrong, 0);
         assert!(result.is_err(), "wrong key must be Err, not a partial group");
+    }
+
+    // Scenario 3b: NEGATIVE — a snapshot sealed for docA must FAIL to restore
+    // under docB, even with the SAME at-rest key (issue #76). All of a client's
+    // snapshots share one key, so without AAD binding they are interchangeable
+    // and an attacker with local write access can swap docA's file for docB's.
+    // The doc id is bound as associated data, so the swap fails at the AEAD.
+    #[test]
+    fn test_snapshot_for_other_doc_id_is_rejected() {
+        let (alice, _bob) = two_member_group();
+        let snapshot = alice.snapshot_encrypted("docA", &KEY).unwrap();
+
+        let Err(err) = MlsDocumentGroup::restore_encrypted("docB", &snapshot, &KEY, 0) else {
+            panic!("a docA snapshot must not restore under docB");
+        };
+        assert!(
+            err.to_string().contains("AEAD open failed"),
+            "must be rejected at the AEAD (doc id is associated data), not a later parse; got: {err}"
+        );
+    }
+
+    // Scenario 3d: the SEAL side binds the id it was GIVEN, not a constant.
+    // Every other test here seals under DOC_ID ("docA"), so a hardcoded literal
+    // in `snapshot_encrypted` would satisfy all of them — the negatives still
+    // mismatch on open, the positives still match. Sealing under a different id
+    // is what pins the parameter as load-bearing.
+    #[test]
+    fn test_snapshot_binds_the_doc_id_it_was_given() {
+        let (alice, _bob) = two_member_group();
+        let snapshot = alice.snapshot_encrypted("docB", &KEY).unwrap();
+
+        assert!(
+            MlsDocumentGroup::restore_encrypted("docB", &snapshot, &KEY, 0).unwrap().is_some(),
+            "a docB snapshot must restore under docB"
+        );
+        assert!(
+            MlsDocumentGroup::restore_encrypted(DOC_ID, &snapshot, &KEY, 0).is_err(),
+            "a docB snapshot must NOT restore under docA"
+        );
+    }
+
+    // Scenario 3c: POSITIVE control for 3b — the SAME doc id round-trips, so 3b
+    // cannot pass merely because restore is broken for every doc id.
+    #[test]
+    fn test_same_doc_id_round_trips() {
+        let (alice, _bob) = two_member_group();
+        let snapshot = alice.snapshot_encrypted("docA", &KEY).unwrap();
+
+        let restored = MlsDocumentGroup::restore_encrypted("docA", &snapshot, &KEY, 0).unwrap();
+        assert_eq!(restored.expect("same doc id must restore").epoch(), 1);
     }
 
     // Scenario 4: NEGATIVE — all-zeros key rejected on BOTH snapshot and restore.
@@ -361,7 +441,10 @@ mod tests {
     fn test_all_zeros_key_rejected_on_snapshot() {
         let (alice, _bob) = two_member_group();
         let zeros = [0u8; 32];
-        assert!(alice.snapshot_encrypted(&zeros).is_err(), "all-zeros snapshot must be Err");
+        assert!(
+            alice.snapshot_encrypted(DOC_ID, &zeros).is_err(),
+            "all-zeros snapshot must be Err"
+        );
     }
 
     #[test]
@@ -373,15 +456,27 @@ mod tests {
         // up-front guard. Proven load-bearing by the mutation that deletes the
         // guard -> this blob then restores to Ok(Some) and the test goes RED.
         let (alice, _bob) = two_member_group();
-        let real = alice.snapshot_encrypted(&KEY).unwrap();
+        let real = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
         let nonce: [u8; NONCE_LEN] = real[..NONCE_LEN].try_into().unwrap();
-        let plaintext = new_cipher(&KEY).decrypt(&Nonce::from(nonce), &real[NONCE_LEN..]).unwrap();
+        let plaintext = new_cipher(&KEY)
+            .decrypt(
+                &Nonce::from(nonce),
+                Payload { msg: &real[NONCE_LEN..], aad: DOC_ID.as_bytes() },
+            )
+            .unwrap();
 
         let zeros = [0u8; 32];
         let blob = seal_with_key(&plaintext, &zeros);
+        // Assert the MESSAGE, not just `is_err()`: `seal_with_key` now seals with
+        // the DOC_ID aad, so a bare `is_err()` could not tell "the up-front
+        // all-zeros guard fired" from "the AEAD rejected an aad mismatch". Pinning
+        // the guard's own words keeps this test proving the layer it names.
+        let Err(err) = MlsDocumentGroup::restore_encrypted(DOC_ID, &blob, &zeros, 0) else {
+            panic!("all-zeros restore must be Err")
+        };
         assert!(
-            MlsDocumentGroup::restore_encrypted(&blob, &zeros, 0).is_err(),
-            "all-zeros restore must be Err via the guard"
+            err.to_string().contains("refusing all-zeros key"),
+            "must be rejected by the up-front guard, not the AEAD; got: {err}"
         );
     }
 
@@ -389,9 +484,9 @@ mod tests {
     #[test]
     fn test_stale_epoch_returns_none() {
         let (alice, _bob) = two_member_group(); // epoch 1
-        let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
+        let snapshot = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
 
-        let restored = MlsDocumentGroup::restore_encrypted(&snapshot, &KEY, 5).unwrap();
+        let restored = MlsDocumentGroup::restore_encrypted(DOC_ID, &snapshot, &KEY, 5).unwrap();
         assert!(restored.is_none(), "epoch 1 snapshot with min_epoch 5 must be Ok(None)");
     }
 
@@ -399,17 +494,17 @@ mod tests {
     #[test]
     fn test_random_bytes_rejected() {
         let garbage = vec![0xABu8; 200];
-        assert!(MlsDocumentGroup::restore_encrypted(&garbage, &KEY, 0).is_err());
+        assert!(MlsDocumentGroup::restore_encrypted(DOC_ID, &garbage, &KEY, 0).is_err());
     }
 
     #[test]
     fn test_one_byte_blob_rejected() {
-        assert!(MlsDocumentGroup::restore_encrypted(&[1u8], &KEY, 0).is_err());
+        assert!(MlsDocumentGroup::restore_encrypted(DOC_ID, &[1u8], &KEY, 0).is_err());
     }
 
     #[test]
     fn test_empty_blob_rejected() {
-        assert!(MlsDocumentGroup::restore_encrypted(&[], &KEY, 0).is_err());
+        assert!(MlsDocumentGroup::restore_encrypted(DOC_ID, &[], &KEY, 0).is_err());
     }
 
     #[test]
@@ -417,18 +512,25 @@ mod tests {
         // Build a real snapshot, decrypt, flip the version byte, re-seal with the
         // same key, and confirm restore rejects it (version check fires).
         let (alice, _bob) = two_member_group();
-        let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
+        let snapshot = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
 
         let cipher = new_cipher(&KEY);
         let nonce_bytes: [u8; NONCE_LEN] = snapshot[..NONCE_LEN].try_into().unwrap();
         let nonce = Nonce::from(nonce_bytes);
-        let mut pt = cipher.decrypt(&nonce, &snapshot[NONCE_LEN..]).unwrap();
+        let aad = DOC_ID.as_bytes();
+        let mut pt = cipher.decrypt(&nonce, Payload { msg: &snapshot[NONCE_LEN..], aad }).unwrap();
         pt[0] = 0xFF; // corrupt the version byte
-        let resealed = cipher.encrypt(&nonce, pt.as_ref()).unwrap();
+        let resealed = cipher.encrypt(&nonce, Payload { msg: &pt, aad }).unwrap();
         let mut blob = nonce_bytes.to_vec();
         blob.extend_from_slice(&resealed);
 
-        assert!(MlsDocumentGroup::restore_encrypted(&blob, &KEY, 0).is_err());
+        let Err(err) = MlsDocumentGroup::restore_encrypted(DOC_ID, &blob, &KEY, 0) else {
+            panic!("a flipped version byte must be Err");
+        };
+        assert!(
+            err.to_string().contains("unsupported version"),
+            "must be rejected by the version check, not at the AEAD; got: {err}"
+        );
     }
 
     // Scenario 7: plaintext-at-rest — the sealed blob does not leak the
@@ -447,7 +549,7 @@ mod tests {
         let bob = MlsDocumentGroup::generate_key_package("bob").unwrap();
         alice.add_member(bob.key_package()).unwrap();
 
-        let snapshot = alice.snapshot_encrypted(&KEY).unwrap();
+        let snapshot = alice.snapshot_encrypted(DOC_ID, &KEY).unwrap();
         assert!(
             !contains_window(&snapshot, NEEDLE),
             "sealed snapshot must not contain the user_id in the clear"
@@ -477,7 +579,7 @@ mod tests {
         plaintext.extend_from_slice(&3u64.to_le_bytes()); // storage count, no entries follow
 
         let blob = seal_with_key(&plaintext, &KEY);
-        let Err(err) = MlsDocumentGroup::restore_encrypted(&blob, &KEY, 0) else {
+        let Err(err) = MlsDocumentGroup::restore_encrypted(DOC_ID, &blob, &KEY, 0) else {
             panic!("corrupt inner storage encoding must be Err (not panic/OOM)");
         };
         assert!(
@@ -504,7 +606,7 @@ mod tests {
         plaintext.extend_from_slice(&(MAX_STORAGE_ENTRIES + 1).to_le_bytes());
 
         let blob = seal_with_key(&plaintext, &KEY);
-        let Err(err) = MlsDocumentGroup::restore_encrypted(&blob, &KEY, 0) else {
+        let Err(err) = MlsDocumentGroup::restore_encrypted(DOC_ID, &blob, &KEY, 0) else {
             panic!("over-cap storage count must be Err (not OOM/hang)");
         };
         assert!(
