@@ -205,7 +205,20 @@ describe('Two-user MLS over the real relay binary', () => {
     beforeAll(async () => {
         relayProc = spawn('cargo', ['run', '--quiet', '-p', 'collab-relay'], {
             cwd: REPO_ROOT,
-            env: { ...process.env, RELAY_ADDR: `127.0.0.1:${PORT}` },
+            // RELAY_SUBSCRIBE_AUTHZ=0: this suite proves MLS crypto over a real
+            // relay — that a cross-group op fails to decrypt — and it never
+            // registers a doc anchor or mints a capability. Since #72 the relay
+            // defaults to authz ON, where an anchorless document delivers no
+            // YrsUpdate to anyone, so these tests would time out waiting for
+            // content that is correctly withheld. Turning the gate off keeps the
+            // test about the crypto, exactly as docker/docker-compose.yml does
+            // for fail_closed.rs. The subscribe ACK is unaffected either way: a
+            // capability-less subscribe is accepted as handshake-only.
+            env: {
+                ...process.env,
+                RELAY_ADDR: `127.0.0.1:${PORT}`,
+                RELAY_SUBSCRIBE_AUTHZ: '0',
+            },
             stdio: 'ignore',
             // `cargo run` launches the relay as a GRANDCHILD; detached makes this
             // child a process-group leader so the relay joins its group and the

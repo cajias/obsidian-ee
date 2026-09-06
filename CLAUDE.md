@@ -92,6 +92,30 @@ Any collection fed by untrusted or network-sourced input MUST be bounded by BYTE
 just by element count — a per-item count cap with MiB-scale items still permits OOM.
 Charge/credit the byte counter on every add/remove path and keep it O(1).
 
+### Partial-success state
+A flag or handle that records "established" while only PART of a multi-step setup
+succeeded is this codebase's most repeated defect — four instances in one audit
+session, every one invisible to a fully green suite.
+
+Set a completion flag only AFTER every step it claims completed has returned. A
+teardown may undo only work whose side effect has not yet left the process: once
+a frame is on the wire (`register_doc_key` above all, which the relay refuses to
+accept twice for the same document), freeing the local state strands it and no
+retry can recover.
+
+Scope a teardown to the unit of work. One `try` around a loop over N
+side-effecting units either under-cleans (leaks the failed unit) or over-cleans
+(destroys units that succeeded); use a per-unit `try`. A safety comment written
+in the singular about a plural operation is the tell.
+
+A single boolean cannot honestly represent N independently-established resources.
+Derive readiness from the resources themselves rather than latching a flag over
+them.
+
+Test the state, not the promise: asserting that a retry RESOLVES proves nothing,
+because these failures resolve normally and go quiet. Assert the post-retry state
+is USABLE — the handle exists, the registration was sent exactly once.
+
 ### Dead code / YAGNI
 Keep internal-crate APIs `pub(crate)` (not `pub`) so `rustc`'s `dead_code` lint flags
 unused items — `pub` items in a workspace-internal crate are never reported as dead.

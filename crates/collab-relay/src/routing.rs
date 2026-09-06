@@ -12,7 +12,8 @@
 //! Subscriptions are bounded to keep memory safe against a malicious client:
 //! the total number of documents and the subscribers-per-document are capped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use collab_proto::{DocumentId, ServerMessage, UserId};
@@ -35,11 +36,20 @@ pub struct DocAnchor {
     pub verifying_key: [u8; 32],
 }
 
+/// Per-document subscribers and their content-authorization state (issue #72):
+/// `doc_id` -> `user_id` -> `None` (handshake only) or `Some(anchor epoch)`.
+type Subscriptions = Arc<RwLock<HashMap<DocumentId, HashMap<UserId, Option<u64>>>>>;
+
 /// Routes messages to the appropriate subscribers.
 pub struct MessageRouter {
-    /// Document subscriptions: `doc_id` -> set of `user_id`s. Retained across
-    /// disconnect so offline subscribers can be queued for.
-    subscriptions: Arc<RwLock<HashMap<DocumentId, HashSet<UserId>>>>,
+    /// Document subscriptions: `doc_id` -> `user_id` -> content-authorization
+    /// state (issue #72). `None` means subscribed for the MLS handshake only;
+    /// `Some(epoch)` means a subscribe capability was verified at that anchor
+    /// epoch. ONE collection, deliberately: a second "authorized" map would have
+    /// to be kept in sync on unsubscribe / eviction and leaks authorization when
+    /// the two drift. Retained across disconnect so offline subscribers can be
+    /// queued for.
+    subscriptions: Subscriptions,
     /// Per-document subscribe-authorization anchors (issue #29). Public
     /// verification data — never a group secret.
     anchors: Arc<RwLock<HashMap<DocumentId, DocAnchor>>>,
@@ -51,6 +61,11 @@ pub struct MessageRouter {
     max_documents: usize,
     /// Maximum number of subscribers per document.
     max_subscribers_per_doc: usize,
+    /// When true, `YrsUpdate` fan-out is restricted to content-authorized
+    /// subscribers (issue #72). Mirrors `RelayServer::require_subscribe_authz`,
+    /// which sets it. Atomic so the flag can be set through the `Arc` the
+    /// server already holds.
+    content_gating: AtomicBool,
 }
 
 impl MessageRouter {
@@ -80,7 +95,16 @@ impl MessageRouter {
             offline: OfflineQueue::new(),
             max_documents: Self::DEFAULT_MAX_DOCUMENTS,
             max_subscribers_per_doc: Self::DEFAULT_MAX_SUBSCRIBERS_PER_DOC,
+            content_gating: AtomicBool::new(false),
         }
+    }
+
+    /// Restrict `YrsUpdate` fan-out to content-authorized subscribers (#72).
+    ///
+    /// Off by default, so fan-out is unchanged unless the relay turns on
+    /// subscribe authorization. See [`Self::route_message`].
+    pub(crate) fn set_content_gating(&self, enabled: bool) {
+        self.content_gating.store(enabled, Ordering::Relaxed);
     }
 
     /// Get the subscribe-authorization anchor for a document, if one is set.
@@ -220,17 +244,30 @@ impl MessageRouter {
 
     /// Subscribe a user to a document.
     ///
+    /// `authorized_epoch` is the subscription's content-authorization state
+    /// (issue #72): `None` subscribes for the MLS handshake only, `Some(epoch)`
+    /// records a capability verified against the doc's anchor at that epoch.
+    ///
     /// Returns `false` (and does not subscribe) if a resource limit would be
     /// exceeded: the global document cap or the per-document subscriber cap.
-    /// Re-subscribing an already-subscribed user is idempotent and returns
-    /// `true`.
+    /// Re-subscribing an already-subscribed user is idempotent for cap
+    /// accounting and returns `true`, but DOES overwrite the stored state — that
+    /// is how a joiner upgrades `None` -> `Some(epoch)` once it has joined the
+    /// group and can mint a capability.
     #[must_use]
     #[allow(clippy::significant_drop_tightening)] // guard needed across all branches
-    pub async fn subscribe(&self, user_id: &str, doc_id: &str) -> bool {
+    pub async fn subscribe(
+        &self,
+        user_id: &str,
+        doc_id: &str,
+        authorized_epoch: Option<u64>,
+    ) -> bool {
         let mut subs = self.subscriptions.write().await;
 
-        // Re-subscribing an existing member is idempotent.
-        if subs.get(doc_id).is_some_and(|set| set.contains(user_id)) {
+        // Re-subscribing an existing member is idempotent, but re-states the
+        // authorization: a fresh capability upgrades, a bare Subscribe downgrades.
+        if let Some(state) = subs.get_mut(doc_id).and_then(|members| members.get_mut(user_id)) {
+            *state = authorized_epoch;
             return true;
         }
         // A brand-new document counts against the global document cap.
@@ -238,13 +275,13 @@ impl MessageRouter {
             tracing::warn!(doc_id = %doc_id, "Rejecting subscribe: document cap reached");
             return false;
         }
-        let set = subs.entry(doc_id.to_string()).or_default();
+        let members = subs.entry(doc_id.to_string()).or_default();
         // An existing document counts against the per-document subscriber cap.
-        if set.len() >= self.max_subscribers_per_doc {
+        if members.len() >= self.max_subscribers_per_doc {
             tracing::warn!(doc_id = %doc_id, "Rejecting subscribe: per-document cap reached");
             return false;
         }
-        set.insert(user_id.to_string());
+        members.insert(user_id.to_string(), authorized_epoch);
         true
     }
 
@@ -260,13 +297,18 @@ impl MessageRouter {
         }
     }
 
-    /// Route a message to all subscribers of a document except the sender.
+    /// Route a message to the eligible subscribers of a document, except the
+    /// sender.
     ///
     /// Online subscribers are sent the message directly. Subscribers with no
     /// live connection have the message queued to the offline buffer for
     /// delivery on reconnect. A subscriber whose send channel is full is treated
     /// as a too-slow consumer: its connection is signalled to close and the
     /// message is queued for redelivery when it reconnects.
+    ///
+    /// With content gating on (issue #72) "eligible" narrows for
+    /// [`ServerMessage::YrsUpdate`] only — see [`Self::recipients`]. Every other
+    /// variant, `MlsHandshake` above all, always reaches every subscriber.
     ///
     /// Returns the number of clients the message was delivered to directly.
     pub async fn route_message(
@@ -275,7 +317,7 @@ impl MessageRouter {
         from_user: &str,
         message: ServerMessage,
     ) -> usize {
-        let Some(subscribers) = self.subscribers_except(doc_id, from_user).await else {
+        let Some(subscribers) = self.recipients(doc_id, from_user, &message).await else {
             return 0;
         };
 
@@ -310,18 +352,46 @@ impl MessageRouter {
     // capacity), so a reverse user->docs index isn't worth the extra state.
     async fn drop_subscriptions(&self, users: &[UserId]) {
         let mut subs = self.subscriptions.write().await;
-        subs.retain(|_doc, set| {
-            set.retain(|member| !users.contains(member));
-            !set.is_empty()
+        subs.retain(|_doc, members| {
+            members.retain(|member, _| !users.contains(member));
+            !members.is_empty()
         });
     }
 
-    /// Snapshot of the subscribers of `doc_id`, excluding the sender. Returns
-    /// `None` if the document has no subscribers at all.
-    async fn subscribers_except(&self, doc_id: &str, from_user: &str) -> Option<Vec<String>> {
+    /// Snapshot of the subscribers of `doc_id` eligible for `message`, excluding
+    /// the sender. Returns `None` when nobody is eligible.
+    ///
+    /// With content gating off this is every subscriber, unchanged. With it on,
+    /// a [`ServerMessage::YrsUpdate`] additionally requires the subscriber to
+    /// have been authorized at the document's CURRENT anchor epoch. Comparing
+    /// against the current anchor is what makes a rekey revoke: after a rotation
+    /// to `N+1` a subscription stored at `N` no longer matches, with no extra
+    /// bookkeeping. No anchor means nobody is content-authorized.
+    ///
+    /// Gating happens HERE, before [`Self::fan_out`], so an unauthorized
+    /// subscriber is excluded from the offline queue too — it must not
+    /// accumulate document content to be handed over on reconnect either.
+    async fn recipients(
+        &self,
+        doc_id: &str,
+        from_user: &str,
+        message: &ServerMessage,
+    ) -> Option<Vec<String>> {
+        // Handshake traffic is never gated: a joiner must receive its Welcome
+        // over the relay before it can become a member and mint a capability.
+        let gated = self.content_gating.load(Ordering::Relaxed)
+            && matches!(*message, ServerMessage::YrsUpdate { .. });
+        // `?`: gated content for a doc with no anchor reaches nobody.
+        let authorized = if gated { Some(self.get_anchor(doc_id).await?.epoch) } else { None };
+
         let subs = self.subscriptions.read().await;
-        let result =
-            subs.get(doc_id).map(|set| set.iter().filter(|id| *id != from_user).cloned().collect());
+        let result = subs.get(doc_id).map(|members| {
+            members
+                .iter()
+                .filter(|(id, at)| id.as_str() != from_user && (!gated || **at == authorized))
+                .map(|(id, _)| id.clone())
+                .collect()
+        });
         drop(subs);
         result
     }
@@ -371,13 +441,18 @@ impl MessageRouter {
 
     /// Get all subscribers for a document.
     #[cfg(test)]
-    pub async fn get_subscribers(&self, doc_id: &str) -> HashSet<String> {
-        self.subscriptions.read().await.get(doc_id).cloned().unwrap_or_default()
+    pub(crate) async fn get_subscribers(&self, doc_id: &str) -> Vec<String> {
+        self.subscriptions
+            .read()
+            .await
+            .get(doc_id)
+            .map(|members| members.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// Check if a user is subscribed to a document.
+    /// Check if a user is subscribed to a document (at any authorization state).
     pub async fn is_subscribed(&self, user_id: &str, doc_id: &str) -> bool {
-        self.subscriptions.read().await.get(doc_id).is_some_and(|subs| subs.contains(user_id))
+        self.subscriptions.read().await.get(doc_id).is_some_and(|subs| subs.contains_key(user_id))
     }
 
     /// Number of live client sessions (for testing).
@@ -432,8 +507,8 @@ mod tests {
         router.register_client(alice_handle, true).await;
         router.register_client(bob_handle, true).await;
 
-        assert!(router.subscribe("alice", "doc1").await);
-        assert!(router.subscribe("bob", "doc1").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
+        assert!(router.subscribe("bob", "doc1", None).await);
 
         let message = ServerMessage::YrsUpdate {
             doc_id: "doc1".into(),
@@ -467,8 +542,8 @@ mod tests {
         router.register_client(bob_handle, true).await;
         router.register_client(eve_handle, true).await;
 
-        assert!(router.subscribe("alice", "doc1").await);
-        assert!(router.subscribe("bob", "doc1").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
+        assert!(router.subscribe("bob", "doc1", None).await);
 
         let message = ServerMessage::YrsUpdate {
             doc_id: "doc1".into(),
@@ -490,7 +565,7 @@ mod tests {
 
         let (alice_handle, mut alice_rx) = create_test_client("alice", 1);
         router.register_client(alice_handle, true).await;
-        assert!(router.subscribe("alice", "doc1").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
 
         let message = ServerMessage::YrsUpdate {
             doc_id: "doc1".into(),
@@ -514,8 +589,8 @@ mod tests {
         router.register_client(alice_handle, true).await;
         router.register_client(bob_handle, true).await;
 
-        assert!(router.subscribe("alice", "doc1").await);
-        assert!(router.subscribe("bob", "doc1").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
+        assert!(router.subscribe("bob", "doc1", None).await);
 
         router.unsubscribe("bob", "doc1").await;
 
@@ -537,7 +612,7 @@ mod tests {
         let (alice_handle, _rx) = create_test_client("alice", 1);
         router.register_client(alice_handle, true).await;
 
-        assert!(router.subscribe("alice", "doc1").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
         assert!(!router.get_subscribers("doc1").await.is_empty());
 
         router.unsubscribe("alice", "doc1").await;
@@ -558,10 +633,10 @@ mod tests {
         router.register_client(bob_handle, true).await;
         router.register_client(charlie_handle, true).await;
 
-        assert!(router.subscribe("alice", "doc1").await);
-        assert!(router.subscribe("bob", "doc1").await);
-        assert!(router.subscribe("alice", "doc2").await);
-        assert!(router.subscribe("charlie", "doc2").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
+        assert!(router.subscribe("bob", "doc1", None).await);
+        assert!(router.subscribe("alice", "doc2", None).await);
+        assert!(router.subscribe("charlie", "doc2", None).await);
 
         let msg1 = ServerMessage::YrsUpdate {
             doc_id: "doc1".into(),
@@ -595,8 +670,8 @@ mod tests {
         router.register_client(alice_handle, true).await;
         router.register_client(bob_handle, true).await;
 
-        assert!(router.subscribe("alice", "doc1").await);
-        assert!(router.subscribe("bob", "doc1").await);
+        assert!(router.subscribe("alice", "doc1", None).await);
+        assert!(router.subscribe("bob", "doc1", None).await);
 
         // Bob disconnects; his subscription is retained.
         router.unregister_client("bob", 2).await;
@@ -649,14 +724,15 @@ mod tests {
             offline: OfflineQueue::new(),
             max_documents: 100,
             max_subscribers_per_doc: 2,
+            content_gating: AtomicBool::new(false),
         };
 
-        assert!(router.subscribe("a", "doc1").await);
-        assert!(router.subscribe("b", "doc1").await);
+        assert!(router.subscribe("a", "doc1", None).await);
+        assert!(router.subscribe("b", "doc1", None).await);
         // Third distinct subscriber exceeds the per-document cap.
-        assert!(!router.subscribe("c", "doc1").await);
+        assert!(!router.subscribe("c", "doc1", None).await);
         // Re-subscribing an existing member is still fine.
-        assert!(router.subscribe("a", "doc1").await);
+        assert!(router.subscribe("a", "doc1", None).await);
     }
 
     #[tokio::test]
@@ -670,11 +746,12 @@ mod tests {
             offline: OfflineQueue::with_limits(10, 1),
             max_documents: 100,
             max_subscribers_per_doc: 100,
+            content_gating: AtomicBool::new(false),
         };
 
         // Two offline subscribers (no live handles registered).
-        assert!(router.subscribe("u1", "doc1").await);
-        assert!(router.subscribe("u2", "doc1").await);
+        assert!(router.subscribe("u1", "doc1", None).await);
+        assert!(router.subscribe("u2", "doc1", None).await);
 
         // A sender routes an update; both offline subscribers get enqueued.
         // The offline queue (cap 1) evicts whichever was enqueued first.
@@ -778,6 +855,7 @@ mod tests {
             offline: OfflineQueue::new(),
             max_documents: 2,
             max_subscribers_per_doc: 100,
+            content_gating: AtomicBool::new(false),
         };
 
         // Two distinct first-anchors fill the map to the cap.
@@ -834,13 +912,181 @@ mod tests {
             offline: OfflineQueue::new(),
             max_documents: 2,
             max_subscribers_per_doc: 100,
+            content_gating: AtomicBool::new(false),
         };
 
-        assert!(router.subscribe("a", "doc1").await);
-        assert!(router.subscribe("a", "doc2").await);
+        assert!(router.subscribe("a", "doc1", None).await);
+        assert!(router.subscribe("a", "doc2", None).await);
         // Third distinct document exceeds the global document cap.
-        assert!(!router.subscribe("a", "doc3").await);
+        assert!(!router.subscribe("a", "doc3", None).await);
         // Subscribing to an existing document is still fine.
-        assert!(router.subscribe("b", "doc1").await);
+        assert!(router.subscribe("b", "doc1", None).await);
+    }
+
+    // ---- Content gating (issue #72) -----------------------------------------
+
+    /// A `YrsUpdate` for `doc1` from `alice`.
+    fn update_for_doc1(data: u8) -> ServerMessage {
+        ServerMessage::YrsUpdate {
+            doc_id: "doc1".into(),
+            from: "alice".into(),
+            encrypted: vec![data],
+            epoch: 1,
+        }
+    }
+
+    /// NEGATIVE (a): with content gating on, a subscriber that presented no
+    /// capability is subscribed for the HANDSHAKE ONLY. It must receive MLS
+    /// handshake traffic (or a joiner could never receive its `Welcome` and the
+    /// join deadlocks) and must receive NO document content — neither delivered
+    /// live nor accumulated in the offline queue.
+    #[tokio::test]
+    async fn test_content_gating_withholds_yrs_update_from_unauthorized() {
+        let router = MessageRouter::new();
+        router.set_content_gating(true);
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+
+        let (member_handle, mut member_rx) = create_test_client("member", 1);
+        let (joiner_handle, mut joiner_rx) = create_test_client("joiner", 2);
+        router.register_client(member_handle, true).await;
+        router.register_client(joiner_handle, true).await;
+
+        assert!(router.subscribe("member", "doc1", Some(1)).await);
+        // The join bootstrap: subscribed, no capability presented yet.
+        assert!(router.subscribe("joiner", "doc1", None).await);
+        // Same, but with no live connection — the offline-queue path.
+        assert!(router.subscribe("offline-joiner", "doc1", None).await);
+
+        // Content reaches the content-authorized member only.
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 1);
+        assert!(member_rx.try_recv().is_ok(), "an authorized subscriber still receives content");
+        assert!(
+            joiner_rx.try_recv().is_err(),
+            "an unauthorized subscriber must receive no content"
+        );
+        assert!(
+            !router.has_offline_messages("offline-joiner").await,
+            "content must be filtered BEFORE fan-out: an unauthorized subscriber must not \
+             accumulate queued content either"
+        );
+
+        // Handshake traffic is NOT gated: it reaches every subscriber, which is
+        // what makes the MLS join bootstrap work under authz.
+        let handshake = ServerMessage::MlsHandshake {
+            doc_id: "doc1".into(),
+            from: "alice".into(),
+            payload: vec![9],
+            message_type: collab_proto::MlsMessageType::Welcome,
+        };
+        assert_eq!(router.route_message("doc1", "alice", handshake).await, 2);
+        assert!(joiner_rx.try_recv().is_ok(), "a handshake-only subscriber must get the Welcome");
+        assert!(member_rx.try_recv().is_ok());
+        assert!(router.has_offline_messages("offline-joiner").await);
+    }
+
+    /// NEGATIVE (b): authorization is compared against the doc's CURRENT anchor
+    /// epoch, so a rekey revokes it. A subscriber verified at epoch 1 keeps its
+    /// subscription across the rotation to epoch 2 but stops receiving content —
+    /// no extra bookkeeping, and no window where a removed member keeps reading.
+    #[tokio::test]
+    async fn test_content_gating_rotation_revokes_stale_authorization() {
+        let router = MessageRouter::new();
+        router.set_content_gating(true);
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+
+        let (removed_handle, mut removed_rx) = create_test_client("removed", 1);
+        router.register_client(removed_handle, true).await;
+        assert!(router.subscribe("removed", "doc1", Some(1)).await);
+
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 1);
+        assert!(removed_rx.try_recv().is_ok(), "epoch-1 authorization delivers at epoch 1");
+
+        // The group rekeys and the anchor rotates forward.
+        assert!(router.set_anchor("doc1", 2, [2u8; 32]).await);
+
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(2)).await, 0);
+        assert!(
+            removed_rx.try_recv().is_err(),
+            "a capability verified at the OLD epoch must not receive post-rotation content"
+        );
+        assert!(!router.has_offline_messages("removed").await);
+        assert!(
+            router.is_subscribed("removed", "doc1").await,
+            "the subscription itself survives: only content is withheld"
+        );
+    }
+
+    /// A document with NO anchor has nobody content-authorized, so gated content
+    /// goes nowhere — fail closed.
+    ///
+    /// `None` is the ONLY authorization state reachable on an unanchored doc:
+    /// `subscribe(.., Some(epoch))` is reached solely from `relay.rs` after
+    /// `authorize_subscribe` found an anchor, and anchors are never removed. So
+    /// this pins the handshake-only subscriber — the case the fail-closed `?` in
+    /// [`MessageRouter::recipients`] actually guards. Both a live and an offline
+    /// subscriber, so the offline queue is covered too.
+    #[tokio::test]
+    async fn test_content_gating_without_anchor_withholds_from_handshake_only() {
+        let router = MessageRouter::new();
+        router.set_content_gating(true);
+
+        let (handle, mut rx) = create_test_client("eve", 1);
+        router.register_client(handle, true).await;
+        assert!(router.subscribe("eve", "doc1", None).await);
+        assert!(router.subscribe("offline-eve", "doc1", None).await);
+
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 0);
+        assert!(rx.try_recv().is_err(), "no anchor means nobody is content-authorized");
+        assert!(
+            !router.has_offline_messages("offline-eve").await,
+            "an unauthorized subscriber must not accumulate queued content either"
+        );
+    }
+
+    /// The other direction of the same re-statement: a BARE re-subscribe
+    /// DOWNGRADES an authorized subscriber back to handshake-only. This is what a
+    /// reconnecting client does if it forgets to re-present its capability — it
+    /// silently stops receiving content, so a client that reconnects must mint
+    /// and re-present, not just re-subscribe.
+    #[tokio::test]
+    async fn test_bare_resubscribe_downgrades_authorization() {
+        let router = MessageRouter::new();
+        router.set_content_gating(true);
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+
+        let (handle, mut rx) = create_test_client("member", 1);
+        router.register_client(handle, true).await;
+        assert!(router.subscribe("member", "doc1", Some(1)).await);
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 1);
+        assert!(rx.try_recv().is_ok());
+
+        // Reconnect, re-subscribe, present nothing.
+        assert!(router.subscribe("member", "doc1", None).await);
+
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(2)).await, 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "a bare re-subscribe drops content authorization back to handshake-only"
+        );
+    }
+
+    /// Re-subscribing re-states authorization: this is how a joiner upgrades from
+    /// handshake-only to content-authorized once it can mint a capability.
+    #[tokio::test]
+    async fn test_resubscribe_upgrades_authorization() {
+        let router = MessageRouter::new();
+        router.set_content_gating(true);
+        assert!(router.set_anchor("doc1", 1, [1u8; 32]).await);
+
+        let (handle, mut rx) = create_test_client("joiner", 1);
+        router.register_client(handle, true).await;
+
+        assert!(router.subscribe("joiner", "doc1", None).await);
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(1)).await, 0);
+
+        // Joined, minted a capability, re-subscribed with it.
+        assert!(router.subscribe("joiner", "doc1", Some(1)).await);
+        assert_eq!(router.route_message("doc1", "alice", update_for_doc1(2)).await, 1);
+        assert!(rx.try_recv().is_ok());
     }
 }

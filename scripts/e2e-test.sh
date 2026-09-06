@@ -21,7 +21,7 @@ cargo build --workspace --release
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if ! $COMPOSE ps --quiet 2>/dev/null | grep -q .; then
         echo "Starting relay via Docker Compose..."
-        $COMPOSE up -d
+        $COMPOSE up -d --build
     fi
 
     echo "Waiting for the relay to become healthy..."

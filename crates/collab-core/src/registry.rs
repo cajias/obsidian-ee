@@ -2,7 +2,7 @@
 
 use crate::document::CollabDocument;
 use crate::encryption::EncryptedDocument;
-use crate::{DocumentId, Invite, PendingMember};
+use crate::{AnchorRotation, DocumentId, Invite, PendingMember};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -510,7 +510,14 @@ impl DocumentRegistry {
     /// Returns `RegistryError::NotFound` if the document doesn't exist.
     /// Returns `RegistryError::NotEncrypted` if the document is not encrypted.
     /// Returns `RegistryError::MlsError` if processing the commit fails.
-    pub fn process_commit(&mut self, id: &str, commit: &[u8]) -> Result<(), RegistryError> {
+    ///
+    /// Returns the [`AnchorRotation`] for the epoch the commit creates, which the
+    /// caller sends to the relay as `RegisterDocKey` (issue #29).
+    pub fn process_commit(
+        &mut self,
+        id: &str,
+        commit: &[u8],
+    ) -> Result<AnchorRotation, RegistryError> {
         info!(document_id = %id, commit_len = commit.len(), "Processing commit for encrypted document");
 
         let entry = self.documents.get_mut(id).ok_or_else(|| {
@@ -528,7 +535,7 @@ impl DocumentRegistry {
 
         let old_epoch = doc.epoch();
 
-        doc.process_commit(commit).map_err(|e| {
+        let rotation = doc.process_commit(commit).map_err(|e| {
             error!(document_id = %id, error = ?e, old_epoch = %old_epoch,
                    "Failed to process commit");
             RegistryError::MlsError(Arc::new(e))
@@ -539,7 +546,7 @@ impl DocumentRegistry {
         debug!(document_id = %id, old_epoch = %old_epoch, new_epoch = %new_epoch,
                "Commit processed successfully, epoch updated");
 
-        Ok(())
+        Ok(rotation)
     }
 
     /// Get encryption metadata for a document.

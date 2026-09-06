@@ -71,8 +71,13 @@ async fn test_wrong_key_client_observes_nothing_over_relay() {
     else {
         panic!("Bob expected an MlsHandshake Welcome message");
     };
-    let bob_invite =
-        Invite { doc_id: doc_id.clone(), welcome: bob_welcome, commit: vec![], epoch: 1 };
+    let bob_invite = Invite {
+        doc_id: doc_id.clone(),
+        welcome: bob_welcome,
+        commit: vec![],
+        epoch: 1,
+        rotation: None,
+    };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
 
     // Eve also receives the Welcome off the wire (fanned out to every other
@@ -91,8 +96,13 @@ async fn test_wrong_key_client_observes_nothing_over_relay() {
     // key material can't unseal it, so joining must fail — she never enters
     // the session via the intercepted Welcome.
     let eve_join_pending = MlsDocumentGroup::generate_key_package("eve").unwrap();
-    let eve_bad_invite =
-        Invite { doc_id: doc_id.clone(), welcome: eve_seen_welcome, commit: vec![], epoch: 1 };
+    let eve_bad_invite = Invite {
+        doc_id: doc_id.clone(),
+        welcome: eve_seen_welcome,
+        commit: vec![],
+        epoch: 1,
+        rotation: None,
+    };
     let eve_join_result = EncryptedDocument::join(&eve_bad_invite, eve_join_pending);
     assert!(
         eve_join_result.is_err(),
