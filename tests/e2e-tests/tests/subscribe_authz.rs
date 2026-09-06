@@ -13,46 +13,45 @@
 //! Subscribe — first with NO capability, then with a FOREIGN capability minted
 //! by her own independent MLS group — AND WHEN Alice's connection tries to
 //! replay a VALID capability that member Bob minted for himself,
-//! THEN the relay REJECTS each attempt with `Unauthorized` (the replay fails
-//! `UserIdMismatch`: the relay binds the presenting connection's LOCAL identified
-//! uid, not `cap.user_id`), Eve is NOT added to the subscriber set (she receives
-//! no subsequent `YrsUpdate`), AND the two real members DO subscribe
-//! successfully (each with a capability naming its own identity) and round-trip
-//! an encrypted update.
+//! THEN the relay REJECTS every capability-bearing attempt with `Unauthorized`
+//! (the replay fails `UserIdMismatch`: the relay binds the presenting
+//! connection's LOCAL identified uid, not `cap.user_id`), Eve's capability-less
+//! subscribe is accepted for the MLS handshake ONLY so she still receives no
+//! `YrsUpdate` (issue #72), AND the two real members DO subscribe successfully
+//! (each with a capability naming its own identity) and round-trip an encrypted
+//! update.
 //!
-//! NOTE ON BOOTSTRAP: the MLS-handshake-over-relay flow (`KeyPackage` ->
-//! `Welcome`) is intentionally NOT run through this authz-enabled relay — it
-//! cannot be. A joiner must Subscribe to *receive* the `Welcome`, but can only
-//! mint a capability *after* joining, so an always-on authz relay would deadlock
-//! the join. That is
-//! exactly why the production relay binary keeps authz OFF for the un-gated
-//! bootstrap subscribe (see `full_flow.rs`). Here membership is established
-//! in-process (Alice creates + invites Bob → both real epoch-1 members sharing
-//! the exporter secret, as in `collab-core`'s `two_member_group`), and the #29
-//! authorization gate is exercised over the real wire.
+//! NOTE ON BOOTSTRAP: membership here is established in-process (Alice creates +
+//! invites Bob → both real epoch-1 members sharing the exporter secret, as in
+//! `collab-core`'s `two_member_group`) so this test can focus on the #29
+//! authorization gate over the real wire. The MLS-handshake-over-relay bootstrap
+//! under an authz-enabled relay — `KeyPackage` -> `Welcome` -> join -> mint ->
+//! re-subscribe -> content — is the separate `test_joiner_bootstraps_...` test
+//! below (issue #72). Before #72 that flow deadlocked: a joiner had to Subscribe
+//! to *receive* the `Welcome`, but could only mint a capability *after* joining.
 //!
-//! The second test in this file covers the OTHER half of the same gate: what
-//! happens to those capabilities once the group rekeys, and the anchor rotation
-//! that has to accompany it. See
-//! `test_anchor_rotation_unwedges_a_rekeyed_document`.
+//! The second test covers the OTHER half of the same gate: what happens to those
+//! capabilities once the group rekeys, and the anchor rotation that must
+//! accompany it. See `test_anchor_rotation_unwedges_a_rekeyed_document`.
 //!
-//! The third takes the same rotation machinery down the REMOVAL path — the point
-//! where #31 (member removal) meets #72 (anchor rotation): rotating the anchor
-//! after a removal is what makes the removal mean something at the relay. See
+//! The third takes the same rotation machinery down the REMOVAL path — where #31
+//! (member removal) meets #72 (anchor rotation): rotating the anchor after a
+//! removal is what makes the removal mean something at the relay. See
 //! `removal_rotation_revokes_the_removed_members_capability`.
 //!
-//! All three self-host their authz relay, so none needs Docker — but all are
-//! `#[ignore]`d, which keeps them in the `--include-ignored` wire-test tier the
-//! e2e gate counts and OUT of a plain `cargo test --workspace` run.
+//! TAGGING — no test here is `#[ignore]`d, deliberately. All self-host their
+//! authz relay via `TestServer`, so none needs Docker. They still run under the
+//! e2e gate (`cargo xtask e2e`), because `--include-ignored` is a superset: it
+//! runs untagged tests too. Tagging them would only hide them from a plain
+//! `cargo test --workspace` — coverage subtracted for nothing.
 //!
-//! Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
-//! (This test self-hosts its authz relay and does not use the Docker relay, but
-//! carries the tag so it lands in the `--include-ignored` wire-test tier.)
+//! The `#[ignore]`s in `full_flow.rs` and `fail_closed.rs` are the real thing:
+//! those hardcode `ws://localhost:8080/ws` and do need the Docker relay.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use collab_core::{AnchorRotation, EncryptedDocument, Invite, MlsDocumentGroup};
-use collab_proto::{ClientMessage, DocumentId, ErrorCode, ServerMessage};
+use collab_proto::{ClientMessage, DocumentId, ErrorCode, MlsMessageType, ServerMessage};
 use collab_relay::RelayServer;
 use e2e_tests::helpers::{TestClient, TestServer};
 
@@ -144,7 +143,6 @@ fn foreign_group_at_epoch_1(doc_id: &str) -> EncryptedDocument {
 }
 
 #[tokio::test]
-#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
 #[allow(clippy::too_many_lines)]
 async fn test_non_member_subscribe_rejected_over_relay() {
     // Self-hosted relay with subscribe authorization ENABLED.
@@ -178,14 +176,14 @@ async fn test_non_member_subscribe_rejected_over_relay() {
 
     let now = now_unix();
 
-    // --- Negative (a): Eve subscribes with NO capability → Unauthorized ------
+    // --- Negative (a): Eve subscribes with NO capability → handshake-only ----
+    // Since #72 this subscribe is ACCEPTED (it is the join-bootstrap path, which
+    // the relay cannot distinguish from Eve's), but it authorizes nothing: the
+    // final assertion — Eve receives no `YrsUpdate` — is where the teeth moved.
     eve.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await.unwrap();
     assert!(
-        matches!(
-            eve.recv().await.unwrap(),
-            ServerMessage::Error { code: ErrorCode::Unauthorized, .. }
-        ),
-        "a non-member with no capability must be rejected Unauthorized"
+        matches!(eve.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+        "a capability-less subscribe is accepted for the handshake bootstrap"
     );
 
     // --- Negative (b): Eve subscribes with a FOREIGN capability → Unauthorized
@@ -263,10 +261,170 @@ async fn test_non_member_subscribe_rejected_over_relay() {
         "the second member must decrypt the update off the wire"
     );
 
-    // Eve was never added to the subscriber set (both subscribes were rejected),
-    // so the fanned-out update never reaches her.
+    // Eve is subscribed (handshake-only) but was never content-authorized: her
+    // capability-bearing attempt was rejected and her capability-less one granted
+    // no content. The fanned-out update never reaches her.
     let eve_saw = eve.try_recv(Duration::from_secs(2)).await.unwrap();
-    assert!(eve_saw.is_none(), "a rejected non-member must receive no YrsUpdate; got {eve_saw:?}");
+    assert!(
+        eve_saw.is_none(),
+        "an unauthorized subscriber must receive no YrsUpdate; got {eve_saw:?}"
+    );
+}
+
+/// The #72 bootstrap: an MLS join completes over an authz-ENABLED relay, and the
+/// joiner receives document content only once it presents a capability.
+///
+/// GIVEN a relay with subscribe authorization enabled and an owner (Alice) whose
+/// group does not yet include Bob,
+/// WHEN Bob subscribes with NO capability (he cannot mint one — the key derives
+/// from the group's per-epoch exporter secret and he is not yet a member),
+/// publishes his `KeyPackage` over the wire, and receives Alice's `Welcome` over
+/// the relay to join, WHILE Alice registers the doc anchor and sends an encrypted
+/// update,
+/// THEN Bob's capability-less subscribe SUCCEEDS (before #72 it was rejected and
+/// the join deadlocked), he receives the handshake but NOT that first update,
+/// AND only after he mints a capability at the anchor epoch and re-subscribes
+/// with it does relayed content reach him and decrypt.
+// DELIBERATELY NOT `#[ignore]`d — this is the default-run test defending the #72
+// mapping end to end: a capability-less subscribe grants the handshake and no
+// content. Tagging it would hide that defence from `cargo test --workspace` and
+// buy nothing (see the module-level TAGGING note).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_joiner_bootstraps_and_gains_content_after_capability() {
+    let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+    let url = server.url().to_owned();
+    let doc_id: DocumentId = "authz-bootstrap-doc".to_string();
+    let secret = "members only: the rendezvous is at 0300";
+
+    let mut alice = TestClient::connect_as(&url, "alice").await.unwrap();
+    let mut bob = TestClient::connect_as(&url, "bob").await.unwrap();
+
+    // --- Both subscribe with NO capability: no anchor exists yet, and Bob is
+    // --- not a member, so neither CAN present one. This is the deadlock fix.
+    for client in [&mut alice, &mut bob] {
+        client
+            .send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None })
+            .await
+            .unwrap();
+        assert!(
+            matches!(client.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+            "a pre-membership subscribe must be accepted, or the MLS join deadlocks"
+        );
+    }
+
+    // --- Bob publishes his KeyPackage over the wire ---------------------------
+    let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+    bob.send(&ClientMessage::MlsHandshake {
+        doc_id: doc_id.clone(),
+        payload: bob_pending.key_package().to_vec(),
+        message_type: MlsMessageType::KeyPackage,
+    })
+    .await
+    .unwrap();
+
+    // --- Alice builds the invite from the WIRE bytes only ---------------------
+    let mut alice_doc = EncryptedDocument::create(&doc_id, "alice").unwrap();
+    let ServerMessage::MlsHandshake {
+        payload: bob_key_package,
+        message_type: MlsMessageType::KeyPackage,
+        ..
+    } = alice.recv().await.unwrap()
+    else {
+        panic!("Alice expected Bob's KeyPackage over the wire")
+    };
+    let invite = alice_doc.create_invite(&bob_key_package).unwrap();
+    assert_eq!(alice_doc.epoch(), 1, "the add-commit advances the owner to epoch 1");
+
+    // --- The Welcome crosses the relay to a handshake-only subscriber ---------
+    // This is the fan-out that content gating must NOT block.
+    alice
+        .send(&ClientMessage::MlsHandshake {
+            doc_id: doc_id.clone(),
+            payload: invite.welcome.clone(),
+            message_type: MlsMessageType::Welcome,
+        })
+        .await
+        .unwrap();
+    let ServerMessage::MlsHandshake {
+        payload: welcome_payload,
+        message_type: MlsMessageType::Welcome,
+        ..
+    } = bob.recv().await.unwrap()
+    else {
+        panic!("Bob expected the Welcome over the wire")
+    };
+    let mut bob_doc = EncryptedDocument::join(
+        // Joiner-side reconstruction from the Welcome bytes off the wire: no
+        // commit and no rotation, because Bob holds no outgoing-epoch key to
+        // sign one with. Only the owner's `create_invite` emits a rotation.
+        &Invite {
+            doc_id: doc_id.clone(),
+            welcome: welcome_payload,
+            commit: vec![],
+            epoch: alice_doc.epoch(),
+            rotation: None,
+        },
+        bob_pending,
+    )
+    .unwrap();
+
+    // --- Alice anchors the doc at her current epoch and re-subscribes with a
+    // --- capability, upgrading her own subscription to content-authorized.
+    let now = now_unix();
+    alice
+        .send(&ClientMessage::RegisterDocKey {
+            doc_id: doc_id.clone(),
+            epoch: alice_doc.epoch(),
+            public_key: alice_doc.subscribe_verifying_key().unwrap().to_vec(),
+            proof: alice_doc.sign_doc_key_proof(&doc_id).unwrap(),
+            rotation_proof: Vec::new(),
+        })
+        .await
+        .unwrap();
+    alice
+        .send(&ClientMessage::Subscribe {
+            doc_id: doc_id.clone(),
+            capability: Some(
+                alice_doc.mint_subscribe_capability("alice", &doc_id, now, TTL_SECS).unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(alice.recv().await.unwrap(), ServerMessage::Subscribed { .. }));
+
+    // --- Bob has JOINED but has not presented a capability: no content --------
+    alice_doc.insert(0, "pre-capability content");
+    let early = alice_doc.get_encrypted_update().unwrap();
+    alice.send_update(&doc_id, &early).await.unwrap();
+    let bob_saw = bob.try_recv(Duration::from_secs(2)).await.unwrap();
+    assert!(
+        bob_saw.is_none(),
+        "a joined-but-handshake-only subscriber must receive no YrsUpdate; got {bob_saw:?}"
+    );
+
+    // --- Bob mints a capability at the anchor epoch and re-subscribes ---------
+    assert_eq!(bob_doc.epoch(), alice_doc.epoch(), "joiner and owner share the anchored epoch");
+    bob.send(&ClientMessage::Subscribe {
+        doc_id: doc_id.clone(),
+        capability: Some(bob_doc.mint_subscribe_capability("bob", &doc_id, now, TTL_SECS).unwrap()),
+    })
+    .await
+    .unwrap();
+    assert!(matches!(bob.recv().await.unwrap(), ServerMessage::Subscribed { .. }));
+
+    // --- Now content reaches him and decrypts --------------------------------
+    // `get_encrypted_update` encodes full CRDT state, so the update Bob was
+    // denied above is not needed to converge.
+    alice_doc.insert(0, secret);
+    let update = alice_doc.get_encrypted_update().unwrap();
+    alice.send_update(&doc_id, &update).await.unwrap();
+    let bob_op = bob.recv_update().await.unwrap();
+    bob_doc.apply_encrypted_update(&bob_op).unwrap();
+    assert!(
+        bob_doc.get_content().contains(secret),
+        "a content-authorized joiner must decrypt relayed content"
+    );
 }
 
 /// An outsider's own group on the same `doc_id`, advanced to epoch 2 so it emits
@@ -306,7 +464,6 @@ async fn assert_rotation_rejected(client: &mut TestClient, context: &str) {
 /// DIFFERENT document are both REJECTED; and the rotation emitted by the commit
 /// itself is ACCEPTED, after which epoch-2 capabilities work and content flows.
 #[tokio::test]
-#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
 #[allow(clippy::too_many_lines)]
 async fn test_anchor_rotation_unwedges_a_rekeyed_document() {
     let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
@@ -488,7 +645,6 @@ async fn test_anchor_rotation_unwedges_a_rekeyed_document() {
 /// could use to move the anchor back, and Bob — who re-mints at epoch 3 —
 /// subscribes and decrypts the content off the wire.
 #[tokio::test]
-#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
 #[allow(clippy::too_many_lines)]
 async fn removal_rotation_revokes_the_removed_members_capability() {
     let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
