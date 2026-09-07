@@ -77,6 +77,23 @@ export interface CollabClientConfig {
      * `DEFAULT_MAX_RECONNECT_ATTEMPTS`; 0 gives up on the first drop.
      */
     maxReconnectAttempts?: number;
+    /**
+     * MLS group state saved by a previous session, keyed by document id (#93).
+     *
+     * Without it a new `CollabClient` builds a fresh epoch-0 group, whose TOFU
+     * `register_doc_key` the relay refuses against a document it has already
+     * anchored — so the session completes its handshake and then receives no
+     * content. That is what `stopSession()` -> `startSession()` does today.
+     *
+     * A blob that fails to open is IGNORED, not fatal: the slot stays empty and
+     * the client bootstraps fresh, exactly as it does with no snapshot at all.
+     */
+    snapshots?: Record<string, Uint8Array>;
+    /**
+     * The 32-byte at-rest key for `snapshots`. Its provenance is the caller's
+     * concern; it must never be persisted beside the blobs it protects.
+     */
+    snapshotKey?: Uint8Array;
 }
 
 export type UpdateCallback = (text: string) => void;
@@ -270,6 +287,71 @@ export class CollabClient {
     constructor(config: CollabClientConfig) {
         validateConfig(config);
         this.config = config;
+        this.restoreSlots();
+    }
+
+    /**
+     * Repopulate each slot from `config.snapshots` (#93).
+     *
+     * Done in the CONSTRUCTOR rather than in `connect()` on purpose: `subscribe`
+     * runs before `establishGroup`, so a slot that already holds a doc mints a
+     * capability on its first subscribe AND is filtered out of bootstrapping —
+     * no `create`, and no TOFU `register_doc_key` the relay would refuse as a
+     * stale-or-equal-epoch rotation against the anchor the previous session
+     * already registered.
+     *
+     * `slot.docId` is the AEAD associated data, and it is the LOCALLY-trusted
+     * `config.docId` / `config.manifestDocId` — never the key a blob was filed
+     * under, which would hand an attacker the aad along with the blob.
+     *
+     * A blob that will not open (wrong document, wrong key, stale epoch, or
+     * corrupt) leaves the slot empty and the client bootstraps fresh. Degrading
+     * to today's behaviour is the right failure: refusing to start would turn a
+     * lost snapshot into a dead session.
+     */
+    private restoreSlots(): void {
+        const { snapshots, snapshotKey } = this.config;
+        if (!snapshots || !snapshotKey) {
+            return;
+        }
+        for (const slot of this.slots()) {
+            const blob = snapshots[slot.docId];
+            if (!blob) {
+                continue;
+            }
+            try {
+                // ponytail: min_epoch 0 accepts a snapshot at any epoch. See the
+                // matching note in collab-cli's `load_state` — rejecting a stale
+                // one needs a current epoch learned out of band, and accepting
+                // one costs content delivery (the relay refuses a capability
+                // that does not match the current anchor), never confidentiality.
+                slot.setDoc(
+                    WasmEncryptedDocument.restore_encrypted(slot.docId, blob, snapshotKey, 0n)
+                );
+            } catch (error) {
+                console.warn(
+                    `[CollabClient] Ignoring the saved group for ${slot.docId}; bootstrapping fresh:`,
+                    error
+                );
+            }
+        }
+    }
+
+    /**
+     * Snapshot every established group, encrypted at rest, keyed by document id.
+     *
+     * Call this BEFORE `destroy()`: `destroy` frees the wasm handles, and a
+     * snapshot taken afterwards would be empty.
+     */
+    snapshot(key: Uint8Array): Record<string, Uint8Array> {
+        const blobs: Record<string, Uint8Array> = {};
+        for (const slot of this.slots()) {
+            const doc = slot.getDoc();
+            if (doc) {
+                blobs[slot.docId] = doc.snapshot_encrypted(key);
+            }
+        }
+        return blobs;
     }
 
     /** The file-group slot, viewing `this.doc`/`this.pending`. */
@@ -285,6 +367,20 @@ export class CollabClient {
                 this.pending = pending;
             },
         };
+    }
+
+    /**
+     * Every slot this client actually owns: the file group always, plus the
+     * manifest group when vault sync is configured (#32).
+     *
+     * The conditional is load-bearing — `manifestSlot()` asserts a
+     * `manifestDocId`, so enumerating it unconditionally would produce a slot
+     * with an undefined document id.
+     */
+    private slots(): GroupSlot[] {
+        return this.config.vaultSync && this.config.manifestDocId
+            ? [this.fileSlot(), this.manifestSlot()]
+            : [this.fileSlot()];
     }
 
     /** The manifest-group slot (#32), viewing `this.manifestDoc`/`this.manifestPending`. */
@@ -316,6 +412,24 @@ export class CollabClient {
             // registered — nothing a member mints verifies without it (#72).
             // Presenting the capability is establishGroup's job, deliberately
             // after this: see the comment there.
+            // ponytail: the boolean is deliberately not checked. `send` returns
+            // false only when it QUEUED the frame for the next flush, which is
+            // not a failure — tearing the group down there would strand a frame
+            // that is still going to be sent.
+            //
+            // The residual it cannot cover: `ws.send` returns, the frame is lost
+            // at TCP level, and the relay never stores the anchor. Before #93 a
+            // stopSession()/startSession() cycle self-healed that by rebuilding
+            // the group and re-running this TOFU registration. Now the
+            // un-anchored group is snapshotted and restored, so it is excluded
+            // from bootstrapping and keeps presenting capabilities against an
+            // anchor the relay never received — a permanently content-blind
+            // session that fails closed and resolves normally.
+            //
+            // Closing it needs a retry driven by the relay's Unauthorized, which
+            // is not expressible today: `ServerMessage::Error` carries a code and
+            // a message but NO doc_id, so a client with two slots cannot tell
+            // which document was refused. Adding that field is the prerequisite.
             this.registerAnchor(slot);
             return;
         }
@@ -352,10 +466,7 @@ export class CollabClient {
         // established by the same handshake. Same role: whoever owns the file doc
         // owns the manifest group. Throws below fail the connect() attempt via
         // tryInitialize, exactly like the file group.
-        const slots =
-            this.config.vaultSync && this.config.manifestDocId
-                ? [this.fileSlot(), this.manifestSlot()]
-                : [this.fileSlot()];
+        const slots = this.slots();
         // A slot with a live doc is a group to RESUME; a slot with a live pending
         // is a joiner still mid-handshake, whose one-time key package is already
         // on the wire. Only a slot with neither needs bootstrapping.

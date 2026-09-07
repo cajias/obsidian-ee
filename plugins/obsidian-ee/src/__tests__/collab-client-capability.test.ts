@@ -100,6 +100,11 @@ const makeMockDoc = (docId: string) => ({
                 minted_by: docId,
             })
     ),
+    snapshot_encrypted: jest
+        .fn<(key: Uint8Array) => Uint8Array>()
+        // Echo the doc id into the blob so a test can tell WHICH group it came
+        // from, mirroring `minted_by` on the capability.
+        .mockImplementation(() => new TextEncoder().encode(`snapshot:${docId}`)),
     sign_doc_key_proof: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([7, 7])),
     subscribe_verifying_key: jest.fn<() => Uint8Array>().mockReturnValue(new Uint8Array([8, 8])),
     free: jest.fn(),
@@ -107,6 +112,7 @@ const makeMockDoc = (docId: string) => ({
 
 type MockDoc = ReturnType<typeof makeMockDoc>;
 const createdDocs: MockDoc[] = [];
+const restoredDocs: MockDoc[] = [];
 const joinedDocs: MockDoc[] = [];
 
 jest.unstable_mockModule('../wasm/collab_wasm', () => ({
@@ -122,6 +128,19 @@ jest.unstable_mockModule('../wasm/collab_wasm', () => ({
             joinedDocs.push(doc);
             return doc;
         }),
+        // Models the real binding: the blob names the document it was sealed
+        // for, and opening it under any other id throws exactly as the AEAD
+        // does. A mock that ignored `docId` would let a broken caller pass.
+        restore_encrypted: jest.fn(
+            (docId: string, snapshot: Uint8Array, key: Uint8Array, _minEpoch: bigint) => {
+                if (key.length !== 32) throw new Error('key must be exactly 32 bytes');
+                const sealedFor = new TextDecoder().decode(snapshot).replace('snapshot:', '');
+                if (sealedFor !== docId) throw new Error('AEAD open failed');
+                const doc = makeMockDoc(docId);
+                restoredDocs.push(doc);
+                return doc;
+            }
+        ),
     },
     WasmInvite: {
         from_welcome: jest.fn((docId: string) => ({ doc_id: docId, welcome: new Uint8Array() })),
@@ -175,6 +194,7 @@ describe('subscribe capability (#72)', () => {
         jest.useFakeTimers();
         sockets.length = 0;
         createdDocs.length = 0;
+        restoredDocs.length = 0;
         joinedDocs.length = 0;
     });
 
@@ -526,5 +546,146 @@ describe('subscribe capability (#72)', () => {
         // Honest limitation: no MLS group exists for a newly-announced path, so
         // there is nothing to mint from. Handshake-only until one is established.
         expect(discovered[0].capability).toBeUndefined();
+    });
+});
+
+describe('persisted group state (#93)', () => {
+    let client: CollabClient | null = null;
+    const KEY = new Uint8Array(32).fill(7);
+    const blobFor = (docId: string) => new TextEncoder().encode(`snapshot:${docId}`);
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        sockets.length = 0;
+        createdDocs.length = 0;
+        restoredDocs.length = 0;
+        joinedDocs.length = 0;
+    });
+
+    afterEach(() => {
+        client?.destroy();
+        client = null;
+        jest.useRealTimers();
+    });
+
+    // GIVEN a client constructed with the snapshot a previous session saved,
+    // WHEN it connects, THEN it subscribes WITH a capability and sends NO
+    // register_doc_key. The second half is the point: a fresh epoch-0 group
+    // would TOFU-register against a document the relay has already anchored and
+    // be refused, which is exactly what stopSession() -> startSession() does
+    // today (#93 path 3).
+    it('restores a persisted group and subscribes without re-registering the anchor', async () => {
+        client = new CollabClient(
+            makeConfig({ snapshots: { doc1: blobFor('doc1') }, snapshotKey: KEY })
+        );
+        await connectClient(client);
+
+        const presented = subscribes(sockets[0], 'doc1').filter((f) => f.capability);
+        expect(presented).toHaveLength(1);
+        expect(presented[0].capability).toMatchObject({ minted_by: 'doc1' });
+        expect(frames(sockets[0]).filter((f) => f.type === 'register_doc_key')).toHaveLength(0);
+        expect(createdDocs).toHaveLength(0);
+    });
+
+    // A reconnect must RE-present: a bare subscribe downgrades an authorized
+    // member back to handshake-only at the relay.
+    it('re-presents the restored capability after a reconnect', async () => {
+        client = new CollabClient(
+            makeConfig({ snapshots: { doc1: blobFor('doc1') }, snapshotKey: KEY })
+        );
+        await connectClient(client);
+        sockets[0].drop();
+        jest.runAllTimers();
+        await Promise.resolve();
+
+        expect(sockets.length).toBeGreaterThan(1);
+        expect(subscribes(sockets[1], 'doc1').filter((f) => f.capability)).not.toHaveLength(0);
+    });
+
+    // NEGATIVE — the AEAD context is config.docId, the LOCALLY-trusted value.
+    // A blob sealed for another document must not open, and the client must
+    // fall back to a fresh bootstrap rather than run on a half-restored slot.
+    it('refuses a snapshot sealed for a different document and bootstraps fresh', async () => {
+        client = new CollabClient(
+            makeConfig({ snapshots: { doc1: blobFor('other-doc') }, snapshotKey: KEY })
+        );
+        await connectClient(client);
+
+        expect(restoredDocs).toHaveLength(0);
+        expect(createdDocs).toHaveLength(1);
+        expect(frames(sockets[0]).filter((f) => f.type === 'register_doc_key')).toHaveLength(1);
+    });
+
+    // NEGATIVE — the map KEY is a lookup, never the AEAD context. A blob filed
+    // under a foreign document id must simply not be found: an implementation
+    // that iterated Object.keys(snapshots) and passed the key as the aad would
+    // restore it, and every other test here would still pass.
+    it('ignores a snapshot filed under a foreign document id', async () => {
+        client = new CollabClient(
+            makeConfig({ snapshots: { 'other-doc': blobFor('other-doc') }, snapshotKey: KEY })
+        );
+        await connectClient(client);
+
+        expect(restoredDocs).toHaveLength(0);
+        expect(createdDocs).toHaveLength(1);
+        const presented = subscribes(sockets[0], 'doc1').find((f) => f.capability);
+        // Asserted rather than optional-chained: `presented?.capability` would be
+        // `undefined` if NO capability were presented at all, and
+        // `toMatchObject` on undefined must not be the thing that fails here.
+        expect(presented).toBeDefined();
+        expect(presented!.capability).toMatchObject({ minted_by: 'doc1' });
+    });
+
+    // NEGATIVE — a wrong-length (and so wrong) at-rest key fails the same way.
+    it('refuses a snapshot under a bad key and bootstraps fresh', async () => {
+        client = new CollabClient(
+            makeConfig({ snapshots: { doc1: blobFor('doc1') }, snapshotKey: new Uint8Array(16) })
+        );
+        await connectClient(client);
+
+        expect(restoredDocs).toHaveLength(0);
+        expect(createdDocs).toHaveLength(1);
+    });
+
+    // Positive control for the two negatives above: without it they would both
+    // pass merely because restore is broken for every input.
+    it('snapshot() round-trips into a new client that then mints', async () => {
+        const first = new CollabClient(makeConfig());
+        await connectClient(first);
+        const blobs = first.snapshot(KEY);
+        expect(blobs.doc1).toEqual(blobFor('doc1'));
+        first.destroy();
+
+        sockets.length = 0;
+        createdDocs.length = 0;
+        client = new CollabClient(makeConfig({ snapshots: blobs, snapshotKey: KEY }));
+        await connectClient(client);
+
+        expect(restoredDocs).toHaveLength(1);
+        expect(subscribes(sockets[0], 'doc1').filter((f) => f.capability)).toHaveLength(1);
+    });
+
+    // The manifest group hits path 3 identically, so it must be snapshotted and
+    // restored too — a fresh epoch-0 manifest group is refused against the
+    // already-anchored __vault_manifest__.
+    it('restores the manifest slot as well as the file slot', async () => {
+        client = new CollabClient(
+            makeConfig({
+                vaultSync: { apply_remote_manifest: jest.fn(() => []) },
+                manifestDocId: '__vault_manifest__',
+                snapshots: {
+                    doc1: blobFor('doc1'),
+                    __vault_manifest__: blobFor('__vault_manifest__'),
+                },
+                snapshotKey: KEY,
+            })
+        );
+        await connectClient(client);
+
+        const manifestSubs = subscribes(sockets[0], '__vault_manifest__').filter(
+            (f) => f.capability
+        );
+        expect(manifestSubs).toHaveLength(1);
+        expect(manifestSubs[0].capability).toMatchObject({ minted_by: '__vault_manifest__' });
     });
 });

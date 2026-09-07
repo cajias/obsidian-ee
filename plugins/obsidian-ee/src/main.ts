@@ -1,4 +1,4 @@
-import { Plugin, Notice, MarkdownView, PluginSettingTab, App, Setting } from 'obsidian';
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import type { EventRef } from 'obsidian';
 import init, { WasmVaultSync, manifest_doc_id } from './wasm/collab_wasm';
 import type { WasmSyncAction } from './wasm/collab_wasm';
@@ -33,6 +33,18 @@ export default class CollabPlugin extends Plugin {
     private collabClient: CollabClient | null = null;
     private editorSync: EditorSync | null = null;
     private vaultSync: WasmVaultSync | null = null;
+    /** The at-rest key for MLS snapshots, resolved once per session (#93). */
+    private snapshotKey: Uint8Array | null = null;
+    /**
+     * The user id THIS session runs under.
+     *
+     * Persisted with the snapshot and reused on restore: a restored group's MLS
+     * leaf still carries the id it was created with, so minting under a fresh
+     * `user-${Date.now()}` would leave the leaf identity and the wire identity
+     * disagreeing. The capability still verifies either way (the relay binds the
+     * connection's identified uid), but the divergence is real and free to avoid.
+     */
+    private sessionUserId = '';
     private vaultEventRefs: EventRef[] = [];
     // Paths currently being created FROM a remote manifest: the vault 'create'
     // event they fire must not echo back out as a new manifest update.
@@ -175,10 +187,32 @@ export default class CollabPlugin extends Plugin {
         // under its own MLS group, established by the same owner/joiner handshake.
         this.vaultSync = new WasmVaultSync([], [], true, true);
 
+        // Resume the MLS groups a previous session saved (#93). Without this a
+        // stopSession() -> startSession() cycle builds a fresh epoch-0 group
+        // whose TOFU register_doc_key the relay refuses against the document it
+        // already anchored, and the session goes content-blind.
+        //
+        // Every failure here degrades to a fresh bootstrap rather than aborting:
+        // an unreadable key or state file costs content resumption, and refusing
+        // to start would turn that into no session at all.
+        let saved: { snapshots: Record<string, Uint8Array>; userId?: string } = { snapshots: {} };
+        try {
+            this.snapshotKey = await this.atRestKey();
+            saved = await this.loadMlsState();
+        } catch (error) {
+            console.warn('[CollabPlugin] MLS state unavailable; starting fresh:', error);
+            this.snapshotKey = null;
+        }
+        // Reuse the persisted id so the restored group's MLS leaf and the wire
+        // identity agree; a first-ever session mints a new one.
+        this.sessionUserId = saved.userId ?? `user-${Date.now()}`;
+
         const config: CollabClientConfig = {
             relayUrl: this.settings.relayUrl,
-            userId: `user-${Date.now()}`,
+            userId: this.sessionUserId,
             docId: activeView.file?.path || 'unknown',
+            snapshots: saved.snapshots,
+            snapshotKey: this.snapshotKey ?? undefined,
             // owner creates the MLS group; joiner joins via a Welcome. No key input:
             // the group's keys are derived by MLS, so a session fails closed until a
             // group is established (CollabClient.sendUpdate returns false, no plaintext).
@@ -315,6 +349,106 @@ export default class CollabPlugin extends Plugin {
         }
     }
 
+    /** Where the encrypted MLS snapshots live: the plugin's own folder. */
+    private mlsStatePath(): string {
+        return `${this.manifest.dir}/mls-state.json`;
+    }
+
+    /** Where the at-rest key lives — a SEPARATE file from the blobs it protects. */
+    private mlsKeyPath(): string {
+        return `${this.manifest.dir}/mls-key.bin`;
+    }
+
+    /**
+     * Load (or on first use, generate) the 32-byte key that encrypts the MLS
+     * snapshots.
+     *
+     * It lives in its own file and NEVER in `data.json`: settings are the thing
+     * a user copies between machines or pastes into a bug report, and a key
+     * stored beside the blobs it protects protects nothing.
+     *
+     * ponytail: a plain key file. Obsidian's DataAdapter cannot set file modes,
+     * so unlike the CLI's 0600 this inherits the vault's permissions — anything
+     * that can read the vault can read the key. The upgrade path is Electron's
+     * `safeStorage` (OS keychain), which would bind the key to the user account;
+     * swap the body of this method and nothing else changes.
+     */
+    private async atRestKey(): Promise<Uint8Array> {
+        const adapter = this.app.vault.adapter;
+        const path = this.mlsKeyPath();
+        if (await adapter.exists(path)) {
+            const key = new Uint8Array(await adapter.readBinary(path));
+            if (key.length === 32) {
+                return key;
+            }
+            // Refuse rather than regenerate. Overwriting would mint a key that
+            // opens none of the existing blobs, permanently orphaning every
+            // saved group — the CLI refuses for the same reason. startSession
+            // catches this and the session runs unpersisted.
+            throw new Error(
+                `${path} is ${key.length} bytes, expected 32 — refusing to replace a ` +
+                    'malformed at-rest key, which would orphan every saved group'
+            );
+        }
+        const key = new Uint8Array(32);
+        crypto.getRandomValues(key);
+        await adapter.writeBinary(path, key.buffer as ArrayBuffer);
+        return key;
+    }
+
+    /**
+     * Read the MLS groups a previous session saved, keyed by document id.
+     *
+     * Returns empty on ANY failure — a missing, corrupt, or unreadable state
+     * file must degrade to a fresh bootstrap, never block a session.
+     */
+    private async loadMlsState(): Promise<{
+        snapshots: Record<string, Uint8Array>;
+        userId?: string;
+    }> {
+        try {
+            const adapter = this.app.vault.adapter;
+            if (!(await adapter.exists(this.mlsStatePath()))) {
+                return { snapshots: {} };
+            }
+            const raw = new TextDecoder().decode(await adapter.readBinary(this.mlsStatePath()));
+            const parsed = JSON.parse(raw) as {
+                snapshots?: Record<string, number[]>;
+                userId?: string;
+            };
+            // `Object.fromEntries`, not a computed assignment in a loop: the keys
+            // come from a JSON file, so `"__proto__"` would set the prototype
+            // rather than add an entry. `fromEntries` defines an own property
+            // for every key, including that one.
+            const snapshots = Object.fromEntries(
+                Object.entries(parsed.snapshots ?? {}).map(([docId, bytes]) => [
+                    docId,
+                    new Uint8Array(bytes),
+                ])
+            ) as Record<string, Uint8Array>;
+            return { snapshots, userId: parsed.userId };
+        } catch (error) {
+            console.warn('[CollabPlugin] Could not read saved MLS state; starting fresh:', error);
+            return { snapshots: {} };
+        }
+    }
+
+    /** Persist the MLS groups this session established, encrypted at rest. */
+    private async saveMlsState(blobs: Record<string, Uint8Array>, userId: string): Promise<void> {
+        // Plain number arrays rather than base64: a snapshot is a few KB, so
+        // the ~3x on disk buys not needing an encoder at all. `JSON.stringify`
+        // of a Uint8Array yields an object keyed by index, not an array, so the
+        // conversion is explicit in both directions.
+        const snapshots = Object.fromEntries(
+            Object.entries(blobs).map(([docId, blob]) => [docId, [...blob]])
+        ) as Record<string, number[]>;
+        const body = JSON.stringify({ snapshots, userId }, null, 2);
+        await this.app.vault.adapter.writeBinary(
+            this.mlsStatePath(),
+            new TextEncoder().encode(body).buffer as ArrayBuffer
+        );
+    }
+
     stopSession(): void {
         // Unregister editor change handler
         if (this.editorChangeHandler) {
@@ -346,6 +480,33 @@ export default class CollabPlugin extends Plugin {
         // reconnecting client resumes it instead of building a fresh epoch-0
         // group. Ending the session is what releases the wasm handles.
         if (this.collabClient) {
+            // Snapshot BEFORE destroy(), which frees the wasm handles: taken
+            // afterwards this returns nothing, and the next startSession would
+            // build a fresh epoch-0 group whose TOFU registration the relay
+            // refuses against the already-anchored document (#93 path 3).
+            //
+            // ponytail: fire-and-forget, because stopSession is sync and
+            // saveData is not — onunload may exit before the write lands. Await
+            // it if surviving a hard quit matters.
+            // The key is resolved at session START and cached, so the snapshot
+            // itself is synchronous and destroy() is not deferred behind a
+            // promise. Only the WRITE is async.
+            // The snapshot is best-effort; freeing the client is not. A throw
+            // here used to skip destroy() below, leaving the wasm handles alive
+            // and `collabClient` non-null, so startSession's "already active"
+            // guard then refused every restart — and onDisconnect calls
+            // stopSession, so it did not need the user to touch the stop command.
+            // Ending a session must be total.
+            if (this.snapshotKey) {
+                try {
+                    const blobs = this.collabClient.snapshot(this.snapshotKey);
+                    void this.saveMlsState(blobs, this.sessionUserId).catch((error) =>
+                        console.error('[CollabPlugin] Could not save MLS state:', error)
+                    );
+                } catch (error) {
+                    console.error('[CollabPlugin] Could not snapshot MLS state:', error);
+                }
+            }
             this.collabClient.destroy();
             this.collabClient = null;
         }

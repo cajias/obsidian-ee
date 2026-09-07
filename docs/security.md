@@ -237,26 +237,59 @@ group for the document, so the ordinary flows work with the default on:
 joiner sessions including the same-instance `disconnect()` → `connect()`
 reconnect cycle, which re-presents the capability at the current epoch.
 
-**Three paths still subscribe capability-less**, and they share one root cause —
-**no client persists MLS group state**, so any code path that does not already
-hold a live group in memory has nothing to mint from:
+Three paths once subscribed capability-less, sharing one root cause — **no
+client persisted MLS group state**, so any path that did not already hold a live
+group in memory had nothing to mint from. Issue #93 persists it, encrypted at
+rest, and closes two of the three:
 
-- **`collab-cli connect`** (the read-only listener) subscribes handshake-only and
-  receives no `YrsUpdate`. It holds no group, and `keygen` persists none — see the
-  comment at `crates/collab-cli/src/commands.rs` in `run_ws_session`.
+- **`collab-cli connect`** (the read-only listener) — **closed for the owner.**
+  `init --state` snapshots the group it creates; `connect --state` restores it
+  and mints on every subscribe, reconnects included. A **joiner** is still
+  content-blind: resuming one needs `keygen`'s `PendingMember` state persisted,
+  a different type with no snapshot surface. Its state file records an empty
+  snapshot, which reads as "no group" and falls back to handshake-only.
+- **The plugin's user-facing restart** (`stopSession()` then `startSession()`) —
+  **closed.** `stopSession` snapshots every established group before `destroy()`
+  frees the wasm handles, and the next `CollabClient` restores them in its
+  constructor. It therefore resumes the existing group rather than building a
+  fresh epoch-0 one whose TOFU `RegisterDocKey` the relay refuses against an
+  already-anchored document, and it deliberately does NOT re-register: the relay
+  accepts a rotation only at a strictly higher epoch.
 - **The plugin's manifest-discovered paths** (`handleManifestUpdate` in
-  `plugins/obsidian-ee/src/collab-client.ts`) subscribe with `capability: None`: a
-  path that has only just been announced has no group on this client yet.
-- **The plugin's user-facing restart** (`stopSession()` then `startSession()`)
-  constructs a *new* `CollabClient`, which builds a fresh epoch-0 group. Its
-  `RegisterDocKey` is refused by TOFU against a document that is already anchored,
-  so it never becomes content-authorized. Only the same-instance
-  `disconnect()`/`connect()` cycle resumes correctly.
+  `plugins/obsidian-ee/src/collab-client.ts`) — **still open, and persistence
+  does not close it.** A path that has only just been announced has no group on
+  this client to snapshot, before a restart or after. Closing it needs
+  `handleManifestUpdate` to bootstrap a group per path — owner: `create` +
+  `registerAnchor`; joiner: `generate_key_package` + handshake — which in turn
+  needs `GroupSlot` generalized from the two hardcoded slots to N keyed by path,
+  plus per-path handshake routing. Tracked separately.
 
 Each is a loss of *content delivery on that path*, never a loss of
 confidentiality: a capability-less subscriber sees handshake metadata and no
-plaintext. Persisting MLS group state closes all three at once and is tracked as
-#72 follow-up work.
+plaintext.
+
+**Residual: an anchor lost in flight is no longer self-healing.** A
+`register_doc_key` frame that `ws.send`/`write` accepts but that never reaches
+the relay leaves a group whose anchor the relay does not hold. Before group
+state was persisted, ending and restarting a session rebuilt the group and
+re-ran the TOFU registration, which repaired it. A restored group skips
+bootstrapping by design, so it now keeps presenting capabilities against an
+anchor that was never stored, and the session stays content-blind until the
+document is abandoned. It fails closed — no plaintext and no integrity impact,
+only lost delivery — and the window is narrow. Closing it needs the client to
+re-register on the relay's `Unauthorized`, which `ServerMessage::Error` cannot
+drive today: it carries a code and a message but no `doc_id`, so a client with
+more than one slot cannot tell which document was refused. Adding that field is
+the prerequisite.
+
+**At-rest key provenance is the client's decision, and it is not equal on both.**
+The CLI writes `<state_file>.key` with mode `0600` set in the `open` call, and
+refuses an existing key file that is group- or world-accessible. The plugin
+writes its key through Obsidian's `DataAdapter`, which cannot set file modes, so
+the key inherits the vault's permissions — anything that can read the vault can
+read it. Neither ever stores the key beside the blobs it protects: the CLI keeps
+it out of the state file, the plugin out of `data.json`. `safeStorage` (the OS
+keychain) is the upgrade path for the plugin.
 
 **Migration.** Set `RELAY_SUBSCRIBE_AUTHZ=0` (or `false`/`no`/`off`) to restore
 the previous behavior. Off, every identified subscriber receives every
