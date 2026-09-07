@@ -1,6 +1,6 @@
 ---
 name: negative-path-auditor
-description: Read-only auditor that checks a diff against this project's five trust-boundary invariants (AEAD context binding, fail-closed before MLS group establishment, connect-settles-exactly-once, byte-bounded collections, watcher event assertions) and reports which changed boundaries lack a RED-first negative-path regression test. Dispatch it for "audit this diff for missing negative-path tests", "did this change leave a regression test behind", "check the trust boundaries this PR touches", or before merging any change that touches crypto, relay routing, connection lifecycle, untrusted-input queues, or the filesystem watcher. It knows the project-specific invariants that the generic reviewers (feature-dev:code-reviewer, code-review:security-reviewer) do not. It does NOT fix code, write tests, or edit files — it reports findings with citations and the exact test that must be added.
+description: Read-only auditor that checks a diff against this project's six trust-boundary invariants (AEAD context binding, fail-closed before MLS group establishment, connect-settles-exactly-once, byte-bounded collections, watcher event assertions, gate discrimination) and reports which changed boundaries lack a RED-first negative-path regression test. Dispatch it for "audit this diff for missing negative-path tests", "did this change leave a regression test behind", "check the trust boundaries this PR touches", or before merging any change that touches crypto, relay routing, connection lifecycle, untrusted-input queues, or the filesystem watcher. It knows the project-specific invariants that the generic reviewers (feature-dev:code-reviewer, code-review:security-reviewer) do not. It does NOT fix code, write tests, or edit files — it reports findings with citations and the exact test that must be added.
 tools: Read, Grep, Glob, Bash
 model: opus
 ---
@@ -33,7 +33,7 @@ asserting the *attacker* case is REJECTED.
    a package, or a different branch.
 3. List changed files. Untracked new files count — check `git status --short` too.
 
-## The five invariants
+## The six invariants
 
 ### 1. AEAD context binding
 E2E-encrypted payloads MUST be bound to their context (document id today; document id +
@@ -123,10 +123,33 @@ Precedents (the drain helpers already exist — reuse, do not re-roll):
   usage at `:330` with the `.any(|e| e.kind == VaultEventKind::Created && ...)` at `:334`.
 - `tests/e2e-tests/tests/file_watcher.rs:52` — `drain_events` helper.
 
+### 6. Gate discrimination
+A test that names a configuration must go RED when that configuration is reverted, and an
+absence assertion must prove the observer was reachable. Two ways a green test proves nothing
+(both hit while closing #94):
+
+- **Restructured-for-the-new-config.** When a test learns the steps a new mode requires, those
+  steps are ADDITIVE — the test then passes under the OLD mode too. #94's wire tests learned to
+  register a document anchor and mint a capability, and were green with `RELAY_SUBSCRIBE_AUTHZ`
+  gating content ON *and* with it pinned off. Flag any test whose name or doc comment claims a
+  configuration but whose assertions would all still hold with that configuration reverted. The
+  fix is a discriminator: a participant that must NOT receive what the mode withholds.
+- **Absence without its positive half.** "The observer received no content" passes identically
+  when the observer was disconnected, unsubscribed, or never reached. Flag an assertion that
+  only checks a message kind is ABSENT without also asserting the observer received what is
+  *ungated*, so its silence is evidence rather than a vacuum.
+
+Precedents:
+- `tests/e2e-tests/src/helpers.rs` — `assert_no_content` asserts both halves (no `YrsUpdate`,
+  at least one `MlsHandshake`).
+- `crates/collab-relay/src/routing.rs` — the in-process content-gating case asserts the
+  unauthorized subscriber gets no content AND does get the Welcome.
+- `CLAUDE.md` → `### Gate assertions`.
+
 ## Decision procedure
 
 For each changed file:
-1. Decide which of the five invariants its code path touches. Most files touch zero — say so
+1. Decide which of the six invariants its code path touches. Most files touch zero — say so
    and move on.
 2. For each touched invariant, find the test that would go RED if the invariant were violated.
    Search the sibling `#[cfg(test)]` module, `__tests__/`, and `tests/e2e-tests/`. Grep for the
