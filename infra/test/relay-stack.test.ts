@@ -175,6 +175,59 @@ for (const envName of ENV_NAMES) {
     }
   });
 
+  // The CreationPolicy above is only as good as the instance's ability to
+  // ANSWER it. `addSignalOnExitCommand` renders a `cfn-signal` call, which is
+  // the CloudFormation SignalResource API invoked with the instance role's
+  // credentials — so without the matching grant the call returns AccessDenied,
+  // the trailing `|| echo` swallows it, no signal ever arrives, and a perfectly
+  // healthy boot sits out the full PT15M and then rolls back.
+  //
+  // Asserting the three parts together is the point: the wait exists, the
+  // command that satisfies it is on the host, and the role may actually make
+  // that call. Any one alone passes while the stack is undeployable.
+  test(`Relay-${envName}: the instance can signal the CreationPolicy it waits on`, () => {
+    // 1. The wait: CloudFormation blocks on a resource signal.
+    const instances = template.findResources('AWS::EC2::Instance');
+    const [instanceDef] = Object.values(instances);
+    assert.deepEqual(
+      (instanceDef as { CreationPolicy?: unknown }).CreationPolicy,
+      { ResourceSignal: { Count: 1, Timeout: 'PT15M' } },
+      `Relay-${envName} must wait for a resource signal`,
+    );
+
+    // 2. The answer: user-data actually calls cfn-signal for THIS resource.
+    const [instanceLogicalId] = Object.keys(instances);
+    const userData = JSON.stringify(
+      (instanceDef as { Properties: { UserData: unknown } }).Properties.UserData,
+    );
+    assert.ok(
+      userData.includes('cfn-signal') && userData.includes(instanceLogicalId),
+      `Relay-${envName}'s user-data must signal ${instanceLogicalId}`,
+    );
+
+    // 3. The permission: cfn-signal IS cloudformation:SignalResource, made with
+    //    the instance role's credentials. Collected through
+    //    `effectivePolicyStatements` so a grant arriving by any attachment path
+    //    counts, and matched as an IAM glob so `cloudformation:*` counts too.
+    template.resourceCountIs('AWS::IAM::Role', 1);
+    const [roleLogicalId] = Object.keys(template.findResources('AWS::IAM::Role'));
+    const canSignal = effectivePolicyStatements(template, roleLogicalId).some((statement) => {
+      // An opaque managed-policy ARN could carry the grant, so an UNBOUNDED
+      // statement counts here: this asserts the permission is REACHABLE, and
+      // the exhaustive-bound test below is what keeps the surface honest.
+      if ('UNBOUNDED' in statement) return true;
+      if (statement.Effect !== 'Allow') return false;
+      return toArray(statement.Action).some((a) =>
+        iamMatches(String(a), 'cloudformation:SignalResource'),
+      );
+    });
+    assert.ok(
+      canSignal,
+      `Relay-${envName}'s instance role must allow cloudformation:SignalResource, or ` +
+        'cfn-signal returns AccessDenied and every deploy times out and rolls back',
+    );
+  });
+
   // EXHAUSTIVE BOUND — a golden literal, not a probe.
   //
   // Every previous version of the guard above enumerated action names
@@ -199,6 +252,18 @@ for (const envName of ENV_NAMES) {
     const [roleLogicalId] = Object.keys(template.findResources('AWS::IAM::Role'));
 
     assert.deepEqual(effectivePolicyStatements(template, roleLogicalId), [
+      // Answering the CreationPolicy's resource signal. `cfn-signal` in
+      // user-data IS this API call, so without it a healthy boot times out and
+      // rolls back. Scoped to this stack's own id, and neither action touches
+      // what the invariants below bound — SignalResource reports the instance's
+      // own status, DescribeStackResource reads that resource's metadata. Both
+      // are what CDK itself grants for the identical command. Action order is
+      // CDK's rendering (alphabetical), not the order they are declared in.
+      {
+        Action: ['cloudformation:DescribeStackResource', 'cloudformation:SignalResource'],
+        Effect: 'Allow',
+        Resource: [{ Ref: 'AWS::StackId' }],
+      },
       // SSM-agent baseline. These actions declare no resource types (or would
       // create a role -> instance -> role cycle), so "*" is the only
       // expressible resource; none of them is ssm:GetParameter*.

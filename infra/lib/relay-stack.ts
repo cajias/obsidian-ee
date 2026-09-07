@@ -193,6 +193,23 @@ export class RelayStack extends cdk.Stack {
     (instance.node.defaultChild as ec2.CfnInstance).cfnOptions.creationPolicy = {
       resourceSignal: { count: 1, timeout: 'PT15M' },
     };
+    // `addSignalOnExitCommand` renders a `cfn-signal` call, which IS the
+    // CloudFormation SignalResource API made with this instance's role. Without
+    // the grant the call returns AccessDenied, the rendered `|| echo` swallows
+    // it, and a healthy boot sits out the whole PT15M before rolling back —
+    // adding the wait above without this makes every deploy fail.
+    //
+    // CDK adds these two itself for `CloudFormationInit.attach()`, which uses
+    // the identical command; `addSignalOnExitCommand` on its own adds nothing,
+    // so the grant has to be explicit here. Scoped to this stack, matching what
+    // CDK's own attach() grants: `SignalResource` is the call, and
+    // `DescribeStackResource` is what cfn-signal reads first.
+    instanceRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['cloudformation:SignalResource', 'cloudformation:DescribeStackResource'],
+        resources: [cdk.Aws.STACK_ID],
+      }),
+    );
 
     const eip = new ec2.CfnEIP(this, 'RelayEip', { domain: 'vpc' });
     new ec2.CfnEIPAssociation(this, 'RelayEipAssociation', {

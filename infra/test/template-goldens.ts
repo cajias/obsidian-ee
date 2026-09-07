@@ -596,6 +596,16 @@ export const TEMPLATE_GOLDENS: Record<string, unknown> = {
                 "Action": "ssm:GetParameter",
                 "Effect": "Allow",
                 "Resource": "arn:aws:ssm:us-east-1:111111111111:parameter/relay/dev/auth-token"
+              },
+              {
+                "Action": [
+                  "cloudformation:DescribeStackResource",
+                  "cloudformation:SignalResource"
+                ],
+                "Effect": "Allow",
+                "Resource": {
+                  "Ref": "AWS::StackId"
+                }
               }
             ],
             "Version": "2012-10-17"
@@ -881,6 +891,16 @@ export const TEMPLATE_GOLDENS: Record<string, unknown> = {
                 "Action": "ssm:GetParameter",
                 "Effect": "Allow",
                 "Resource": "arn:aws:ssm:us-east-1:111111111111:parameter/relay/staging/auth-token"
+              },
+              {
+                "Action": [
+                  "cloudformation:DescribeStackResource",
+                  "cloudformation:SignalResource"
+                ],
+                "Effect": "Allow",
+                "Resource": {
+                  "Ref": "AWS::StackId"
+                }
               }
             ],
             "Version": "2012-10-17"
@@ -1166,6 +1186,16 @@ export const TEMPLATE_GOLDENS: Record<string, unknown> = {
                 "Action": "ssm:GetParameter",
                 "Effect": "Allow",
                 "Resource": "arn:aws:ssm:us-east-1:111111111111:parameter/relay/prod/auth-token"
+              },
+              {
+                "Action": [
+                  "cloudformation:DescribeStackResource",
+                  "cloudformation:SignalResource"
+                ],
+                "Effect": "Allow",
+                "Resource": {
+                  "Ref": "AWS::StackId"
+                }
               }
             ],
             "Version": "2012-10-17"
