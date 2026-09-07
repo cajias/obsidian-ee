@@ -628,8 +628,12 @@ describe('persisted group state (#93)', () => {
 
         expect(restoredDocs).toHaveLength(0);
         expect(createdDocs).toHaveLength(1);
-        const presented = subscribes(sockets[0], 'doc1').filter((f) => f.capability);
-        expect(presented[0].capability).toMatchObject({ minted_by: 'doc1' });
+        const presented = subscribes(sockets[0], 'doc1').find((f) => f.capability);
+        // Asserted rather than optional-chained: `presented?.capability` would be
+        // `undefined` if NO capability were presented at all, and
+        // `toMatchObject` on undefined must not be the thing that fails here.
+        expect(presented).toBeDefined();
+        expect(presented!.capability).toMatchObject({ minted_by: 'doc1' });
     });
 
     // NEGATIVE — a wrong-length (and so wrong) at-rest key fails the same way.
@@ -678,7 +682,9 @@ describe('persisted group state (#93)', () => {
         );
         await connectClient(client);
 
-        const manifestSubs = subscribes(sockets[0], '__vault_manifest__').filter((f) => f.capability);
+        const manifestSubs = subscribes(sockets[0], '__vault_manifest__').filter(
+            (f) => f.capability
+        );
         expect(manifestSubs).toHaveLength(1);
         expect(manifestSubs[0].capability).toMatchObject({ minted_by: '__vault_manifest__' });
     });

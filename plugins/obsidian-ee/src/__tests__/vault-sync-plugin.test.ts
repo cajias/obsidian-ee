@@ -72,21 +72,21 @@ function createMockPlugin(): { plugin: CollabPlugin; vaultHandlers: VaultHandler
     const mockApp = {
         vault: {
             adapter: (() => {
-                    // #93 persists the encrypted MLS state through this adapter
-                    // at session start and stop; an in-memory one keeps these
-                    // tests on the real path rather than the degraded fallback.
-                    const files = new Map<string, ArrayBuffer>();
-                    return {
-                        exists: jest.fn((path: string) => Promise.resolve(files.has(path))),
-                        readBinary: jest.fn((path: string) =>
-                            Promise.resolve(files.get(path) ?? new ArrayBuffer(8))
-                        ),
-                        writeBinary: jest.fn((path: string, data: ArrayBuffer) => {
-                            files.set(path, data);
-                            return Promise.resolve();
-                        }),
-                    };
-                })(),
+                // #93 persists the encrypted MLS state through this adapter
+                // at session start and stop; an in-memory one keeps these
+                // tests on the real path rather than the degraded fallback.
+                const files = new Map<string, ArrayBuffer>();
+                return {
+                    exists: jest.fn((path: string) => Promise.resolve(files.has(path))),
+                    readBinary: jest.fn((path: string) =>
+                        Promise.resolve(files.get(path) ?? new ArrayBuffer(8))
+                    ),
+                    writeBinary: jest.fn((path: string, data: ArrayBuffer) => {
+                        files.set(path, data);
+                        return Promise.resolve();
+                    }),
+                };
+            })(),
             on: jest.fn((event: string, cb: (...args: any[]) => void) => {
                 vaultHandlers[event] = cb;
                 return { event };

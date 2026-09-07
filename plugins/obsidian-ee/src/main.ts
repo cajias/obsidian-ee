@@ -402,7 +402,10 @@ export default class CollabPlugin extends Plugin {
      * Returns empty on ANY failure — a missing, corrupt, or unreadable state
      * file must degrade to a fresh bootstrap, never block a session.
      */
-    private async loadMlsState(): Promise<{ snapshots: Record<string, Uint8Array>; userId?: string }> {
+    private async loadMlsState(): Promise<{
+        snapshots: Record<string, Uint8Array>;
+        userId?: string;
+    }> {
         try {
             const adapter = this.app.vault.adapter;
             if (!(await adapter.exists(this.mlsStatePath()))) {
@@ -413,10 +416,16 @@ export default class CollabPlugin extends Plugin {
                 snapshots?: Record<string, number[]>;
                 userId?: string;
             };
-            const snapshots: Record<string, Uint8Array> = {};
-            for (const [docId, bytes] of Object.entries(parsed.snapshots ?? {})) {
-                snapshots[docId] = new Uint8Array(bytes);
-            }
+            // `Object.fromEntries`, not a computed assignment in a loop: the keys
+            // come from a JSON file, so `"__proto__"` would set the prototype
+            // rather than add an entry. `fromEntries` defines an own property
+            // for every key, including that one.
+            const snapshots = Object.fromEntries(
+                Object.entries(parsed.snapshots ?? {}).map(([docId, bytes]) => [
+                    docId,
+                    new Uint8Array(bytes),
+                ])
+            ) as Record<string, Uint8Array>;
             return { snapshots, userId: parsed.userId };
         } catch (error) {
             console.warn('[CollabPlugin] Could not read saved MLS state; starting fresh:', error);
@@ -425,18 +434,14 @@ export default class CollabPlugin extends Plugin {
     }
 
     /** Persist the MLS groups this session established, encrypted at rest. */
-    private async saveMlsState(
-        blobs: Record<string, Uint8Array>,
-        userId: string
-    ): Promise<void> {
+    private async saveMlsState(blobs: Record<string, Uint8Array>, userId: string): Promise<void> {
         // Plain number arrays rather than base64: a snapshot is a few KB, so
         // the ~3x on disk buys not needing an encoder at all. `JSON.stringify`
         // of a Uint8Array yields an object keyed by index, not an array, so the
         // conversion is explicit in both directions.
-        const snapshots: Record<string, number[]> = {};
-        for (const [docId, blob] of Object.entries(blobs)) {
-            snapshots[docId] = Array.from(blob);
-        }
+        const snapshots = Object.fromEntries(
+            Object.entries(blobs).map(([docId, blob]) => [docId, [...blob]])
+        ) as Record<string, number[]>;
         const body = JSON.stringify({ snapshots, userId }, null, 2);
         await this.app.vault.adapter.writeBinary(
             this.mlsStatePath(),

@@ -528,7 +528,7 @@ describe('persisted MLS state across stopSession/startSession (#93)', () => {
         expect(rawLeak).toBe(false);
 
         const compact = JSON.stringify(JSON.parse(new TextDecoder().decode(state)));
-        expect(compact).not.toContain(Array.from(key).join(','));
+        expect(compact).not.toContain([...key].join(','));
     });
 
     // A first-ever session has nothing saved and must bootstrap fresh rather
