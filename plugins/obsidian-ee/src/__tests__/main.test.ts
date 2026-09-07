@@ -33,15 +33,33 @@ const { Notice } = await import('obsidian');
 const { default: CollabPlugin } = await import('../main');
 type CollabPlugin = InstanceType<typeof CollabPlugin>;
 
+/**
+ * An in-memory DataAdapter. #93 stores the encrypted MLS snapshots and their
+ * at-rest key through this, so tests can assert what actually reached disk —
+ * above all that the key never lands in the same file as the blobs.
+ */
+function makeAdapter() {
+    const files = new Map<string, ArrayBuffer>();
+    return {
+        files,
+        exists: jest.fn((path: string) => Promise.resolve(files.has(path))),
+        // Unknown paths fall back to a stub buffer: this same adapter serves
+        // the wasm binary that `init` loads, which no test writes.
+        readBinary: jest.fn((path: string) =>
+            Promise.resolve(files.get(path) ?? new ArrayBuffer(8))
+        ),
+        writeBinary: jest.fn((path: string, data: ArrayBuffer) => {
+            files.set(path, data);
+            return Promise.resolve();
+        }),
+    };
+}
+
 // Helper to create a properly mocked plugin instance
 function createMockPlugin(): CollabPlugin {
     const mockApp = {
         vault: {
-            adapter: {
-                readBinary: jest
-                    .fn<() => Promise<ArrayBuffer>>()
-                    .mockResolvedValue(new ArrayBuffer(8)),
-            },
+            adapter: makeAdapter(),
             // Vault sync (#32) registers create/delete/rename handlers and
             // materializes remote paths.
             on: jest.fn().mockReturnValue({}),
@@ -403,5 +421,157 @@ describe('CollabPlugin', () => {
             expect(stopSessionSpy).toHaveBeenCalled();
             expect(Notice).toHaveBeenCalledWith('Collaboration disconnected: max_retries_exceeded');
         });
+    });
+});
+
+describe('persisted MLS state across stopSession/startSession (#93)', () => {
+    // The CollabClient mock is module-scoped, so its call log accumulates
+    // across every test in this file. Clearing here is what makes `calls[0]`
+    // and `calls[1]` mean THIS test's two sessions.
+    beforeEach(() => {
+        jest.clearAllMocks();
+        mockCompile.mockResolvedValue(mockWasmModule as WebAssembly.Module);
+        mockWasmInit.mockResolvedValue(undefined);
+    });
+
+    /** The shared CollabClient constructor mock and the instance it returns. */
+    async function clientMock() {
+        const { CollabClient } = await import('../collab-client');
+        const ctor = CollabClient as unknown as jest.Mock;
+        return {
+            ctor,
+            instance: ctor.mock.results[0]?.value as ReturnType<typeof createMockClientInstance>,
+        };
+    }
+
+    function adapterFiles(plugin: CollabPlugin): Map<string, ArrayBuffer> {
+        return (plugin.app.vault.adapter as unknown as { files: Map<string, ArrayBuffer> }).files;
+    }
+
+    /**
+     * `stopSession` is synchronous but its at-rest write is not, so the write
+     * has to be allowed to land before the next session reads it. A macrotask
+     * turn drains the whole promise chain, which chained microtasks do not.
+     */
+    async function settle(): Promise<void> {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    // THE path-3 test. GIVEN a session started and stopped on a file, WHEN a
+    // second session starts, THEN the new CollabClient is constructed with the
+    // snapshot the first one handed back — so it resumes that group instead of
+    // building a fresh epoch-0 one whose TOFU registration the relay refuses.
+    it('hands the saved snapshot to the next session', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+
+        await plugin.startSession('owner');
+        plugin.stopSession();
+        await settle();
+        await plugin.startSession('owner');
+
+        const { ctor, instance } = await clientMock();
+        expect(ctor.mock.calls.length).toBeGreaterThanOrEqual(2);
+        const secondConfig = ctor.mock.calls[1][0] as { snapshots?: Record<string, Uint8Array> };
+        expect(secondConfig.snapshots).toEqual(instance.snapshot.mock.results[0]?.value);
+        expect(Object.keys(secondConfig.snapshots ?? {})).not.toHaveLength(0);
+    });
+
+    // The snapshot must be taken BEFORE destroy() frees the wasm handles;
+    // afterwards it returns nothing and the persistence is silently useless.
+    it('snapshots before destroying the client', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+
+        await plugin.startSession('owner');
+        plugin.stopSession();
+
+        const { instance } = await clientMock();
+        expect(instance.snapshot).toHaveBeenCalled();
+        expect(instance.snapshot.mock.invocationCallOrder[0]).toBeLessThan(
+            instance.destroy.mock.invocationCallOrder[0]
+        );
+    });
+
+    // NEGATIVE, and the one that matters most: this data sits in the vault,
+    // often inside a synced folder. The at-rest key must never land in the same
+    // file as the blobs it protects.
+    it('never writes the at-rest key into the snapshot file', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+
+        await plugin.startSession('owner');
+        plugin.stopSession();
+        await settle();
+
+        const files = adapterFiles(plugin);
+        const keyBuf = files.get('/test/plugin/dir/mls-key.bin');
+        const stateBuf = files.get('/test/plugin/dir/mls-state.json');
+        expect(keyBuf).toBeDefined();
+        expect(stateBuf).toBeDefined();
+
+        const key = new Uint8Array(keyBuf!);
+        expect(key).toHaveLength(32);
+        const stateText = new TextDecoder().decode(new Uint8Array(stateBuf!));
+        expect(stateText).not.toContain(Array.from(key).join(','));
+    });
+
+    // A first-ever session has nothing saved and must bootstrap fresh rather
+    // than fail: a missing state file is the normal case, not an error.
+    it('starts fresh when no snapshot has been saved', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+
+        await plugin.startSession('owner');
+
+        const { ctor } = await clientMock();
+        const config = ctor.mock.calls[0][0] as { snapshots?: Record<string, Uint8Array> };
+        expect(config.snapshots).toEqual({});
+    });
+
+    // NEGATIVE — persistence failing must cost content resumption, never the
+    // session. An unreadable key file used to throw straight out of
+    // startSession, so a corrupt at-rest file meant no collaboration at all.
+    it('still starts a session when the at-rest state cannot be read', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+        const adapter = plugin.app.vault.adapter as unknown as {
+            exists: jest.Mock;
+        };
+        adapter.exists.mockImplementation(() => Promise.reject(new Error('disk on fire')));
+
+        await plugin.startSession('owner');
+
+        const { ctor } = await clientMock();
+        expect(ctor).toHaveBeenCalled();
+        const config = ctor.mock.calls[0][0] as {
+            snapshots?: Record<string, Uint8Array>;
+            snapshotKey?: Uint8Array;
+        };
+        expect(config.snapshots).toEqual({});
+        expect(config.snapshotKey).toBeUndefined();
+    });
+
+    // The persisted user id is reused, so a restored group's MLS leaf identity
+    // and the wire identity agree instead of drifting apart on every restart.
+    it('reuses the persisted user id on the next session', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+
+        await plugin.startSession('owner');
+        plugin.stopSession();
+        await settle();
+        await plugin.startSession('owner');
+
+        const { ctor } = await clientMock();
+        const first = ctor.mock.calls[0][0] as { userId: string };
+        const second = ctor.mock.calls[1][0] as { userId: string };
+        expect(second.userId).toBe(first.userId);
     });
 });
