@@ -613,6 +613,23 @@ async fn test_two_users_collaborate() {
     assert_no_content(&mut mallory, std::time::Duration::from_secs(2)).await.unwrap();
 }
 
+/// Receive the next message and, if it is a `YrsUpdate`, decrypt and apply it.
+/// Non-update control messages (e.g. `Subscribed`) are ignored. Panics on a
+/// receive timeout.
+async fn apply_next_update(
+    client: &mut TestClient,
+    doc: &mut EncryptedDocument,
+    idle: std::time::Duration,
+) {
+    let Some(msg) = client.try_recv(idle).await.unwrap() else {
+        panic!("Timed out waiting to catch up");
+    };
+    if let ServerMessage::YrsUpdate { encrypted, epoch, .. } = msg {
+        let op = EncryptedOp { ciphertext: encrypted, epoch };
+        doc.apply_encrypted_update(&op).unwrap();
+    }
+}
+
 /// Test that offline messages are delivered when a user reconnects, with the
 /// relay's per-document subscribe authorization ON (issues #72, #94).
 ///
@@ -635,23 +652,6 @@ async fn test_two_users_collaborate() {
 /// reads the live channel; the queued half is covered in-process by
 /// `routing.rs`'s `offline-joiner` case.)
 ///
-/// Receive the next message and, if it is a `YrsUpdate`, decrypt and apply it.
-/// Non-update control messages (e.g. `Subscribed`) are ignored. Panics on a
-/// receive timeout.
-async fn apply_next_update(
-    client: &mut TestClient,
-    doc: &mut EncryptedDocument,
-    idle: std::time::Duration,
-) {
-    let Some(msg) = client.try_recv(idle).await.unwrap() else {
-        panic!("Timed out waiting to catch up");
-    };
-    if let ServerMessage::YrsUpdate { encrypted, epoch, .. } = msg {
-        let op = EncryptedOp { ciphertext: encrypted, epoch };
-        doc.apply_encrypted_update(&op).unwrap();
-    }
-}
-
 /// The relay retains a disconnected subscriber's subscription — and its content
 /// authorization — and queues updates for them, draining the queue when they
 /// re-identify on reconnect.
