@@ -266,11 +266,17 @@ it, and a removed member keeps receiving content after a rekey. On, content
 reaches only subscribers authorized at the document's current anchor epoch, a
 rekey revokes stale authorizations for free, and the three paths above go quiet.
 
-`docker/docker-compose.yml` sets `RELAY_SUBSCRIBE_AUTHZ=0` explicitly. It is a
-test fixture: the Docker-gated wire tests subscribe capability-less, and
-`fail_closed.rs` specifically needs the relay to fan out to an unauthorized
-subscriber so it can prove MLS fail-closed independently of this gate. That file
-is not a deployment template.
+`docker/docker-compose.yml` leaves `RELAY_SUBSCRIBE_AUTHZ` **unset** (issue
+#94), so the Docker wire tier runs against the on-by-default binary and actually
+exercises the behaviour #72 changed. Its tests register a document anchor and
+mint a capability, as `collab-cli` and the plugin do, and each carries a
+handshake-only observer that must receive no `YrsUpdate` — so re-pinning the
+variable off turns them red rather than silently deleting the coverage.
+
+The one test that needs the gate off is `fail_closed.rs`: Eve must *receive* the
+ciphertext to prove MLS fails closed independently of this gate. It hosts its
+own relay with `.with_subscribe_authz(false)` stated explicitly, so a single
+compose relay no longer has to serve both gate states.
 
 ### Content gating: subscribe is open, content is not (issue #72)
 

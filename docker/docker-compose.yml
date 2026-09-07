@@ -19,20 +19,24 @@ services:
       # To require client authentication, set a token here or in a .env file:
       # - RELAY_AUTH_TOKEN=change-me
       #
-      # Subscribe authorization is ON by default in the binary since #72. This
-      # test fixture turns it OFF **explicitly** because the three Docker-gated
-      # wire tests subscribe capability-less and need `YrsUpdate` fan-out:
-      #   tests/e2e-tests/tests/fail_closed.rs
-      #     test_wrong_key_client_observes_nothing_over_relay
+      # RELAY_SUBSCRIBE_AUTHZ is deliberately UNSET (#94): the docker wire tier
+      # runs against the binary's own ON-by-default (#72), which is the point of
+      # the tier. Pinning it — to either value — is what made the gate stop
+      # covering the behaviour #72 changed.
+      #
+      # The wire tests here therefore register a document anchor and mint a
+      # SubscribeCapability, exactly as collab-cli and the plugin do:
       #   tests/e2e-tests/tests/full_flow.rs
       #     test_two_users_collaborate, test_offline_message_delivery
-      # fail_closed in particular CANNOT be upgraded to mint a capability: its
-      # whole point is that Eve *receives* the ciphertext off the wire and still
-      # fails to decrypt it, proving MLS fail-closed independently of the relay
-      # gate. Deleting this line makes those three tests fail, not pass harder.
-      # This is a local dev/test fixture, NOT a deployment template — a real
-      # relay should leave the variable unset and run with authz on.
-      - RELAY_SUBSCRIBE_AUTHZ=0
+      # Each also carries a handshake-only observer that must receive NO
+      # YrsUpdate, so re-pinning the variable off turns those tests RED rather
+      # than silently deleting the coverage again.
+      #
+      # The one test that needs the gate OFF — fail_closed.rs, where Eve must
+      # RECEIVE the ciphertext off the wire and still fail to decrypt, proving
+      # MLS fails closed independently of the relay gate — no longer runs here.
+      # It self-hosts its own relay with `.with_subscribe_authz(false)` stated
+      # explicitly, so one compose relay no longer has to serve both gate states.
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "8080"]

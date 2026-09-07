@@ -10,11 +10,24 @@
 //! network: "Every trust boundary ... MUST have a NEGATIVE-path test asserting
 //! the attacker case is REJECTED — not only a positive round-trip."
 //!
-//! Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
+//! ## Why this test hosts its own relay (issue #94)
+//!
+//! Eve must RECEIVE the ciphertext off the wire for the assertion to mean
+//! anything: the property under test is that MLS fails closed *by itself*,
+//! independently of whether the relay also refuses to route to her. That needs
+//! subscribe authorization OFF, while the Docker wire tier now runs it ON so
+//! that it actually exercises the relay's default. One compose relay cannot be
+//! both, so this file starts its own with the gate stated explicitly.
+//!
+//! Nothing is lost by leaving the Docker tier: the property is a property of
+//! the encryption, not of the container, and `TestServer` is the same relay
+//! code over a real WebSocket (`subscribe_authz.rs` is the precedent). It now
+//! runs on every `cargo test`, not only when Docker is up.
 
 use collab_core::{EncryptedDocument, EncryptedOp, Invite, MlsDocumentGroup};
 use collab_proto::{ClientMessage, DocumentId, MlsMessageType, ServerMessage};
-use e2e_tests::helpers::TestClient;
+use collab_relay::RelayServer;
+use e2e_tests::helpers::{TestClient, TestServer};
 
 /// A wrong-key client, subscribed to the same doc through the relay, receives
 /// Alice's encrypted update off the wire but cannot decrypt it — proving
@@ -29,12 +42,17 @@ use e2e_tests::helpers::TestClient;
 /// decrypt is REJECTED, Eve's document stays empty, and the ciphertext Eve
 /// received leaks no plaintext.
 ///
-/// Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
+/// Runs against its own relay, so no Docker is required.
 #[tokio::test]
-#[ignore = "Requires Docker: docker compose -f docker/docker-compose.yml up -d"]
 #[allow(clippy::too_many_lines)]
 async fn test_wrong_key_client_observes_nothing_over_relay() {
-    let relay_url = "ws://localhost:8080/ws";
+    // Subscribe authorization OFF, stated explicitly rather than relied upon:
+    // `RelayServer::new()` defaults it off while the relay BINARY defaults it
+    // on, and trusting a default to mean what you assume is precisely how this
+    // gate broke before. Off is load-bearing here — Eve must receive the
+    // ciphertext for the negative path to be reachable at all.
+    let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(false)).await;
+    let relay_url = server.url();
     let doc_id: DocumentId = "test-doc-fail-closed".to_string();
     let secret = "TOP SECRET: Launch codes are 12345";
 
