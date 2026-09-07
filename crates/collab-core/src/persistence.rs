@@ -21,13 +21,23 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 /// Snapshot format version. Bump on any layout change so an old snapshot is
 /// rejected (`Err`) rather than mis-parsed.
 ///
-/// Deliberately NOT bumped for the issue-#76 doc-id AEAD binding: this byte sits
-/// at offset 0 of the SEALED plaintext, so it is only readable after a successful
-/// AEAD open, which a pre-#76 blob can no longer achieve. It cannot discriminate
-/// those blobs, so a bump would buy nothing. That is only harmless while nothing
-/// persists snapshots — a pre-#76 blob restored today fails with "AEAD open
-/// failed", not a graceful `Ok(None)` re-join. Whoever wires the plugin / CLI
-/// data-dir storage owns that migration decision.
+/// v1 is the FIRST format that ships. It was deliberately not bumped for the
+/// issue-#76 doc-id AEAD binding, and issue #93 — the CLI and plugin data-dir
+/// wiring that persistence was waiting on — confirmed why that stays correct:
+/// nothing had ever written a snapshot, so no earlier format exists in the wild
+/// and there is no migration to make graceful. Every blob that will ever exist
+/// is post-#76.
+///
+/// Bump on any future layout change; there will be v1 blobs on disk to reject by
+/// then. One caveat for whoever does: this byte sits at offset 0 of the SEALED
+/// plaintext, readable only AFTER a successful AEAD open. That is sufficient to
+/// discriminate two plaintext LAYOUTS, but not two AEAD COMPOSITIONS — a change
+/// to the key, nonce, or associated data fails the open before the version is
+/// ever read. For that kind of change, first relocate the version into a
+/// cleartext `magic || version` prefix bound as associated data, so it is
+/// readable before the open and still tamper-evident. A bare version prefix will
+/// not do: an existing blob's first byte is a random nonce byte, so it collides
+/// with a real version 1-in-256 — the magic is what makes the prefix decidable.
 pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// AES-GCM nonce length in bytes.

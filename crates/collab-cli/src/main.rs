@@ -71,6 +71,12 @@ enum Commands {
         /// Document identifier.
         #[arg(short, long)]
         doc: String,
+        /// State file written by `init`. Restoring its MLS group is what lets
+        /// this session present a subscribe capability and receive content
+        /// against a relay with subscribe authorization on; without it the
+        /// session subscribes handshake-only.
+        #[arg(short, long)]
+        state: Option<PathBuf>,
     },
     /// Run a demo showing the full E2E encryption flow.
     Demo {
@@ -97,6 +103,20 @@ enum Commands {
     },
 }
 
+/// Restore the MLS group `--state` points at, if it was given.
+///
+/// `doc_id` comes from argv and is the document identity for both the relay and
+/// the AEAD context the snapshot must authenticate under; the id recorded
+/// *inside* the state file is never trusted for this.
+fn restore_group(
+    doc_id: &str,
+    state: Option<&std::path::Path>,
+) -> anyhow::Result<Option<collab_core::EncryptedDocument>> {
+    let Some(path) = state else { return Ok(None) };
+    let key = collab_cli::commands::at_rest_key(path)?;
+    collab_cli::commands::load_state(doc_id, path, &key)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
@@ -105,7 +125,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init { doc_id, user, state } => {
-            let result = collab_cli::commands::init(&doc_id, &user, state.as_deref())?;
+            // No state file means nothing is persisted, so no key is needed.
+            // A throwaway key keeps `init` working for the stateless case
+            // without generating a key file nobody will read.
+            let key = match state.as_deref() {
+                Some(path) => collab_cli::commands::at_rest_key(path)?,
+                None => [0xAA; 32],
+            };
+            let result = collab_cli::commands::init(&doc_id, &user, state.as_deref(), &key)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::Keygen { user, output } => {
@@ -120,8 +147,9 @@ async fn main() -> anyhow::Result<()> {
             let result = collab_cli::commands::join(&invite, &user, state.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        Commands::Connect { relay_url, user, doc } => {
-            collab_cli::commands::connect(&relay_url, &user, &doc).await?;
+        Commands::Connect { relay_url, user, doc, state } => {
+            let restored = restore_group(&doc, state.as_deref())?;
+            collab_cli::commands::connect(&relay_url, &user, &doc, restored.as_ref()).await?;
         }
         Commands::Demo { doc_id } => {
             let result = collab_cli::commands::demo(&doc_id)?;

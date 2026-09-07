@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use collab_core::{
     ConnectionAction, ConnectionConfig, ConnectionStateMachine, EncryptedDocument, EncryptedOp,
@@ -21,15 +21,26 @@ use tokio_tungstenite::tungstenite::Message;
 /// # Errors
 ///
 /// Returns an error if document creation fails.
-pub fn init(doc_id: &str, user_id: &str, state_file: Option<&Path>) -> anyhow::Result<InitResult> {
-    let _doc = EncryptedDocument::create(doc_id, user_id)?;
+pub fn init(
+    doc_id: &str,
+    user_id: &str,
+    state_file: Option<&Path>,
+    key: &[u8; 32],
+) -> anyhow::Result<InitResult> {
+    let doc = EncryptedDocument::create(doc_id, user_id)?;
 
-    // Save state if requested
+    // Save state if requested. The group is snapshotted encrypted-at-rest so a
+    // later `connect` can restore it and mint a subscribe capability; without
+    // this the owner reconnects with no group and stays content-blind (#93).
     if let Some(path) = state_file {
         let state = DocumentState {
             doc_id: doc_id.to_string(),
             user_id: user_id.to_string(),
             role: "owner".to_string(),
+            // `snapshot_encrypted` binds `doc_id` as AEAD associated data using
+            // the document's OWN id, so the blob only ever opens under the id it
+            // was created for (#76).
+            snapshot: base64_encode(&doc.snapshot_encrypted(key)?),
         };
         fs::write(path, serde_json::to_string_pretty(&state)?)?;
     }
@@ -61,6 +72,12 @@ pub struct DocumentState {
     pub user_id: String,
     /// User's role (e.g. "owner", "collaborator").
     pub role: String,
+    /// The MLS group, snapshotted and encrypted at rest (base64), so a later
+    /// session can resume it rather than build a fresh epoch-0 group (#93).
+    ///
+    /// The at-rest key lives in a SEPARATE file — writing it here would void
+    /// the encryption, since the key would sit beside the blob it protects.
+    pub snapshot: String,
 }
 
 /// Generate a key package for joining a group.
@@ -205,6 +222,13 @@ pub fn join(
             doc_id: invite.doc_id.clone(),
             user_id: user_id.to_string(),
             role: "collaborator".to_string(),
+            // Empty: a joiner has no group to snapshot. Reaching here at all
+            // requires `pending.join` above to have succeeded, which it cannot
+            // until `keygen`'s `PendingMember` state is persisted across
+            // processes — a different type with no snapshot surface (#93
+            // follow-up). `load_state` reads empty as "no group" and the
+            // session falls back to handshake-only, exactly as today.
+            snapshot: String::new(),
         };
         fs::write(path, serde_json::to_string_pretty(&state)?)?;
     }
@@ -657,19 +681,14 @@ async fn run_ws_session(
     >,
     user_id: &str,
     doc_id: &str,
+    doc: Option<&EncryptedDocument>,
 ) -> anyhow::Result<()> {
     let (mut write, mut read) = ws.split();
 
     let identify = ClientMessage::Identify { user_id: user_id.to_string(), token: None };
     write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 
-    // capability: None — this listener holds no MLS group (the CLI persists no
-    // MLS state, see `keygen`), so it has nothing to mint from and can only
-    // subscribe handshake-only. Against a relay with subscribe authorization on
-    // it therefore receives no YrsUpdate — including after a reconnect, since a
-    // bare Subscribe re-states the authorization as handshake-only. Presenting a
-    // capability here needs persisted group state first (issue #72 follow-up).
-    let subscribe = ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability: None };
+    let subscribe = subscribe_frame(user_id, doc_id, doc)?;
     write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
 
     println!("Connected as {user_id}, subscribed to {doc_id}");
@@ -712,7 +731,12 @@ async fn run_ws_session(
 ///
 /// Returns an error if the connection permanently fails after exhausting
 /// all retry attempts.
-pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Result<()> {
+pub async fn connect(
+    relay_url: &str,
+    user_id: &str,
+    doc_id: &str,
+    doc: Option<&EncryptedDocument>,
+) -> anyhow::Result<()> {
     let config = ConnectionConfig::new(relay_url, user_id, doc_id);
     let mut sm = ConnectionStateMachine::new(config);
 
@@ -722,7 +746,7 @@ pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Re
         let flow = match sm.next_action() {
             ConnectionAction::Connect { relay_url: url } => {
                 println!("Connecting to {url}...");
-                handle_connect_action(&mut sm, &url).await?
+                handle_connect_action(&mut sm, &url, doc).await?
             }
             ConnectionAction::WaitAndRetry { delay, attempt } => {
                 println!("Retry attempt {attempt} in {delay:?}...");
@@ -758,6 +782,7 @@ pub async fn connect(relay_url: &str, user_id: &str, doc_id: &str) -> anyhow::Re
 async fn handle_connect_action(
     sm: &mut ConnectionStateMachine,
     url: &str,
+    doc: Option<&EncryptedDocument>,
 ) -> anyhow::Result<ControlFlow<()>> {
     let (ws, _) = match connect_async(url).await {
         Ok(pair) => pair,
@@ -782,7 +807,7 @@ async fn handle_connect_action(
     // accept-then-drop must NOT reset the budget, or the retry loop never
     // escalates toward GiveUp.
     let started = tokio::time::Instant::now();
-    let result = run_ws_session(ws, &uid, &did).await;
+    let result = run_ws_session(ws, &uid, &did, doc).await;
     if started.elapsed() >= MIN_STABLE_CONNECTION {
         sm.on_stable_connection();
     }
@@ -798,6 +823,168 @@ async fn handle_connect_action(
             Ok(ControlFlow::Continue(()))
         }
     }
+}
+
+/// Build this session's `Subscribe` frame, minting a capability from `doc` when
+/// a group was restored (#93).
+///
+/// Extracted so the frame that actually goes on the wire is directly
+/// assertable: the difference between content-authorized and content-blind is
+/// one `Option` field, and it is invisible from the session's console output.
+///
+/// Called on EVERY session, reconnects included, because `handle_connect_action`
+/// re-enters `run_ws_session` per attempt — and it must be: a bare `Subscribe`
+/// from an already authorized member DOWNGRADES it back to handshake-only, so a
+/// reconnect that forgets the capability goes quietly content-blind.
+///
+/// `None` stays the honest fallback for a session with no persisted group (no
+/// `--state`, or the joiner path): it subscribes handshake-only, which is the
+/// correct MLS bootstrap and receives no `YrsUpdate` under authz.
+///
+/// The capability is bound to the LOCALLY-trusted `user_id` and `doc_id` the
+/// session was started with, never to a value read back off the wire.
+///
+/// # Errors
+///
+/// Returns an error if minting from the restored group fails.
+///
+/// `pub` rather than private: `tests/e2e-tests/tests/cli_subscribe_authz.rs`
+/// puts this exact frame on the wire against a real authz relay, which is the
+/// only way to prove the relay ACCEPTS what the CLI mints.
+pub fn subscribe_frame(
+    user_id: &str,
+    doc_id: &str,
+    doc: Option<&EncryptedDocument>,
+) -> anyhow::Result<ClientMessage> {
+    let capability = doc
+        .map(|d| d.mint_subscribe_capability(user_id, doc_id, now_unix(), CAPABILITY_TTL_SECS))
+        .transpose()?;
+    Ok(ClientMessage::Subscribe { doc_id: doc_id.to_string(), capability })
+}
+
+/// Restore the MLS group a prior `init` persisted in `state_file`.
+///
+/// Returns `Ok(None)` when the file records no snapshot (the joiner path, which
+/// has no group to save) or when the snapshot predates a known rotation — both
+/// mean "no group", and the session then subscribes handshake-only exactly as it
+/// did before #93.
+///
+/// `doc_id` is the CALLER's document id, from argv. It is passed to
+/// `restore_encrypted` as the AEAD associated data, and the `doc_id` field
+/// stored *inside* the file is deliberately never read: the state file is
+/// untrusted input, so a blob sealed for another document must fail
+/// authentication here rather than be adopted on the file's own say-so.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or parsed, or if the snapshot
+/// fails AEAD authentication (wrong at-rest key, wrong document, or tampering).
+pub fn load_state(
+    doc_id: &str,
+    state_file: &Path,
+    key: &[u8; 32],
+) -> anyhow::Result<Option<EncryptedDocument>> {
+    let state: DocumentState = serde_json::from_str(&fs::read_to_string(state_file)?)?;
+    if state.snapshot.is_empty() {
+        return Ok(None);
+    }
+    let blob = base64_decode(&state.snapshot)?;
+    // `doc_id` here is the caller's, never `state.doc_id`.
+    EncryptedDocument::restore_encrypted(doc_id, &blob, key, 0)
+        .map_err(|e| anyhow::anyhow!("cannot restore the persisted group: {e}"))
+}
+
+/// Load (or on first use, generate) the 32-byte key that encrypts the MLS
+/// snapshot in `state_file`, from `<state_file>.key`.
+///
+/// The key lives in its OWN file, never in the state file: the two sit in the
+/// same directory, so writing the key beside the blob it protects would void
+/// the encryption. The file is created `0600` — owner read/write only — and an
+/// existing one with looser permissions is refused rather than silently used.
+///
+/// ponytail: a 0600 key file is the lazy source. The upgrade path is the OS
+/// keychain (macOS Keychain / libsecret), which would protect the key against a
+/// file-level read by another process running as the same user; this does not.
+/// Swap the body of this function and nothing else changes.
+///
+/// # Errors
+///
+/// Returns an error if the key file cannot be read or created, if OS randomness
+/// is unavailable, if an existing key file is not exactly 32 bytes, or if it is
+/// group- or world-accessible.
+pub fn at_rest_key(state_file: &Path) -> anyhow::Result<[u8; 32]> {
+    let key_path = key_path_for(state_file);
+
+    if key_path.exists() {
+        let bytes = fs::read(&key_path)?;
+        let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "{} is {} bytes, expected 32 — refusing to guess at a corrupt key file",
+                key_path.display(),
+                bytes.len()
+            )
+        })?;
+        reject_loose_permissions(&key_path)?;
+        return Ok(key);
+    }
+
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key)
+        .map_err(|e| anyhow::anyhow!("OS randomness unavailable for the at-rest key: {e:?}"))?;
+    write_owner_only(&key_path, &key)?;
+    Ok(key)
+}
+
+/// The key file that pairs with `state_file`.
+fn key_path_for(state_file: &Path) -> PathBuf {
+    let mut name = state_file.file_name().unwrap_or_default().to_os_string();
+    name.push(".key");
+    state_file.with_file_name(name)
+}
+
+/// Write `bytes` to `path` with mode 0600 from the moment it exists.
+///
+/// The mode is set in the `open` call rather than by a later `set_permissions`,
+/// so there is no window in which the key is readable by anyone else.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot create key file {}: {e}", path.display()))?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    // ponytail: no mode bits off unix. Windows ACL hardening if it ever ships there.
+    fs::write(path, bytes)
+        .map_err(|e| anyhow::anyhow!("cannot create key file {}: {e}", path.display()))
+}
+
+/// Refuse a key file any other user can read.
+#[cfg(unix)]
+fn reject_loose_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = fs::metadata(path)?.permissions().mode() & 0o077;
+    if mode != 0 {
+        anyhow::bail!(
+            "{} is group/world accessible (mode {:o}); run `chmod 600` on it",
+            path.display(),
+            mode
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_loose_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 // Base64 encoding/decoding backed by the `base64` crate (standard alphabet).
@@ -823,6 +1010,301 @@ fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed key for the persistence tests. The REAL key's provenance is
+    /// `at_rest_key`; these tests are about the snapshot plumbing, not the
+    /// source, so they inject one and stay independent of that decision.
+    const TEST_KEY: [u8; 32] = [7u8; 32];
+
+    /// Scenario 1: `init` persists the owner's MLS group, encrypted at rest.
+    ///
+    /// GIVEN `init` is asked to create "docA" for alice with a state file,
+    /// WHEN the state file is read back and restored under the same doc id and
+    /// key, THEN a group comes back at the epoch `create` left it on.
+    ///
+    /// RED before the fix: `DocumentState` has no `snapshot` field, and `init`
+    /// drops the group it creates on the floor (`let _doc = ...`).
+    #[test]
+    fn init_persists_the_owner_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        let state: DocumentState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let blob = base64_decode(&state.snapshot).unwrap();
+        let Ok(Some(restored)) = EncryptedDocument::restore_encrypted("docA", &blob, &TEST_KEY, 0)
+        else {
+            panic!("a snapshot init just wrote must restore, and is not stale")
+        };
+        assert_eq!(restored.epoch(), 0, "a freshly created owner group is at epoch 0");
+    }
+
+    /// Scenario 2: NEGATIVE — the seal binds the doc id `init` was GIVEN.
+    ///
+    /// GIVEN `init` created "docB", WHEN the snapshot is restored under "docA",
+    /// THEN it fails AEAD authentication. Without this, `init` could seal under
+    /// a hardcoded literal and scenario 1 would still pass.
+    #[test]
+    fn init_snapshot_is_bound_to_the_document_it_was_created_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docB", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        let state: DocumentState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let blob = base64_decode(&state.snapshot).unwrap();
+        let Err(err) = EncryptedDocument::restore_encrypted("docA", &blob, &TEST_KEY, 0) else {
+            panic!("a snapshot sealed for docB must not open under docA");
+        };
+        assert!(
+            err.to_string().contains("AEAD open failed"),
+            "the doc id must be bound as associated data, got: {err}"
+        );
+    }
+
+    /// Scenario 3: NEGATIVE — a different at-rest key cannot open the snapshot.
+    #[test]
+    fn init_snapshot_rejects_a_wrong_at_rest_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        let state: DocumentState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let blob = base64_decode(&state.snapshot).unwrap();
+        assert!(
+            EncryptedDocument::restore_encrypted("docA", &blob, &[9u8; 32], 0).is_err(),
+            "a wrong at-rest key must fail AEAD authentication"
+        );
+    }
+
+    /// Scenario 4: NEGATIVE — the at-rest key never lands in the state file.
+    ///
+    /// The key sits beside the blob on disk; writing it into the same file
+    /// would void the encryption entirely.
+    #[test]
+    fn init_state_file_does_not_contain_the_at_rest_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            !bytes.windows(TEST_KEY.len()).any(|w| w == TEST_KEY),
+            "the at-rest key must never be written next to the blob it protects"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(&base64_encode(&TEST_KEY)),
+            "the at-rest key must not appear base64-encoded either"
+        );
+    }
+
+    /// Scenario 5: `load_state` restores the group a prior `init` persisted.
+    ///
+    /// GIVEN `init` wrote a state file for "docA", WHEN `load_state` reads it
+    /// back with the same doc id and key, THEN a usable group comes back.
+    #[test]
+    fn load_state_restores_a_persisted_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        let restored = load_state("docA", &path, &TEST_KEY).unwrap();
+        assert!(restored.is_some(), "load_state must return the group init persisted");
+    }
+
+    /// Scenario 6: NEGATIVE — the CALLER's doc id wins over the file's own.
+    ///
+    /// GIVEN a state file whose `doc_id` FIELD claims "docA" while its blob was
+    /// sealed for "docA", WHEN `load_state` is called for "docB", THEN it fails
+    /// AEAD authentication rather than trusting the field.
+    ///
+    /// This is the trust boundary: the state file is untrusted input, so the
+    /// document identity must come from argv. Without this test, `load_state`
+    /// could read `state.doc_id` and every positive test would still pass.
+    #[test]
+    fn load_state_binds_the_callers_doc_id_not_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        let Err(err) = load_state("docB", &path, &TEST_KEY) else {
+            panic!("a snapshot sealed for docA must not open as docB")
+        };
+        assert!(
+            err.to_string().contains("AEAD open failed"),
+            "the caller's doc id must be the AEAD context, got: {err}"
+        );
+    }
+
+    /// Scenario 7: NEGATIVE — a wrong at-rest key does not yield a group.
+    #[test]
+    fn load_state_rejects_a_wrong_at_rest_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+
+        assert!(
+            load_state("docA", &path, &[9u8; 32]).is_err(),
+            "a wrong at-rest key must fail rather than return a group"
+        );
+    }
+
+    /// Scenario 8: a state file with no snapshot (the joiner path) reads as
+    /// "no group" — the session falls back to handshake-only, as today.
+    #[test]
+    fn load_state_reads_an_empty_snapshot_as_no_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = DocumentState {
+            doc_id: "docA".to_string(),
+            user_id: "alice".to_string(),
+            role: "collaborator".to_string(),
+            snapshot: String::new(),
+        };
+        fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+        assert!(
+            load_state("docA", &path, &TEST_KEY).unwrap().is_none(),
+            "an empty snapshot must read as absent, not as a corrupt blob"
+        );
+    }
+
+    /// Scenario 9: NEGATIVE — the at-rest key file is created owner-only, and a
+    /// group/world-accessible one is refused rather than silently used.
+    #[cfg(unix)]
+    #[test]
+    fn at_rest_key_is_owner_only_and_refuses_a_loose_key_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let key = at_rest_key(&path).unwrap();
+        let key_file = dir.path().join("state.json.key");
+        let mode = fs::metadata(&key_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the key file must be created owner-read/write only");
+
+        // A second call returns the SAME key — the group must stay restorable
+        // across processes, which a regenerated key would silently prevent.
+        assert_eq!(at_rest_key(&path).unwrap(), key, "the key must be stable across calls");
+
+        fs::set_permissions(&key_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = at_rest_key(&path).expect_err("a world-readable key file must be refused");
+        assert!(err.to_string().contains("chmod 600"), "the error must say how to fix it: {err}");
+    }
+
+    /// Scenario 10: THE #93 assertion for the CLI listener — a restored group
+    /// makes the session's `Subscribe` carry a capability.
+    ///
+    /// GIVEN a group restored from what `init` persisted, WHEN the listener
+    /// builds its subscribe frame, THEN the frame carries a capability that
+    /// VERIFIES against the anchor that same group registers.
+    ///
+    /// Verifying rather than merely asserting `is_some()` is the point: a
+    /// capability the relay would reject is indistinguishable from none.
+    ///
+    /// RED before the fix: the listener hardcoded `capability: None`.
+    #[test]
+    fn a_restored_group_makes_the_listener_subscribe_content_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+        let doc = load_state("docA", &path, &TEST_KEY).unwrap().expect("init persisted a group");
+
+        let ClientMessage::Subscribe { capability: Some(cap), doc_id } =
+            subscribe_frame("alice", "docA", Some(&doc)).unwrap()
+        else {
+            panic!("a restored group must produce a capability-carrying Subscribe")
+        };
+        assert_eq!(doc_id, "docA");
+
+        // The relay's own verifier is the judge, under the anchor this group
+        // would register and the identity the connection would be bound to.
+        collab_proto::verify_subscribe_capability(
+            &cap,
+            &doc.subscribe_verifying_key().unwrap(),
+            "alice",
+            "docA",
+            doc.epoch(),
+            now_unix(),
+        )
+        .expect("the minted capability must verify against this group's own anchor");
+    }
+
+    /// Scenario 11: NEGATIVE — the capability is bound to THIS user, so another
+    /// connection cannot present it.
+    ///
+    /// The relay checks a capability against the CONNECTION's identified user
+    /// id, so a capability minted for alice must fail for eve even though both
+    /// name the same document and epoch.
+    #[test]
+    fn the_listeners_capability_does_not_verify_for_another_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+        let doc = load_state("docA", &path, &TEST_KEY).unwrap().unwrap();
+
+        let ClientMessage::Subscribe { capability: Some(cap), .. } =
+            subscribe_frame("alice", "docA", Some(&doc)).unwrap()
+        else {
+            panic!("expected a capability")
+        };
+        assert!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &doc.subscribe_verifying_key().unwrap(),
+                "eve",
+                "docA",
+                doc.epoch(),
+                now_unix(),
+            )
+            .is_err(),
+            "a capability minted for alice must not verify for eve"
+        );
+    }
+
+    /// Scenario 12: NEGATIVE — the capability is bound to THIS document.
+    #[test]
+    fn the_listeners_capability_does_not_verify_for_another_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        init("docA", "alice", Some(&path), &TEST_KEY).unwrap();
+        let doc = load_state("docA", &path, &TEST_KEY).unwrap().unwrap();
+
+        let ClientMessage::Subscribe { capability: Some(cap), .. } =
+            subscribe_frame("alice", "docA", Some(&doc)).unwrap()
+        else {
+            panic!("expected a capability")
+        };
+        assert!(
+            collab_proto::verify_subscribe_capability(
+                &cap,
+                &doc.subscribe_verifying_key().unwrap(),
+                "alice",
+                "docB",
+                doc.epoch(),
+                now_unix(),
+            )
+            .is_err(),
+            "a capability minted for docA must not verify for docB"
+        );
+    }
+
+    /// Scenario 13: no persisted group keeps the handshake-only fallback.
+    ///
+    /// The bootstrap path must not regress: a session with no `--state` still
+    /// subscribes, it simply carries no content authorization.
+    #[test]
+    fn no_persisted_group_still_subscribes_handshake_only() {
+        let ClientMessage::Subscribe { capability, doc_id } =
+            subscribe_frame("alice", "docA", None).unwrap()
+        else {
+            panic!("expected a Subscribe")
+        };
+        assert!(capability.is_none(), "no group means no capability, not a forged one");
+        assert_eq!(doc_id, "docA");
+    }
 
     #[test]
     fn test_base64_roundtrip() {
@@ -851,7 +1333,7 @@ mod tests {
 
     #[test]
     fn test_init_creates_document() {
-        let result = init("test-doc", "alice", None).unwrap();
+        let result = init("test-doc", "alice", None, &TEST_KEY).unwrap();
         assert_eq!(result.doc_id, "test-doc");
         assert_eq!(result.user_id, "alice");
     }
@@ -886,7 +1368,7 @@ mod tests {
         tokio::spawn(serve_then_end(listener, true));
 
         let (ws, _) = connect_async(&url).await.unwrap();
-        let result = run_ws_session(ws, "user", "doc").await;
+        let result = run_ws_session(ws, "user", "doc", None).await;
         assert!(result.is_ok(), "clean close must return Ok, got {result:?}");
     }
 
@@ -899,7 +1381,7 @@ mod tests {
         tokio::spawn(serve_then_end(listener, false));
 
         let (ws, _) = connect_async(&url).await.unwrap();
-        let result = run_ws_session(ws, "user", "doc").await;
+        let result = run_ws_session(ws, "user", "doc", None).await;
         assert!(result.is_err(), "transport drop must return Err, got {result:?}");
     }
 

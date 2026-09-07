@@ -162,3 +162,80 @@ async fn a_capability_less_subscriber_still_receives_the_welcome() {
         "a capability-less subscriber must still receive the Welcome, or the join deadlocks"
     );
 }
+
+/// THE #93 assertion for `collab-cli connect`: a listener that restored its
+/// persisted group is content-authorized on a real subscribe-authz relay, and
+/// one without a group is not.
+///
+/// GIVEN a document whose anchor a previous session registered, AND a group
+/// restored from the state file `init` wrote,
+/// WHEN the listener presents the `Subscribe` frame `subscribe_frame` builds,
+/// THEN the relay accepts it and a peer's `YrsUpdate` reaches the listener —
+/// while a second listener with no persisted group receives none.
+///
+/// RED before #93: `run_ws_session` hardcoded `capability: None`, so the relay
+/// correctly withheld content and the listener never saw an update.
+#[tokio::test]
+async fn a_restored_cli_listener_receives_content_over_an_authz_relay() {
+    let server = authz_relay().await;
+    let doc_id: DocumentId = "cli-restored-listener".to_string();
+
+    // What a previous `collab-cli init --state` left on disk.
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    let key = collab_cli::commands::at_rest_key(&state_path).unwrap();
+    collab_cli::commands::init(&doc_id, "alice", Some(&state_path), &key).unwrap();
+    let restored = collab_cli::commands::load_state(&doc_id, &state_path, &key)
+        .unwrap()
+        .expect("init persisted a group");
+
+    // The anchor that session registered is still on the relay. A restored
+    // client deliberately does NOT re-register: the relay accepts a rotation
+    // only at a strictly higher epoch, so a same-epoch re-registration would be
+    // refused as "stale or equal epoch".
+    let mut anchorer = TestClient::connect_as(server.url(), "alice-prior").await.unwrap();
+    register_anchor(&mut anchorer, &restored, &doc_id).await.unwrap();
+
+    // The listener presents exactly what the CLI would put on the wire.
+    let mut listener = TestClient::connect_as(server.url(), "alice").await.unwrap();
+    listener
+        .send(&collab_cli::commands::subscribe_frame("alice", &doc_id, Some(&restored)).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        matches!(listener.recv().await.unwrap(), ServerMessage::Subscribed { .. }),
+        "the relay must accept the capability the CLI minted from its restored group"
+    );
+
+    // A second listener with no persisted group: the honest fallback, and the
+    // control that proves the relay is gating rather than fanning out to all.
+    let mut blind = TestClient::connect_as(server.url(), "bob").await.unwrap();
+    blind
+        .send(&collab_cli::commands::subscribe_frame("bob", &doc_id, None).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(blind.recv().await.unwrap(), ServerMessage::Subscribed { .. }));
+
+    // A peer publishes content.
+    let mut peer = TestClient::connect_as(server.url(), "peer").await.unwrap();
+    peer.send(&ClientMessage::YrsUpdate {
+        doc_id: doc_id.clone(),
+        encrypted: b"opaque ciphertext".to_vec(),
+        epoch: restored.epoch(),
+    })
+    .await
+    .unwrap();
+
+    let ServerMessage::YrsUpdate { encrypted, .. } = listener.recv().await.unwrap() else {
+        panic!("the restored listener must receive the peer's update")
+    };
+    assert_eq!(encrypted, b"opaque ciphertext");
+
+    // The gate assertion: the group-less listener stayed content-blind. Checked
+    // after the authorized listener already received it, so silence here is the
+    // relay withholding, not the update never happening.
+    assert!(
+        blind.try_recv(Duration::from_millis(500)).await.unwrap().is_none(),
+        "a listener with no persisted group must receive NO content"
+    );
+}
