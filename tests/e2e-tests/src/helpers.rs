@@ -334,17 +334,33 @@ pub async fn subscribe_with_capability(
 /// kind is ABSENT, rather than expecting one specific frame: an observer still
 /// legitimately receives MLS handshake traffic, which is never gated.
 ///
+/// Absence alone would be a vacuous gate — a disconnected, unsubscribed or
+/// handshake-starved observer is silent for the same reason a gated one is. So
+/// this also asserts the POSITIVE half: at least one `MlsHandshake` reached the
+/// observer, proving it was live and subscribed for the exchange it stayed
+/// content-blind through.
+///
 /// # Errors
 ///
-/// Returns an error if a `YrsUpdate` arrives, or if the receive itself fails.
+/// Returns an error if a `YrsUpdate` arrives, if no `MlsHandshake` ever did, or
+/// if the receive itself fails.
 pub async fn assert_no_content(client: &mut TestClient, window: Duration) -> anyhow::Result<()> {
+    let mut saw_handshake = false;
     while let Some(msg) = client.try_recv(window).await? {
-        if let ServerMessage::YrsUpdate { doc_id, .. } = msg {
-            anyhow::bail!(
+        match msg {
+            ServerMessage::YrsUpdate { doc_id, .. } => anyhow::bail!(
                 "a handshake-only subscriber received YrsUpdate content for {doc_id}: the \
                  relay is NOT gating content fan-out on a subscribe capability"
-            );
+            ),
+            ServerMessage::MlsHandshake { .. } => saw_handshake = true,
+            _ => {}
         }
+    }
+    if !saw_handshake {
+        anyhow::bail!(
+            "the observer received no MlsHandshake, so its silence proves nothing about \
+             content gating — it was not live and subscribed for the exchange"
+        );
     }
     Ok(())
 }

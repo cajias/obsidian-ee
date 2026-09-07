@@ -630,8 +630,10 @@ async fn test_two_users_collaborate() {
 /// queued anything because he was content-authorized BEFORE going offline —
 /// gating happens in `MessageRouter::recipients`, ahead of the offline queue,
 /// so an unauthorized subscriber accumulates nothing to be handed over later.
-/// And Mallory, identified and subscribed but never a group member, must end
-/// with no content in either channel: live or queued.
+/// And Mallory, identified and subscribed but never a group member, receives
+/// the handshake and no content. (She stays connected throughout, so this arm
+/// reads the live channel; the queued half is covered in-process by
+/// `routing.rs`'s `offline-joiner` case.)
 ///
 /// Receive the next message and, if it is a `YrsUpdate`, decrypt and apply it.
 /// Non-update control messages (e.g. `Subscribed`) are ignored. Panics on a
@@ -844,7 +846,7 @@ async fn test_offline_message_delivery() {
     );
 
     // Mallory was subscribed for the whole exchange and never became a member.
-    // She must have received no content on either path — live fan-out or the
-    // offline queue, which `recipients` gates ahead of.
+    // `assert_no_content` checks both halves: she DID receive the handshake, so
+    // she was genuinely live, and she received no `YrsUpdate`.
     assert_no_content(&mut mallory, idle).await.unwrap();
 }
