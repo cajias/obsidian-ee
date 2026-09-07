@@ -381,7 +381,14 @@ export default class CollabPlugin extends Plugin {
             if (key.length === 32) {
                 return key;
             }
-            console.warn('[CollabPlugin] Discarding a malformed at-rest key; generating a new one');
+            // Refuse rather than regenerate. Overwriting would mint a key that
+            // opens none of the existing blobs, permanently orphaning every
+            // saved group — the CLI refuses for the same reason. startSession
+            // catches this and the session runs unpersisted.
+            throw new Error(
+                `${path} is ${key.length} bytes, expected 32 — refusing to replace a ` +
+                    'malformed at-rest key, which would orphan every saved group'
+            );
         }
         const key = new Uint8Array(32);
         crypto.getRandomValues(key);
@@ -479,11 +486,21 @@ export default class CollabPlugin extends Plugin {
             // The key is resolved at session START and cached, so the snapshot
             // itself is synchronous and destroy() is not deferred behind a
             // promise. Only the WRITE is async.
+            // The snapshot is best-effort; freeing the client is not. A throw
+            // here used to skip destroy() below, leaving the wasm handles alive
+            // and `collabClient` non-null, so startSession's "already active"
+            // guard then refused every restart — and onDisconnect calls
+            // stopSession, so it did not need the user to touch the stop command.
+            // Ending a session must be total.
             if (this.snapshotKey) {
-                const blobs = this.collabClient.snapshot(this.snapshotKey);
-                void this.saveMlsState(blobs, this.sessionUserId).catch((error) =>
-                    console.error('[CollabPlugin] Could not save MLS state:', error)
-                );
+                try {
+                    const blobs = this.collabClient.snapshot(this.snapshotKey);
+                    void this.saveMlsState(blobs, this.sessionUserId).catch((error) =>
+                        console.error('[CollabPlugin] Could not save MLS state:', error)
+                    );
+                } catch (error) {
+                    console.error('[CollabPlugin] Could not snapshot MLS state:', error);
+                }
             }
             this.collabClient.destroy();
             this.collabClient = null;

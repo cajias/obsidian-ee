@@ -515,8 +515,20 @@ describe('persisted MLS state across stopSession/startSession (#93)', () => {
 
         const key = new Uint8Array(keyBuf!);
         expect(key).toHaveLength(32);
-        const stateText = new TextDecoder().decode(new Uint8Array(stateBuf!));
-        expect(stateText).not.toContain(Array.from(key).join(','));
+
+        // Scan the state file's BYTES for the key, and its re-serialized JSON for
+        // the key as numbers. A substring search for `join(',')` alone is
+        // vacuous: the file is pretty-printed, so a leaked key renders one
+        // element per line and never contains the compact form — the assertion
+        // stayed green with the key deliberately written into the body.
+        const state = new Uint8Array(stateBuf!);
+        const rawLeak = Array.from({ length: Math.max(0, state.length - key.length + 1) }).some(
+            (_, i) => key.every((b, j) => state[i + j] === b)
+        );
+        expect(rawLeak).toBe(false);
+
+        const compact = JSON.stringify(JSON.parse(new TextDecoder().decode(state)));
+        expect(compact).not.toContain(Array.from(key).join(','));
     });
 
     // A first-ever session has nothing saved and must bootstrap fresh rather
@@ -531,6 +543,29 @@ describe('persisted MLS state across stopSession/startSession (#93)', () => {
         const { ctor } = await clientMock();
         const config = ctor.mock.calls[0][0] as { snapshots?: Record<string, Uint8Array> };
         expect(config.snapshots).toEqual({});
+    });
+
+    // NEGATIVE — ending a session must be TOTAL. A throwing snapshot used to
+    // skip destroy(), leaving the client non-null so startSession's
+    // "already active" guard refused every restart. onDisconnect calls
+    // stopSession, so this did not need the user to touch the stop command.
+    it('destroys the client and permits a restart when snapshot() throws', async () => {
+        const plugin = createMockPlugin();
+        plugin.app.workspace = mockWorkspaceWithView() as never;
+        await plugin.loadSettings();
+        await plugin.startSession('owner');
+
+        const { instance, ctor } = await clientMock();
+        instance.snapshot.mockImplementation(() => {
+            throw new Error('refusing all-zeros key');
+        });
+
+        expect(() => plugin.stopSession()).not.toThrow();
+        expect(instance.destroy).toHaveBeenCalled();
+
+        await settle();
+        await plugin.startSession('owner');
+        expect(ctor.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
     // NEGATIVE — persistence failing must cost content resumption, never the

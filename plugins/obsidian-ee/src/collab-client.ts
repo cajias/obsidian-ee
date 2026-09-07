@@ -320,7 +320,14 @@ export class CollabClient {
                 continue;
             }
             try {
-                slot.setDoc(WasmEncryptedDocument.restore_encrypted(slot.docId, blob, snapshotKey, 0n));
+                // ponytail: min_epoch 0 accepts a snapshot at any epoch. See the
+                // matching note in collab-cli's `load_state` — rejecting a stale
+                // one needs a current epoch learned out of band, and accepting
+                // one costs content delivery (the relay refuses a capability
+                // that does not match the current anchor), never confidentiality.
+                slot.setDoc(
+                    WasmEncryptedDocument.restore_encrypted(slot.docId, blob, snapshotKey, 0n)
+                );
             } catch (error) {
                 console.warn(
                     `[CollabClient] Ignoring the saved group for ${slot.docId}; bootstrapping fresh:`,
@@ -405,6 +412,24 @@ export class CollabClient {
             // registered — nothing a member mints verifies without it (#72).
             // Presenting the capability is establishGroup's job, deliberately
             // after this: see the comment there.
+            // ponytail: the boolean is deliberately not checked. `send` returns
+            // false only when it QUEUED the frame for the next flush, which is
+            // not a failure — tearing the group down there would strand a frame
+            // that is still going to be sent.
+            //
+            // The residual it cannot cover: `ws.send` returns, the frame is lost
+            // at TCP level, and the relay never stores the anchor. Before #93 a
+            // stopSession()/startSession() cycle self-healed that by rebuilding
+            // the group and re-running this TOFU registration. Now the
+            // un-anchored group is snapshotted and restored, so it is excluded
+            // from bootstrapping and keeps presenting capabilities against an
+            // anchor the relay never received — a permanently content-blind
+            // session that fails closed and resolves normally.
+            //
+            // Closing it needs a retry driven by the relay's Unauthorized, which
+            // is not expressible today: `ServerMessage::Error` carries a code and
+            // a message but NO doc_id, so a client with two slots cannot tell
+            // which document was refused. Adding that field is the prerequisite.
             this.registerAnchor(slot);
             return;
         }

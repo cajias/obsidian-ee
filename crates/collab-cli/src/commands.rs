@@ -890,6 +890,15 @@ pub fn load_state(
     }
     let blob = base64_decode(&state.snapshot)?;
     // `doc_id` here is the caller's, never `state.doc_id`.
+    //
+    // ponytail: `min_epoch = 0` accepts a snapshot at any epoch. Rejecting a
+    // stale one needs a current epoch learned OUT OF BAND — the state file
+    // cannot supply it, since a rollback would simply restore an older file with
+    // an older claim. The cost of accepting one is content delivery, not
+    // confidentiality: the relay compares a capability against the CURRENT
+    // anchor epoch, so a stale group's capability is refused and the session
+    // falls back to receiving nothing. Raise this once a client tracks the
+    // epoch somewhere an attacker cannot roll back.
     EncryptedDocument::restore_encrypted(doc_id, &blob, key, 0)
         .map_err(|e| anyhow::anyhow!("cannot restore the persisted group: {e}"))
 }

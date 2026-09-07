@@ -268,6 +268,20 @@ Each is a loss of *content delivery on that path*, never a loss of
 confidentiality: a capability-less subscriber sees handshake metadata and no
 plaintext.
 
+**Residual: an anchor lost in flight is no longer self-healing.** A
+`register_doc_key` frame that `ws.send`/`write` accepts but that never reaches
+the relay leaves a group whose anchor the relay does not hold. Before group
+state was persisted, ending and restarting a session rebuilt the group and
+re-ran the TOFU registration, which repaired it. A restored group skips
+bootstrapping by design, so it now keeps presenting capabilities against an
+anchor that was never stored, and the session stays content-blind until the
+document is abandoned. It fails closed — no plaintext and no integrity impact,
+only lost delivery — and the window is narrow. Closing it needs the client to
+re-register on the relay's `Unauthorized`, which `ServerMessage::Error` cannot
+drive today: it carries a code and a message but no `doc_id`, so a client with
+more than one slot cannot tell which document was refused. Adding that field is
+the prerequisite.
+
 **At-rest key provenance is the client's decision, and it is not equal on both.**
 The CLI writes `<state_file>.key` with mode `0600` set in the `open` call, and
 refuses an existing key file that is group- or world-accessible. The plugin

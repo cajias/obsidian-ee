@@ -616,6 +616,22 @@ describe('persisted group state (#93)', () => {
         expect(frames(sockets[0]).filter((f) => f.type === 'register_doc_key')).toHaveLength(1);
     });
 
+    // NEGATIVE — the map KEY is a lookup, never the AEAD context. A blob filed
+    // under a foreign document id must simply not be found: an implementation
+    // that iterated Object.keys(snapshots) and passed the key as the aad would
+    // restore it, and every other test here would still pass.
+    it('ignores a snapshot filed under a foreign document id', async () => {
+        client = new CollabClient(
+            makeConfig({ snapshots: { 'other-doc': blobFor('other-doc') }, snapshotKey: KEY })
+        );
+        await connectClient(client);
+
+        expect(restoredDocs).toHaveLength(0);
+        expect(createdDocs).toHaveLength(1);
+        const presented = subscribes(sockets[0], 'doc1').filter((f) => f.capability);
+        expect(presented[0].capability).toMatchObject({ minted_by: 'doc1' });
+    });
+
     // NEGATIVE — a wrong-length (and so wrong) at-rest key fails the same way.
     it('refuses a snapshot under a bad key and bootstraps fresh', async () => {
         client = new CollabClient(

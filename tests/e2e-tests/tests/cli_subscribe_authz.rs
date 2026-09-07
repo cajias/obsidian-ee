@@ -19,7 +19,8 @@ use collab_core::{EncryptedDocument, MlsDocumentGroup};
 use collab_proto::{ClientMessage, DocumentId, MlsMessageType, ServerMessage};
 use collab_relay::RelayServer;
 use e2e_tests::helpers::{
-    register_anchor, setup_two_user_group, subscribe_with_capability, TestClient, TestServer,
+    assert_no_content, register_anchor, setup_two_user_group, subscribe_with_capability,
+    TestClient, TestServer,
 };
 
 /// Start a relay with subscribe authorization ON — the configuration the CLI
@@ -231,11 +232,20 @@ async fn a_restored_cli_listener_receives_content_over_an_authz_relay() {
     };
     assert_eq!(encrypted, b"opaque ciphertext");
 
-    // The gate assertion: the group-less listener stayed content-blind. Checked
-    // after the authorized listener already received it, so silence here is the
-    // relay withholding, not the update never happening.
-    assert!(
-        blind.try_recv(Duration::from_millis(500)).await.unwrap().is_none(),
-        "a listener with no persisted group must receive NO content"
-    );
+    // The peer also sends ungated handshake traffic, so the group-less listener
+    // has something it MUST receive. Without it its silence would prove nothing:
+    // a disconnected or unsubscribed listener is quiet for the same reason a
+    // gated one is.
+    peer.send(&ClientMessage::MlsHandshake {
+        doc_id: doc_id.clone(),
+        payload: b"key package".to_vec(),
+        message_type: MlsMessageType::KeyPackage,
+    })
+    .await
+    .unwrap();
+
+    // The gate assertion: the group-less listener received the handshake and no
+    // content. Checked after the authorized listener already got the update, so
+    // the absence is the relay withholding, not the update never happening.
+    assert_no_content(&mut blind, Duration::from_millis(500)).await.unwrap();
 }
