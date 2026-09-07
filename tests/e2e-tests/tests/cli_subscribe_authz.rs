@@ -13,55 +13,19 @@
 //! NOT `#[ignore]`d, matching `subscribe_authz.rs`: every test here self-hosts
 //! its relay via `TestServer`, so none needs Docker.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use collab_core::{EncryptedDocument, MlsDocumentGroup};
 use collab_proto::{ClientMessage, DocumentId, MlsMessageType, ServerMessage};
 use collab_relay::RelayServer;
-use e2e_tests::helpers::{setup_two_user_group, TestClient, TestServer};
-
-/// Capability lifetime for the test (matches the design's 300s default).
-const TTL_SECS: u64 = 300;
-
-/// Whole seconds since the Unix epoch (for capability minting).
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
+use e2e_tests::helpers::{
+    register_anchor, setup_two_user_group, subscribe_with_capability, TestClient, TestServer,
+};
 
 /// Start a relay with subscribe authorization ON — the configuration the CLI
 /// could not previously work against.
 async fn authz_relay() -> TestServer {
     TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await
-}
-
-/// Register `doc`'s current-epoch anchor over `client` (TOFU: no rotation proof).
-async fn register_anchor(client: &mut TestClient, doc: &EncryptedDocument, doc_id: &DocumentId) {
-    client
-        .send(&ClientMessage::RegisterDocKey {
-            doc_id: doc_id.clone(),
-            epoch: doc.epoch(),
-            public_key: doc.subscribe_verifying_key().unwrap().to_vec(),
-            proof: doc.sign_doc_key_proof(doc_id).unwrap(),
-            rotation_proof: Vec::new(),
-        })
-        .await
-        .unwrap();
-}
-
-/// Subscribe `client` with a capability `doc` mints for `user_id`, asserting
-/// the relay accepted it.
-async fn subscribe_with_capability(
-    client: &mut TestClient,
-    doc: &EncryptedDocument,
-    user_id: &str,
-    doc_id: &DocumentId,
-) {
-    let capability = doc.mint_subscribe_capability(user_id, doc_id, now_unix(), TTL_SECS).unwrap();
-    client
-        .send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: Some(capability) })
-        .await
-        .unwrap();
-    assert!(matches!(client.recv().await.unwrap(), ServerMessage::Subscribed { .. }));
 }
 
 /// THE test this change exists for: the CLI's own session flow must complete
@@ -100,8 +64,8 @@ async fn cli_cannot_hijack_an_already_anchored_document() {
     // An outsider's independent group anchors the doc first (TOFU wins).
     let squatter = EncryptedDocument::create(&doc_id, "squatter").unwrap();
     let mut eve = TestClient::connect_as(server.url(), "squatter").await.unwrap();
-    register_anchor(&mut eve, &squatter, &doc_id).await;
-    subscribe_with_capability(&mut eve, &squatter, "squatter", &doc_id).await;
+    register_anchor(&mut eve, &squatter, &doc_id).await.unwrap();
+    subscribe_with_capability(&mut eve, &squatter, "squatter", &doc_id).await.unwrap();
 
     let err = collab_cli::commands::session_check(Some(server.url()), &doc_id, "secret", "secret")
         .await
@@ -131,9 +95,9 @@ async fn a_bare_resubscribe_downgrades_an_authorized_member() {
     // The bootstrap itself is capability-less — that part is not gated.
     let (mut alice_doc, mut bob_doc) =
         setup_two_user_group(&mut alice, &mut bob, &doc_id).await.unwrap();
-    register_anchor(&mut alice, &alice_doc, &doc_id).await;
-    subscribe_with_capability(&mut alice, &alice_doc, "alice", &doc_id).await;
-    subscribe_with_capability(&mut bob, &bob_doc, "bob", &doc_id).await;
+    register_anchor(&mut alice, &alice_doc, &doc_id).await.unwrap();
+    subscribe_with_capability(&mut alice, &alice_doc, "alice", &doc_id).await.unwrap();
+    subscribe_with_capability(&mut bob, &bob_doc, "bob", &doc_id).await.unwrap();
 
     // Authorized: content reaches Bob.
     alice_doc.insert(0, "before the reconnect");
@@ -152,7 +116,7 @@ async fn a_bare_resubscribe_downgrades_an_authorized_member() {
     assert!(saw.is_none(), "a bare re-subscribe must downgrade to handshake-only; got {saw:?}");
 
     // Re-presenting the capability restores content — the CLI's fix.
-    subscribe_with_capability(&mut bob, &bob_doc, "bob", &doc_id).await;
+    subscribe_with_capability(&mut bob, &bob_doc, "bob", &doc_id).await.unwrap();
     alice_doc.insert(0, "after re-presenting");
     let update = alice_doc.get_encrypted_update().unwrap();
     alice.send_update(&doc_id, &update).await.unwrap();

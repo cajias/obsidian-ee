@@ -45,23 +45,17 @@
 //! runs untagged tests too. Tagging them would only hide them from a plain
 //! `cargo test --workspace` — coverage subtracted for nothing.
 //!
-//! The `#[ignore]`s in `full_flow.rs` and `fail_closed.rs` are the real thing:
-//! those hardcode `ws://localhost:8080/ws` and do need the Docker relay.
+//! The `#[ignore]`s in `full_flow.rs` are the real thing: those hardcode
+//! `ws://localhost:8080/ws` and do need the Docker relay. `fail_closed.rs`
+//! joined this file's pattern in #94 — it self-hosts a relay with the gate
+//! explicitly OFF, which one shared compose relay could no longer provide.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use collab_core::{AnchorRotation, EncryptedDocument, Invite, MlsDocumentGroup};
 use collab_proto::{ClientMessage, DocumentId, ErrorCode, MlsMessageType, ServerMessage};
 use collab_relay::RelayServer;
-use e2e_tests::helpers::{TestClient, TestServer};
-
-/// Capability lifetime for the test (matches the design's 300s default).
-const TTL_SECS: u64 = 300;
-
-/// Whole seconds since the Unix epoch (for capability minting).
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
+use e2e_tests::helpers::{now_unix, TestClient, TestServer, TTL_SECS};
 
 /// Two real members of one group, both settled at epoch 1 sharing the exporter
 /// secret — established in-process (see the module note on bootstrap).

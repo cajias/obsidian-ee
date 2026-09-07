@@ -23,7 +23,10 @@
 
 use collab_core::{EncryptedDocument, EncryptedOp, MlsDocumentGroup};
 use collab_proto::{ClientMessage, DocumentId, MlsMessageType, ServerMessage};
-use e2e_tests::helpers::TestClient;
+use e2e_tests::helpers::{
+    assert_no_content, now_unix, register_anchor, subscribe_with_capability, unique, TestClient,
+    TTL_SECS,
+};
 
 // =============================================================================
 // SECURITY TESTS
@@ -402,13 +405,29 @@ fn test_three_user_collaboration() {
 // These tests require Docker Compose with the relay server running:
 // docker compose -f docker/docker-compose.yml up -d
 
-/// Test that two users can collaborate on a document through the relay.
+/// Test that two users can collaborate on a document through the relay, with
+/// the relay's per-document subscribe authorization ON (issues #72, #94).
 ///
 /// This is a full **integration test** that verifies:
 /// 1. WebSocket connection to the relay server
 /// 2. MLS key exchange through the relay
 /// 3. Encrypted document updates flowing between clients
 /// 4. Both clients end up with identical document content
+/// 5. A handshake-only observer receives the handshake but NO content
+///
+/// GIVEN a relay with subscribe authorization on (docker/docker-compose.yml
+/// leaves `RELAY_SUBSCRIBE_AUTHZ` unset, so the binary's ON default applies),
+/// AND Alice and Bob complete a real MLS handshake over the wire, AND Mallory
+/// is identified and subscribed but never becomes a group member.
+/// WHEN Alice anchors the document, both members mint a capability at the
+/// anchor epoch and re-subscribe, and Alice sends an encrypted `YrsUpdate`.
+/// THEN Bob receives and decrypts it, AND Mallory receives no `YrsUpdate` at
+/// all.
+///
+/// The Mallory arm is what makes this test READ the gate. Steps 1-4 alone pass
+/// with authorization off as well, so on their own they would not notice the
+/// `RELAY_SUBSCRIBE_AUTHZ=0` pin coming back — which is exactly the coverage
+/// gap #94 exists to close.
 ///
 /// Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
 #[tokio::test]
@@ -416,26 +435,39 @@ fn test_three_user_collaboration() {
 #[allow(clippy::too_many_lines)]
 async fn test_two_users_collaborate() {
     let relay_url = "ws://localhost:8080/ws";
-    let doc_id: DocumentId = "test-doc-collab".to_string();
+    // Run-unique ids: the compose relay outlives a single `cargo test`, and a
+    // TOFU anchor can only be claimed once per doc_id (see `unique`).
+    let doc_id: DocumentId = unique("test-doc-collab");
+    let (alice_id, bob_id, mallory_id) = (unique("alice"), unique("bob"), unique("mallory"));
 
     // Alice connects and identifies
-    let mut alice = TestClient::connect_as(relay_url, "alice").await.unwrap();
+    let mut alice = TestClient::connect_as(relay_url, &alice_id).await.unwrap();
 
     // Bob connects and identifies
-    let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
+    let mut bob = TestClient::connect_as(relay_url, &bob_id).await.unwrap();
 
-    // Alice subscribes and drains her confirmation FIRST, so her subscription is
-    // registered on the relay before Bob publishes his KeyPackage. Otherwise the
-    // KeyPackage would fan out to an empty subscriber set and Alice would miss it.
+    // Mallory is a legitimately identified client who never joins the MLS group,
+    // so she can never mint a capability. Under authz she is the control that
+    // proves content is gated, not merely that it flows.
+    let mut mallory = TestClient::connect_as(relay_url, &mallory_id).await.unwrap();
+
+    // All three subscribe capability-less and drain their confirmations FIRST,
+    // so their subscriptions are registered before Bob publishes his KeyPackage.
+    // Otherwise the KeyPackage would fan out to an empty subscriber set. Under
+    // authz these subscriptions are HANDSHAKE-ONLY: they carry the MLS
+    // handshake, which is never gated, and no content. That is the required
+    // bootstrap — a joiner has no group to mint from until it has consumed its
+    // Welcome.
     alice.subscribe(&doc_id).await.unwrap();
     bob.subscribe(&doc_id).await.unwrap();
+    mallory.subscribe(&doc_id).await.unwrap();
 
     // Alice owns the group. `create` starts at epoch 0; `create_invite` below
     // merges her own add-commit and advances the group to epoch 1.
-    let mut alice_doc = EncryptedDocument::create(&doc_id, "alice").unwrap();
+    let mut alice_doc = EncryptedDocument::create(&doc_id, &alice_id).unwrap();
 
     // Bob generates his KeyPackage.
-    let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+    let bob_pending = MlsDocumentGroup::generate_key_package(&bob_id).unwrap();
 
     // === Step 1: Bob PUBLISHES his KeyPackage over the wire ===
     // This send is the load-bearing wire transit. If it is removed, Alice's
@@ -462,7 +494,18 @@ async fn test_two_users_collaborate() {
     };
     let invite = alice_doc.create_invite(&bob_key_package).unwrap();
 
-    // === Step 3: Welcome + Commit cross the wire ===
+    // === Step 3: Alice anchors the document at the epoch members will mint at ===
+    // AFTER `create_invite`, never before: the relay verifies a capability
+    // against the STORED anchor epoch, so an anchor left at epoch 0 would reject
+    // every capability Alice and Bob mint at 1. TOFU — nobody has anchored this
+    // document, so the empty rotation proof is accepted and success is silent.
+    register_anchor(&mut alice, &alice_doc, &doc_id).await.unwrap();
+
+    // Alice upgrades her own handshake-only subscription to a content-authorized
+    // one by re-presenting with a freshly minted capability.
+    subscribe_with_capability(&mut alice, &alice_doc, &alice_id, &doc_id).await.unwrap();
+
+    // === Step 4: Welcome + Commit cross the wire ===
     // Sending the commit too makes the full KeyPackage -> Welcome -> Commit
     // handshake transit the relay.
     alice
@@ -482,26 +525,7 @@ async fn test_two_users_collaborate() {
         .await
         .unwrap();
 
-    // === Step 4: Alice edits and sends the encrypted update ===
-    // The YrsUpdate frame carries Alice's real MLS epoch (a cleartext routing
-    // field) over the wire. Bob uses that wire epoch — never a literal — both to
-    // reconstruct the invite and to assert epoch convergence.
-    alice_doc.insert(0, "Hello from Alice!");
-    let alice_update = alice_doc.get_encrypted_update().unwrap();
-    assert_eq!(
-        alice_update.epoch, invite.epoch,
-        "sanity: the update epoch equals the invite epoch (same group epoch)"
-    );
-    alice
-        .send(&ClientMessage::YrsUpdate {
-            doc_id: doc_id.clone(),
-            encrypted: alice_update.ciphertext.clone(),
-            epoch: alice_update.epoch,
-        })
-        .await
-        .unwrap();
-
-    // === Step 5: Bob receives Welcome, Commit, and the wire epoch off the wire ===
+    // === Step 5: Bob receives Welcome and Commit off the wire and joins ===
     let ServerMessage::MlsHandshake {
         payload: welcome_payload,
         message_type: MlsMessageType::Welcome,
@@ -522,23 +546,49 @@ async fn test_two_users_collaborate() {
         !commit_payload.is_empty(),
         "the Commit that crossed the wire must be a real MLS commit, not a #46 vec![] fake"
     );
-    let ServerMessage::YrsUpdate { encrypted, epoch: wire_epoch, .. } = bob.recv().await.unwrap()
-    else {
-        panic!("Bob expected Alice's encrypted YrsUpdate")
-    };
 
-    // Bob reconstructs the invite from the REAL welcome/commit/epoch that crossed
-    // the wire — no hardcoded `vec![]` / `1`.
+    // Bob reconstructs the invite from the REAL welcome/commit that crossed the
+    // wire. The epoch comes from Alice's own `invite` rather than a wire frame:
+    // under authz Bob must be a member BEFORE any `YrsUpdate` can reach him, so
+    // the update's epoch field is no longer available this early. It is still a
+    // computed value, never a literal, and the wire epoch is cross-checked
+    // against it in the assertions below.
     let bob_invite = collab_core::Invite {
         doc_id: doc_id.clone(),
         welcome: welcome_payload,
         commit: commit_payload,
-        epoch: wire_epoch,
+        epoch: invite.epoch,
         rotation: None,
     };
     let mut bob_doc = EncryptedDocument::join(&bob_invite, bob_pending).unwrap();
 
-    // === Step 6: Bob decrypts and applies Alice's update ===
+    // === Step 6: Bob, now a member, mints his own capability and upgrades ===
+    // Until this returns, the relay withholds `YrsUpdate` from Bob. Its
+    // `Subscribed` acknowledgement is what makes the next step race-free: the
+    // authorization is committed before Alice sends anything.
+    subscribe_with_capability(&mut bob, &bob_doc, &bob_id, &doc_id).await.unwrap();
+
+    // === Step 7: Alice edits and sends the encrypted update ===
+    alice_doc.insert(0, "Hello from Alice!");
+    let alice_update = alice_doc.get_encrypted_update().unwrap();
+    assert_eq!(
+        alice_update.epoch, invite.epoch,
+        "sanity: the update epoch equals the invite epoch (same group epoch)"
+    );
+    alice
+        .send(&ClientMessage::YrsUpdate {
+            doc_id: doc_id.clone(),
+            encrypted: alice_update.ciphertext.clone(),
+            epoch: alice_update.epoch,
+        })
+        .await
+        .unwrap();
+
+    // === Step 8: Bob receives it because he presented a capability ===
+    let ServerMessage::YrsUpdate { encrypted, epoch: wire_epoch, .. } = bob.recv().await.unwrap()
+    else {
+        panic!("Bob expected Alice's encrypted YrsUpdate")
+    };
     let received_op = EncryptedOp { ciphertext: encrypted, epoch: wire_epoch };
     bob_doc.apply_encrypted_update(&received_op).unwrap();
 
@@ -554,18 +604,15 @@ async fn test_two_users_collaborate() {
     // The encrypted update decrypts to the expected plaintext on the peer.
     assert_eq!(bob_doc.get_content(), "Hello from Alice!");
     assert_eq!(alice_doc.get_content(), bob_doc.get_content());
+
+    // === The gate assertion: Mallory saw the handshake and no content ===
+    // Checked last, so Bob's successful receive above has already proven the
+    // update really was fanned out — Mallory's silence is the relay withholding
+    // it, not the update never happening. Without this arm the whole test passes
+    // with authorization OFF (issue #94).
+    assert_no_content(&mut mallory, std::time::Duration::from_secs(2)).await.unwrap();
 }
 
-/// Test that offline messages are delivered when a user reconnects.
-///
-/// This is a full **integration test** that verifies:
-/// 1. Messages sent while a user is offline are queued
-/// 2. Queued messages are delivered when the user reconnects
-/// 3. The reconnected user catches up to the current document state
-///
-/// This is critical for real-world usage where users may have intermittent
-/// connectivity or close their laptop while collaborating.
-///
 /// Receive the next message and, if it is a `YrsUpdate`, decrypt and apply it.
 /// Non-update control messages (e.g. `Subscribed`) are ignored. Panics on a
 /// receive timeout.
@@ -583,8 +630,31 @@ async fn apply_next_update(
     }
 }
 
-/// The relay retains a disconnected subscriber's subscription and queues
-/// updates for them, draining the queue when they re-identify on reconnect.
+/// Test that offline messages are delivered when a user reconnects, with the
+/// relay's per-document subscribe authorization ON (issues #72, #94).
+///
+/// This is a full **integration test** that verifies:
+/// 1. Messages sent while a user is offline are queued
+/// 2. Queued messages are delivered when the user reconnects
+/// 3. The reconnected user catches up to the current document state
+/// 4. Re-presenting the capability on reconnect restores content delivery
+/// 5. A handshake-only observer is never queued content at all
+///
+/// This is critical for real-world usage where users may have intermittent
+/// connectivity or close their laptop while collaborating.
+///
+/// Two things make this test read the gate rather than survive it. Bob is only
+/// queued anything because he was content-authorized BEFORE going offline —
+/// gating happens in `MessageRouter::recipients`, ahead of the offline queue,
+/// so an unauthorized subscriber accumulates nothing to be handed over later.
+/// And Mallory, identified and subscribed but never a group member, receives
+/// the handshake and no content. (She stays connected throughout, so this arm
+/// reads the live channel; the queued half is covered in-process by
+/// `routing.rs`'s `offline-joiner` case.)
+///
+/// The relay retains a disconnected subscriber's subscription — and its content
+/// authorization — and queues updates for them, draining the queue when they
+/// re-identify on reconnect.
 ///
 /// Requires Docker: `docker compose -f docker/docker-compose.yml up -d`
 #[tokio::test]
@@ -592,20 +662,28 @@ async fn apply_next_update(
 #[allow(clippy::too_many_lines)]
 async fn test_offline_message_delivery() {
     let relay_url = "ws://localhost:8080/ws";
-    let doc_id: DocumentId = "test-doc-offline".to_string();
+    // Run-unique ids — see `unique`; Bob reconnects under the SAME id, which is
+    // what makes the relay hand him his queued updates.
+    let doc_id: DocumentId = unique("test-doc-offline");
+    let (alice_id, bob_id, mallory_id) = (unique("alice"), unique("bob"), unique("mallory"));
 
     // Alice subscribes first so her subscription is registered before Bob
-    // publishes his KeyPackage.
-    let mut alice = TestClient::connect_as(relay_url, "alice").await.unwrap();
+    // publishes his KeyPackage. All three subscribes are capability-less and so
+    // handshake-only: the MLS bootstrap, which is never gated.
+    let mut alice = TestClient::connect_as(relay_url, &alice_id).await.unwrap();
     alice.subscribe(&doc_id).await.unwrap();
 
     // Bob connects and subscribes
-    let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
+    let mut bob = TestClient::connect_as(relay_url, &bob_id).await.unwrap();
     bob.subscribe(&doc_id).await.unwrap();
 
+    // Mallory never joins the group, so she can never mint a capability.
+    let mut mallory = TestClient::connect_as(relay_url, &mallory_id).await.unwrap();
+    mallory.subscribe(&doc_id).await.unwrap();
+
     // Alice owns the group (epoch 0 -> 1 after `create_invite`).
-    let mut alice_doc = EncryptedDocument::create(&doc_id, "alice").unwrap();
-    let bob_pending = MlsDocumentGroup::generate_key_package("bob").unwrap();
+    let mut alice_doc = EncryptedDocument::create(&doc_id, &alice_id).unwrap();
+    let bob_pending = MlsDocumentGroup::generate_key_package(&bob_id).unwrap();
 
     // Bob PUBLISHES his KeyPackage over the wire.
     bob.send(&ClientMessage::MlsHandshake {
@@ -628,6 +706,11 @@ async fn test_offline_message_delivery() {
     };
     let invite = alice_doc.create_invite(&bob_key_package).unwrap();
 
+    // Anchor the document at the epoch the members will mint at — after
+    // `create_invite`, so the stored anchor epoch matches their capabilities.
+    register_anchor(&mut alice, &alice_doc, &doc_id).await.unwrap();
+    subscribe_with_capability(&mut alice, &alice_doc, &alice_id, &doc_id).await.unwrap();
+
     // Welcome + Commit cross the wire.
     alice
         .send(&ClientMessage::MlsHandshake {
@@ -647,7 +730,7 @@ async fn test_offline_message_delivery() {
         .unwrap();
 
     // Bob receives Welcome + Commit off the wire and reconstructs the invite from
-    // the REAL welcome/commit/epoch that crossed the wire (no hardcoded vec![]/1).
+    // the REAL welcome/commit that crossed the wire (no hardcoded vec![]).
     let ServerMessage::MlsHandshake {
         payload: welcome_payload,
         message_type: MlsMessageType::Welcome,
@@ -681,7 +764,13 @@ async fn test_offline_message_delivery() {
     assert_eq!(alice_doc.epoch(), bob_doc.epoch(), "both clients must reach the same epoch");
     assert!(alice_doc.epoch() >= 1, "epoch must be non-trivial (real add-commit merged)");
 
-    // Bob goes offline (drop connection)
+    // Bob, now a member, presents a capability. This is what makes the offline
+    // queue reachable for him at all: `recipients` gates BEFORE the queue, so a
+    // handshake-only Bob would have nothing waiting on reconnect.
+    subscribe_with_capability(&mut bob, &bob_doc, &bob_id, &doc_id).await.unwrap();
+
+    // Bob goes offline (drop connection). The relay retains the subscription and
+    // the content authorization stored with it.
     drop(bob);
 
     // Alice makes some edits while Bob is offline
@@ -707,11 +796,21 @@ async fn test_offline_message_delivery() {
         .await
         .unwrap();
 
-    // Bob reconnects. The queued updates are drained on Identify, so they may
-    // arrive before or after the Subscribe confirmation; re-subscribing is
-    // idempotent. Drain messages until Bob's content matches Alice's.
-    let mut bob = TestClient::connect_as(relay_url, "bob").await.unwrap();
-    bob.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await.unwrap();
+    // Bob reconnects and RE-PRESENTS his capability. A bare `Subscribe` would
+    // downgrade the retained subscription back to handshake-only, silently
+    // ending content delivery from here on — the third edit below is what
+    // catches that. The frame is sent directly rather than via
+    // `subscribe_with_capability` because the queue is drained on Identify, so
+    // a queued `YrsUpdate` can arrive before the `Subscribed` acknowledgement.
+    let mut bob = TestClient::connect_as(relay_url, &bob_id).await.unwrap();
+    let bob_capability =
+        bob_doc.mint_subscribe_capability(&bob_id, &doc_id, now_unix(), TTL_SECS).unwrap();
+    bob.send(&ClientMessage::Subscribe {
+        doc_id: doc_id.clone(),
+        capability: Some(bob_capability),
+    })
+    .await
+    .unwrap();
 
     let expected = alice_doc.get_content();
     let idle = std::time::Duration::from_secs(2);
@@ -721,4 +820,33 @@ async fn test_offline_message_delivery() {
 
     // Verify Bob has caught up with Alice
     assert_eq!(bob_doc.get_content(), alice_doc.get_content());
+
+    // A third edit AFTER the reconnect: this one is not served from the queue,
+    // so it only arrives if the reconnect's capability actually restored content
+    // authorization. It is the regression guard for a reconnect that re-presents
+    // nothing and quietly goes content-blind.
+    alice_doc.insert(0, "Edit 3. ");
+    let update3 = alice_doc.get_encrypted_update().unwrap();
+    alice
+        .send(&ClientMessage::YrsUpdate {
+            doc_id: doc_id.clone(),
+            encrypted: update3.ciphertext.clone(),
+            epoch: update3.epoch,
+        })
+        .await
+        .unwrap();
+    let expected = alice_doc.get_content();
+    while bob_doc.get_content() != expected {
+        apply_next_update(&mut bob, &mut bob_doc, idle).await;
+    }
+    assert_eq!(
+        bob_doc.get_content(),
+        alice_doc.get_content(),
+        "a re-presented capability must restore live content delivery after reconnect"
+    );
+
+    // Mallory was subscribed for the whole exchange and never became a member.
+    // `assert_no_content` checks both halves: she DID receive the handshake, so
+    // she was genuinely live, and she received no `YrsUpdate`.
+    assert_no_content(&mut mallory, idle).await.unwrap();
 }

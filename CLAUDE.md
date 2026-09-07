@@ -116,6 +116,32 @@ Test the state, not the promise: asserting that a retry RESOLVES proves nothing,
 because these failures resolve normally and go quiet. Assert the post-retry state
 is USABLE — the handle exists, the registration was sent exactly once.
 
+### Gate assertions
+
+A gate must assert the scenario it names actually HAPPENED, not merely that one
+failure mode was absent. Prefer asserting the expected value over excluding a
+known-bad one. Two corollaries this repo has paid for:
+
+**A test restructured for a new configuration still passes under the old one.**
+The new steps are additive, so they do not by themselves read the change. #94's
+docker wire tests learned to register a document anchor and mint a capability,
+and were green with `RELAY_SUBSCRIBE_AUTHZ` gating content ON — and equally green
+with it pinned off. The discriminator has to be added deliberately: an observer
+that must NOT receive what the gate withholds. Before calling such a test a gate,
+mutate the configuration back and confirm it goes RED.
+
+**An absence assertion needs its positive half.** "The observer received no
+content" passes identically when the observer was disconnected, unsubscribed, or
+never reached at all. Assert in the same place that it DID receive what is
+ungated (the MLS handshake), so its silence is evidence rather than a vacuum.
+`helpers::assert_no_content` and `routing.rs`'s in-process case both do this.
+
+**A shared fixture outlives one test run.** The docker tier runs against a
+long-lived relay, so a fixed `doc_id` is TOFU-anchored once and every later run
+is refused as a rotation, and a fixed `user_id` collides as `SessionReplaced`.
+Wire-test ids come from `helpers::unique`. A test that passes only on a fresh
+container is not a gate.
+
 ### Dead code / YAGNI
 Keep internal-crate APIs `pub(crate)` (not `pub`) so `rustc`'s `dead_code` lint flags
 unused items — `pub` items in a workspace-internal crate are never reported as dead.

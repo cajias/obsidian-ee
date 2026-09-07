@@ -3,9 +3,11 @@
 //! This module provides:
 //! - `TestClient` for WebSocket communication with the relay
 //! - `MlsTestGroup` for quick MLS group setup between users
+//! - the subscribe-authorization choreography (anchor, mint, present)
 //! - Timeout-aware operations with clear error messages
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use collab_core::{EncryptedDocument, EncryptedOp, Invite, MlsDocumentGroup, PendingMember};
 use collab_proto::{ClientMessage, DocumentId, MlsMessageType, ServerMessage};
@@ -177,13 +179,15 @@ impl TestClient {
     ///
     /// Returns an error if subscription fails.
     pub async fn subscribe(&mut self, doc_id: &DocumentId) -> anyhow::Result<()> {
-        // capability: None — these helpers exercise an UN-GATED relay. Two
-        // different defaults get you there: `TestServer::start()` builds a
-        // `RelayServer::new()`, whose flag is off, and the Docker wire tests
-        // point at docker/docker-compose.yml, which sets RELAY_SUBSCRIBE_AUTHZ=0
-        // because the relay BINARY defaults it on since #72. Against a gated
-        // relay these subscriptions are handshake-only and receive no content —
-        // see tests/e2e-tests/tests/subscribe_authz.rs for the gated flows.
+        // capability: None — a HANDSHAKE-ONLY subscribe. Against an un-gated
+        // relay (`TestServer::start()` builds a `RelayServer::new()`, whose flag
+        // is off) it receives everything. Against a gated relay — which since
+        // #94 includes the Docker wire tier, where docker/docker-compose.yml
+        // leaves RELAY_SUBSCRIBE_AUTHZ unset so the binary's ON default applies
+        // — it receives the MLS handshake and NO content. That is the correct
+        // bootstrap for a joiner, which cannot mint a capability until it has
+        // consumed its Welcome; to earn content afterwards, call
+        // [`subscribe_with_capability`].
         self.send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: None }).await?;
         let response = self.recv().await?;
         if !matches!(response, ServerMessage::Subscribed { .. }) {
@@ -223,6 +227,142 @@ impl TestClient {
             other => anyhow::bail!("Expected YrsUpdate, got {other:?}"),
         }
     }
+}
+
+// =============================================================================
+// SUBSCRIBE AUTHORIZATION (issues #72, #94)
+// =============================================================================
+// With subscribe authorization on, the relay gates `YrsUpdate` fan-out on a
+// capability minted from a LIVE MLS group. These helpers are the client-side
+// choreography that earns content — anchor the document, mint, present — the
+// same sequence collab-cli and the Obsidian plugin perform. They live here
+// because three test files need them; they used to be copied per file.
+
+/// A run-unique id built from `prefix`, for document and user ids.
+///
+/// The Docker wire tier runs against a LONG-LIVED relay whose state outlives a
+/// single `cargo test` invocation, so fixed ids make a test pass once and fail
+/// afterwards for reasons unrelated to the code under test:
+/// - a document anchor is TOFU, so the second run's `RegisterDocKey` is a
+///   ROTATION and is refused ("rotation continuity proof verification failed");
+/// - a re-used `user_id` displaces the earlier session (`SessionReplaced`),
+///   which also collides between two tests sharing the relay.
+///
+/// Both ids stay well inside the relay's 256-byte limit.
+pub fn unique(prefix: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{nanos}-{seq}")
+}
+
+/// Capability lifetime for tests (matches the design's 300s default).
+pub const TTL_SECS: u64 = 300;
+
+/// Whole seconds since the Unix epoch, for capability minting.
+#[must_use]
+pub fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Register `doc`'s CURRENT-epoch anchor over `client` (TOFU — empty rotation
+/// proof, so this only succeeds for a document nobody has anchored yet).
+///
+/// Call this only once the group has reached the epoch the members will mint
+/// at: the relay compares a capability's epoch against the STORED anchor epoch,
+/// so an anchor registered at epoch 0 rejects every capability minted at 1.
+///
+/// A successful `RegisterDocKey` is answered with silence (`relay.rs`: "On
+/// success: silent"), so there is nothing to drain — the caller's next `recv`
+/// still sees its own next frame.
+///
+/// # Errors
+///
+/// Returns an error if minting the proof or sending the frame fails.
+pub async fn register_anchor(
+    client: &mut TestClient,
+    doc: &EncryptedDocument,
+    doc_id: &DocumentId,
+) -> anyhow::Result<()> {
+    client
+        .send(&ClientMessage::RegisterDocKey {
+            doc_id: doc_id.clone(),
+            epoch: doc.epoch(),
+            public_key: doc.subscribe_verifying_key()?.to_vec(),
+            proof: doc.sign_doc_key_proof(doc_id)?,
+            rotation_proof: Vec::new(),
+        })
+        .await
+}
+
+/// Subscribe `client` with a capability `doc` mints for `user_id`, and confirm
+/// the relay accepted it.
+///
+/// Re-subscribing is how an already-connected member UPGRADES a handshake-only
+/// subscription to a content-authorized one. The converse also holds and is the
+/// reason this exists: a bare `TestClient::subscribe` from an authorized member
+/// DOWNGRADES it back to handshake-only.
+///
+/// # Errors
+///
+/// Returns an error if minting fails, or if the relay answers with anything
+/// other than `Subscribed` — a rejected capability included.
+pub async fn subscribe_with_capability(
+    client: &mut TestClient,
+    doc: &EncryptedDocument,
+    user_id: &str,
+    doc_id: &DocumentId,
+) -> anyhow::Result<()> {
+    let capability = doc.mint_subscribe_capability(user_id, doc_id, now_unix(), TTL_SECS)?;
+    client
+        .send(&ClientMessage::Subscribe { doc_id: doc_id.clone(), capability: Some(capability) })
+        .await?;
+    let response = client.recv().await?;
+    if !matches!(response, ServerMessage::Subscribed { .. }) {
+        anyhow::bail!("capability subscribe rejected, got {response:?}");
+    }
+    Ok(())
+}
+
+/// Assert that a handshake-only subscriber receives NO document content.
+///
+/// This is what makes a wire test read the gate rather than merely survive it:
+/// the same flow passes with authorization OFF, so without this assertion a
+/// re-pinned `RELAY_SUBSCRIBE_AUTHZ=0` would go unnoticed (issue #94).
+///
+/// Drains until the stream is quiet for `window` and asserts the `YrsUpdate`
+/// kind is ABSENT, rather than expecting one specific frame: an observer still
+/// legitimately receives MLS handshake traffic, which is never gated.
+///
+/// Absence alone would be a vacuous gate — a disconnected, unsubscribed or
+/// handshake-starved observer is silent for the same reason a gated one is. So
+/// this also asserts the POSITIVE half: at least one `MlsHandshake` reached the
+/// observer, proving it was live and subscribed for the exchange it stayed
+/// content-blind through.
+///
+/// # Errors
+///
+/// Returns an error if a `YrsUpdate` arrives, if no `MlsHandshake` ever did, or
+/// if the receive itself fails.
+pub async fn assert_no_content(client: &mut TestClient, window: Duration) -> anyhow::Result<()> {
+    let mut saw_handshake = false;
+    while let Some(msg) = client.try_recv(window).await? {
+        match msg {
+            ServerMessage::YrsUpdate { doc_id, .. } => anyhow::bail!(
+                "a handshake-only subscriber received YrsUpdate content for {doc_id}: the \
+                 relay is NOT gating content fan-out on a subscribe capability"
+            ),
+            ServerMessage::MlsHandshake { .. } => saw_handshake = true,
+            _ => {}
+        }
+    }
+    if !saw_handshake {
+        anyhow::bail!(
+            "the observer received no MlsHandshake, so its silence proves nothing about \
+             content gating — it was not live and subscribed for the exchange"
+        );
+    }
+    Ok(())
 }
 
 /// Helper for setting up MLS groups between test users.
