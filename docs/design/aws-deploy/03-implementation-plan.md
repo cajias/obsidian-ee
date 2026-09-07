@@ -222,6 +222,41 @@ The runner is a third scope value on the `RELAY_CHECKS` knob of `tests/deploymen
 
 One consequence lands outside M3: because `staging-gate` runs inside the default `all` scope, M4's gate command above acquires a fifth reading and an authenticated `gh` as a prerequisite alongside its AWS credentials. M3's section above is amended to carry the second gate command, per the rule that amending a ratified gate takes a numbered note with its justification. Files: `tests/deployment-verify.sh`, this document, `04 — BDD Test Plan`, `CLAUDE.md`.
 
+
+## Plan change 8 — the rollback drill's target is derived, not pinned
+
+**Plan change 8 (recorded during the pre-rollout review, scoped to M4)** —
+`tests/deployment-verify.sh` pinned `PRIOR_TAG=v0.1.0` as the rollback target, and
+the rollout runbook told the operator to dispatch `--ref v0.1.0`. **No step in this
+plan ever creates that tag.** The release-please manifest starts at `0.1.0` with no
+matching tag (`git tag -l` is empty), so the first release cut publishes the *next*
+version — the first tag that ever exists is `$RELEASE_TAG`, and `v0.1.0` is a
+version the repository passed through before tagging began, not a release. The
+dispatch could not resolve its ref, and the gate's own ECR read for that tag exited
+**1 FAIL** — reporting a broken rollback where the truth was a rollback target that
+never existed.
+
+`RELEASE_TAG` stays pinned by the exit criterion. `PRIOR_TAG` is now **resolved from
+the repository's actual releases** — the newest published, non-draft, non-prerelease
+tag that is not `$RELEASE_TAG` — and the gate prints the target it chose so the
+runbook can name it instead of hardcoding a version. Both remain overridable by
+environment variable, so pinning a specific pair is still available.
+
+Two reclassifications follow from it, both toward this script's existing idiom that
+an unmet prerequisite exits **2 BLOCKED** naming the human step, while only a broken
+assertion exits 1:
+
+- **No release precedes `$RELEASE_TAG`** — after the canary cut there is exactly one
+  release, so there is nothing to roll back *to*. That is an outstanding step (cut a
+  second release), not a failure. The runbook's step 4 now says so; it previously
+  implied a drill that could not be run in the sequence it prescribed.
+- **The prior tag has no image** — the same shape as the missing release image at
+  check (b), which already exited 2. Any other `describe-images` error still exits 1.
+
+**This corrects a defect; it adds no requirement.** `rollback-redeploys-old-digest`
+asserts exactly what `04` always specified — prod serves the digest the prior release
+already named — against a target that can exist.
+
 ## Execution notes
 
 - **Context is cleared between milestones.** Each milestone runs in a fresh session; that is why every Context to load list is self-contained — the executing agent reads those files first and needs nothing else from prior sessions.

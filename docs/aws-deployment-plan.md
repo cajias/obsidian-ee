@@ -46,7 +46,7 @@ Image strategy: dev/staging deploy `sha-<sha12>` tags; on release, the build job
 - `.github/workflows/release.yml`: `googleapis/release-please-action@v4` on push to main, with `token: ${{ secrets.RELEASE_PLEASE_TOKEN }}` (fine-grained PAT). **Required**: `GITHUB_TOKEN`-created releases never trigger `release:` workflows — without the PAT, prod deploys never fire.
 
 ### 2. `.github/workflows/deploy.yml`
-- Triggers: `workflow_dispatch` (choice input dev/staging/prod, default dev; prod choice documented as rollback/redeploy hatch, e.g. `--ref v0.1.0`) + `release: {types: [published]}` → prod.
+- Triggers: `workflow_dispatch` (choice input dev/staging/prod, default dev; prod choice documented as rollback/redeploy hatch, e.g. `--ref <a previously released tag>`) + `release: {types: [published]}` → prod.
 - Workflow-level `permissions: {contents: read}`, with `id-token: write` granted job-level on `build` and `deploy` only — `meta` handles the untrusted release tag and assumes no role, so it must not mint OIDC tokens; `concurrency` keyed per target env, no cancel-in-progress.
 - `meta` job resolves env + tags: `sha-<sha12>` always; release → `deploy_tag = tag_name`, rejected unless it matches `^v[0-9]+\.[0-9]+\.[0-9]+$` (the tag is re-parsed as root by SSM downstream).
 - `build` job on `ubuntu-24.04-arm`: `configure-aws-credentials@v4` (ECR push role), `amazon-ecr-login@v2`; skip build if `aws ecr describe-images` finds the sha tag (immutable tags — never re-push); on release, retag digest via `docker buildx imagetools create --prefer-index=false` (the default wraps the single-platform manifest in a new index and changes the digest).
@@ -146,7 +146,7 @@ Sequencing: STOPSIGNAL edit first (independent) → infra + runbook 1–8 → re
 - `websocat wss://relay-dev…` + `Identify` with token → ack; without token → rejection (proves not an open relay).
 - Canary: merge a `fix:` commit → release PR (only version.txt/CHANGELOG → `--locked` CI stays green) → merge → `v0.1.1` published → prod deploy fires; ECR shows `v0.1.1` and `sha-…` on the same digest.
 - Gates: staging dispatch pauses "Waiting for review"; dev doesn't.
-- Rollback drill: `gh workflow run deploy.yml -f environment=prod --ref v0.1.0` (re-deploys old digest, no rebuild).
+- Rollback drill: `gh workflow run deploy.yml -f environment=prod --ref <the release before the current one>` (re-deploys old digest, no rebuild). It therefore needs **two** published releases; `tests/deployment-verify.sh` resolves and names the target.
 - Break-glass: `aws ssm start-session --target <instance-id>`.
 
 ## Rollout runbook (M4)
@@ -202,18 +202,28 @@ Observe: gates (a)–(c) print `OK` and the script exits 2 naming the rollback d
 
 **4. Run the rollback dispatch.** This is a REAL prod deploy, which is why `tests/deployment-verify.sh` never issues it.
 
+A rollback needs a release to go back *to*, so this step needs a second published
+release — after step 3 there is only one. Cut another (merge a further `fix:` and the
+release PR that follows, and let its prod deploy finish), then roll back to the
+**earlier** of the two. Step 3's gate run names the target it resolved on its
+`rollback target:` line; that is the ref to dispatch.
+
 ```bash
-gh workflow run deploy.yml -f environment=prod --ref v0.1.0
+PRIOR=<the earlier release tag, as named by the gate>
+gh workflow run deploy.yml -f environment=prod --ref "$PRIOR"
 gh run watch "$(gh run list --workflow=deploy.yml -L1 --json databaseId -q '.[0].databaseId')"
 ```
 
-Observe: `Build and push` is skipped and `Retag the released digest` does not run at all (this is a dispatch, not a release), so no image is built — the deploy job sends the SSM command with the `:sha-<sha12>` ref of the v0.1.0 commit (a dispatch deploys the `sha-` tag, not the `v` tag; both name the same digest) and its 101 verify passes.
+Observe: `Build and push` is skipped and `Retag the released digest` does not run at all (this is a dispatch, not a release), so no image is built — the deploy job sends the SSM command with the `:sha-<sha12>` ref of that release's commit (a dispatch deploys the `sha-` tag, not the `v` tag; both name the same digest) and its 101 verify passes.
 
 **5. Verify.**
 
 ```bash
 M4_ROLLBACK_DRILL=done bash tests/deployment-verify.sh
 ```
+
+(The gate re-resolves the rollback target itself. Pass `PRIOR_TAG=<tag>` to pin it
+to a specific release instead.)
 
 Observe: exit 0 and `PASS: all four M4 scenarios verified`. Any non-zero exit prints either a `FAIL:` line naming the assertion that broke or a `BLOCKED:` block naming the human step still outstanding.
 

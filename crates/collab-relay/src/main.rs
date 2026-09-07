@@ -45,9 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Report the value as OBSERVED rather than as "the default"/"is falsey": the
     // gate ends up off for an explicitly falsy value too (`RELAY_SUBSCRIBE_AUTHZ=0`,
-    // which docker/docker-compose.yml pins as a wire-test fixture), and a line that
-    // does not name what the process actually read sends whoever is debugging the
-    // wrong way. This log is the first thing read when the wire tests misbehave.
+    // still set by the DEPLOYED unit in infra/assets/docker-compose.yml), and a
+    // line that does not name what the process actually read sends whoever is
+    // debugging the wrong way. This log is the first thing read when the wire
+    // tests misbehave — docker/docker-compose.yml leaves the variable UNSET since
+    // #94, so the docker tier runs with the gate ON and a local run reading
+    // DISABLED means something in the environment set it.
     let raw_subscribe_authz = std::env::var("RELAY_SUBSCRIBE_AUTHZ").ok();
     let subscribe_authz = subscribe_authz_enabled(raw_subscribe_authz.as_deref());
     let observed = raw_subscribe_authz

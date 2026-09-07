@@ -80,8 +80,14 @@ esac
 
 # Pinned by the rollout exit criterion; ECR_REPOSITORY mirrors deploy.yml's repo variable.
 ECR_REPOSITORY=${ECR_REPOSITORY:-obsidian-ee/collab-relay}
-RELEASE_TAG=v0.1.1
-PRIOR_TAG=v0.1.0
+RELEASE_TAG=${RELEASE_TAG:-v0.1.1}
+# PRIOR_TAG is DERIVED, not pinned: it is whatever release precedes $RELEASE_TAG,
+# and it is resolved from the repository's actual releases at (d). It used to be
+# pinned to v0.1.0 — a tag nothing in this repository ever creates. The manifest
+# starts at 0.1.0 with no matching tag, and release-please cuts the NEXT version
+# on its first run, so the very first tag to exist is $RELEASE_TAG. Rolling back
+# to v0.1.0 could never resolve, and the drill it documents could never run.
+PRIOR_TAG=${PRIOR_TAG:-}
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
@@ -544,9 +550,47 @@ esac
 echo "OK (unauthenticated-identify-rejected): dev acks the credentialed Identify and refuses the anonymous one"
 
 # ------------------------------------- (d) rollback-redeploys-old-digest
-# The drill itself (`gh workflow run deploy.yml -f environment=prod --ref v0.1.0`)
+# The drill itself (`gh workflow run deploy.yml -f environment=prod --ref <prior>`)
 # is a REAL prod deploy and a human halt step. This script only verifies its
 # outcome, and only once told the drill has happened.
+
+# Resolve the rollback target before the halt message, so the operator is told
+# WHICH ref to dispatch. It is the newest published release that is not the
+# current one — a rollback needs a release to go back TO, so a repository with a
+# single release has no target yet. That is an outstanding step, not a failure.
+if [ -z "$PRIOR_TAG" ]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    cat <<EOF
+BLOCKED: the rollback target cannot be resolved — \`gh\` is not installed, and it
+is what reads this repository's releases.
+Outstanding human step: install and authenticate the GitHub CLI, or name the
+target yourself and re-run:
+  PRIOR_TAG=<the release to roll back to> RELAY_DOMAIN=$RELAY_DOMAIN bash $SELF
+Checks (a)-(c) above passed.
+EOF
+    exit 2
+  fi
+  # --exclude-drafts/--exclude-pre-releases: a draft or pre-release was never
+  # deployed to prod, so it is not something prod can roll back to.
+  PRIOR_TAG=$(gh release list --limit 20 --exclude-drafts --exclude-pre-releases \
+    --json tagName --jq "[.[].tagName] | map(select(. != \"$RELEASE_TAG\")) | first // empty" \
+    2>"$log") || true
+fi
+
+if [ -z "$PRIOR_TAG" ]; then
+  cat "$log" >&2
+  cat <<EOF
+BLOCKED: no published release precedes $RELEASE_TAG, so there is nothing to roll
+back to and the drill cannot be run yet.
+Outstanding human step: cut a second release (merge another \`fix:\`/\`feat:\` and
+the release PR that follows), let its prod deploy finish, then run the drill
+against the earlier tag and re-run this gate. \`gh release list\` shows what exists.
+Checks (a)-(c) above passed.
+EOF
+  exit 2
+fi
+echo "rollback target: $PRIOR_TAG (the release preceding $RELEASE_TAG)"
+
 if [ "${M4_ROLLBACK_DRILL:-}" != "done" ]; then
   cat <<EOF
 BLOCKED: the rollback drill has not been reported as run, so its outcome cannot be verified.
@@ -564,9 +608,25 @@ fi
 # reads as an infrastructure glitch rather than "the rollback target is gone".
 if ! prior_digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
   --image-ids "imageTag=$PRIOR_TAG" --query 'imageDetails[0].imageDigest' --output text 2>"$log"); then
-  cat "$log" >&2
-  echo "FAIL: no image tagged $PRIOR_TAG in $ECR_REPOSITORY, so the rollback drill cannot be verified." >&2
-  echo "The release image is the rollback target; if it expired, re-cut the release." >&2
+  err=$(cat "$log")
+  # A released tag with no image is a prerequisite that has not happened (or has
+  # expired), the same shape as (b)'s missing release image — which exits 2. It
+  # is not the script failing, and reporting FAIL sent the reader looking for a
+  # broken rollback rather than a missing rollback target.
+  if printf '%s' "$err" | grep -q 'ImageNotFoundException\|RepositoryNotFoundException'; then
+    cat <<EOF
+BLOCKED: the registry holds no image tagged $PRIOR_TAG, so the rollback drill
+cannot be verified against it.
+Outstanding human step: confirm $PRIOR_TAG's release deploy actually ran and
+pushed its image — the release image IS the rollback target. If it has expired
+from the registry, re-cut the release or roll back to one that still exists:
+  PRIOR_TAG=<a tag with an image> M4_ROLLBACK_DRILL=done RELAY_DOMAIN=$RELAY_DOMAIN bash $SELF
+Checks (a)-(c) above passed.
+EOF
+    exit 2
+  fi
+  printf '%s\n' "$err" >&2
+  echo "FAIL: aws ecr describe-images failed for $PRIOR_TAG for a reason other than a missing image" >&2
   exit 1
 fi
 instance=$(aws ec2 describe-instances \
