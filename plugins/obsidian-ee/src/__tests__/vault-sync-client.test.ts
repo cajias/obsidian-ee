@@ -72,7 +72,7 @@ describe('Vault sync over its own MLS group (two clients)', () => {
             manifestDocId: MANIFEST_DOC_ID,
             // An owner admits only the joiners it names (#71). One list gates
             // both the file group and the manifest group.
-            ...(allowedJoiners ? { allowedJoiners } : {}),
+            allowedJoiners,
         };
         const client = new CollabClient(config);
         const errors: CollabError[] = [];

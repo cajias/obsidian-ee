@@ -61,6 +61,17 @@ comma-separated user ids. A joiner's id is printed to the developer console when
 its session starts and must be exchanged out of band. One list gates both the
 file group and the vault-manifest group (#32), which share this handshake.
 
+**Operationally, both sides restart after an id is added.** A client's config is
+a snapshot taken when its session starts — true of the relay URL too — so editing
+the setting does not reach a running session; and a refused joiner is fail-closed
+but inert, because `establishGroup` skips a slot that still holds a pending key
+package, so it does not re-send even across a reconnect. The first-run sequence is
+therefore: the joiner starts a session to learn its id (this attempt is refused),
+the owner pastes the id in and restarts, the joiner restarts. Making a settings
+edit reach a live session, and giving a refused joiner a timeout it can report, are
+follow-up work; the failure is safe but currently indistinguishable from a dead
+relay on the joiner's side.
+
 The gate fails closed on every uncertainty:
 
 - **No list, or an empty list, admits nobody.** This is the shipped default. An

@@ -23,16 +23,12 @@ const DEFAULT_SETTINGS: CollabPluginSettings = {
     allowedJoiners: [],
 };
 
-/** Split the comma-separated allowlist setting into trimmed, unique ids. */
+/** Split the comma-separated allowlist setting into trimmed, non-empty ids. */
 function parseAllowedJoiners(raw: string): string[] {
-    return [
-        ...new Set(
-            raw
-                .split(',')
-                .map((id) => id.trim())
-                .filter((id) => id.length > 0)
-        ),
-    ];
+    return raw
+        .split(',')
+        .map((id) => id.trim())
+        .filter((id) => id.length > 0);
 }
 
 /**
@@ -591,7 +587,10 @@ class CollabSettingTab extends PluginSettingTab {
             .setDesc(
                 'Comma-separated user ids admitted to documents you host. Leave ' +
                     'empty to admit nobody. A joiner sees its id in the console when ' +
-                    'it starts a session; it must be exchanged out of band.'
+                    'it starts a session; it must be exchanged out of band. Like the ' +
+                    'relay URL, this applies to the NEXT session — after editing it, ' +
+                    'restart your session, and the joiner must restart theirs too ' +
+                    '(a refused joiner does not retry on its own).'
             )
             .addText((text) =>
                 text

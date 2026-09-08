@@ -74,7 +74,7 @@ describe('owner-side join gate (#71)', () => {
             userId,
             docId: FILE_DOC,
             role,
-            ...(allowedJoiners ? { allowedJoiners } : {}),
+            allowedJoiners,
         };
         const entry: TestClient = {
             userId,

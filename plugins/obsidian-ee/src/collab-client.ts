@@ -57,6 +57,12 @@ export interface CollabClientConfig {
      * join. Absent or empty admits NOBODY: an owner that has not said who may
      * join has authorized no one, and an unset list must not read as "admit
      * everyone" — that is the open admission #71 closes.
+     *
+     * A snapshot, like every other field here: editing the plugin setting does
+     * not reach a running session. And a refused joiner is fail-closed but
+     * inert — `establishGroup` skips a slot that still holds a pending key
+     * package, so it does not re-send even across a reconnect. Both sides
+     * restart their session after an id is added to the list.
      */
     allowedJoiners?: string[];
     /**

@@ -67,7 +67,7 @@ describe('three-party MLS: the add-commit reaches existing members', () => {
             userId,
             docId: FILE_DOC,
             role,
-            ...(allowedJoiners ? { allowedJoiners } : {}),
+            allowedJoiners,
         };
         const client = new CollabClient(config);
         const errors: CollabError[] = [];
