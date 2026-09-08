@@ -149,6 +149,9 @@ jest.unstable_mockModule('../wasm/collab_wasm', () => ({
         key_package: new Uint8Array([7, 7, 7]),
         free: jest.fn(),
     })),
+    // The gate (#71) reads the requester's identity out of the key package
+    // itself, so the mock must answer for the fixture bytes above.
+    key_package_identity: jest.fn(() => 'joiner'),
 }));
 
 const { WasmEncryptedDocument } = await import('../wasm/collab_wasm');
@@ -177,6 +180,9 @@ function makeConfig(overrides: Partial<CollabClientConfig> = {}): CollabClientCo
         userId: 'user1',
         docId: 'doc1',
         role: 'owner',
+        // The owner admits nobody it has not listed (#71); the mocked
+        // key_package_identity above answers 'joiner' for every key package.
+        allowedJoiners: ['joiner'],
         ...overrides,
     };
 }

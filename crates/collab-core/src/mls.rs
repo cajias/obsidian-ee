@@ -91,6 +91,31 @@ fn credential_identity(credential: &Credential) -> Result<String> {
         .map_err(|e| Error::Mls(format!("Credential identity is not valid UTF-8: {e:?}")))
 }
 
+/// The `user_id` a serialized key package would join a group under.
+///
+/// The package is VALIDATED before its credential is read. Validation checks the
+/// leaf node's self-signature, which binds the credential to the signature key
+/// that signed it — so the name returned is the one that would actually land in
+/// the group, not a string pasted beside someone else's key material.
+///
+/// This is the only identity an admission gate may compare against. A sender
+/// field on the inbound frame is whatever the sender typed at `Identify`; the
+/// relay is an untrusted router and does not verify it.
+///
+/// # Errors
+///
+/// Returns an error if the bytes are not a valid MLS key package, or if its
+/// credential is not a UTF-8 [`BasicCredential`].
+pub fn key_package_identity(key_package_bytes: &[u8]) -> Result<String> {
+    let crypto = OpenMlsRustCrypto::default();
+    let key_package_in = KeyPackageIn::tls_deserialize_exact(key_package_bytes)
+        .map_err(|e| Error::Mls(format!("Failed to deserialize key package: {e:?}")))?;
+    let key_package = key_package_in
+        .validate(crypto.crypto(), ProtocolVersion::Mls10)
+        .map_err(|e| Error::Mls(format!("Failed to validate key package: {e:?}")))?;
+    credential_identity(key_package.leaf_node().credential())
+}
+
 /// A pending member waiting to join a group.
 ///
 /// This struct holds the crypto state needed to process a welcome message.
@@ -716,6 +741,33 @@ impl MlsDocumentGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_package_identity_reads_the_credential_the_member_would_join_under() {
+        let bob = MlsDocumentGroup::generate_key_package("bob").unwrap();
+
+        assert_eq!(key_package_identity(bob.key_package()).unwrap(), "bob");
+    }
+
+    #[test]
+    fn key_package_identity_rejects_bytes_that_are_not_a_key_package() {
+        // The gate's input is relay-supplied: garbage must surface as an error
+        // the caller can fail closed on, never a name it might admit.
+        assert!(key_package_identity(b"not a key package").is_err());
+        assert!(key_package_identity(&[]).is_err());
+    }
+
+    #[test]
+    fn key_package_identity_rejects_a_package_whose_signature_was_tampered_with() {
+        // Validation is what makes the returned name trustworthy: flipping a byte
+        // in the signed body must fail validation rather than yield an identity.
+        let bob = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let mut tampered = bob.key_package().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+
+        assert!(key_package_identity(&tampered).is_err());
+    }
 
     #[test]
     fn test_create_group() {

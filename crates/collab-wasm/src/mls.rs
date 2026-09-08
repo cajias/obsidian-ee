@@ -32,6 +32,18 @@ pub fn generate_key_package(user_id: &str) -> Result<WasmPendingMember, JsError>
     MlsDocumentGroup::generate_key_package(user_id).map(WasmPendingMember).map_err(js_err)
 }
 
+/// The `user_id` an inbound key package would join the group under, read from
+/// the package's own MLS credential after validation (issue #71).
+///
+/// An owner's admission gate must compare THIS against its allowlist. The
+/// relay stamps a sender field on every fanned-out frame, but that is whatever
+/// the sender typed at `Identify` on an untrusted router — a gate reading it
+/// admits anyone willing to claim an allowlisted name.
+#[wasm_bindgen]
+pub fn key_package_identity(key_package: &[u8]) -> Result<String, JsError> {
+    collab_core::key_package_identity(key_package).map_err(js_err)
+}
+
 /// The `RegisterDocKey` payload that moves the relay's subscribe anchor to the
 /// epoch a commit just created (issue #29). Send all four fields verbatim.
 #[wasm_bindgen]

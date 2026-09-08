@@ -3,6 +3,7 @@ import {
     WasmInvite,
     WasmPendingMember,
     generate_key_package,
+    key_package_identity,
 } from './wasm/collab_wasm';
 import type { WasmEncryptedOp } from './wasm/collab_wasm';
 
@@ -917,6 +918,50 @@ export class CollabClient {
     }
 
     /**
+     * Whether this owner admits the member an inbound key package would add (#71).
+     *
+     * The identity checked against `allowedJoiners` is read out of the key
+     * package's OWN MLS credential, after wasm-side validation of the leaf
+     * signature that binds it. Never the relay's `from` field: that is whatever
+     * the sender typed at `identify` on an untrusted router, so a gate reading
+     * it would admit anyone willing to claim an allowlisted name.
+     *
+     * Fails closed on every uncertainty — no list, an empty list, an unlisted
+     * name, or bytes that will not parse as a key package. Living in the shared
+     * handshake means the manifest group (#32) is gated by the same list.
+     *
+     * ponytail: names, not public keys. A BasicCredential identity is
+     * self-asserted, so knowing an allowlisted name is sufficient — this stops
+     * the stranger who knows only the doc id, not one who also knows who was
+     * invited. Pinning the key package's signature public key is the upgrade
+     * path and needs an out-of-band exchange the plugin does not have yet; see
+     * the admission section of docs/security.md.
+     */
+    private admits(keyPackage: Uint8Array, docId: string): boolean {
+        const allowed = this.config.allowedJoiners;
+        if (!allowed?.length) {
+            console.warn(
+                `[CollabClient] Refusing to admit a member to ${docId}: no allowedJoiners configured`
+            );
+            return false;
+        }
+        let requester: string;
+        try {
+            requester = key_package_identity(keyPackage);
+        } catch (error) {
+            console.warn(`[CollabClient] Refusing an unreadable key package on ${docId}:`, error);
+            return false;
+        }
+        if (!allowed.includes(requester)) {
+            console.warn(
+                `[CollabClient] Refusing to admit ${requester} to ${docId}: not in allowedJoiners`
+            );
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * Apply key_package/welcome/commit to one MLS group `slot` — the shared
      * core of the file-group and manifest-group (#32) handshakes, which
      * otherwise differ only in which doc id and which slot they read/write.
@@ -931,6 +976,12 @@ export class CollabClient {
                 // Only an owner with an established group answers a key package.
                 const doc = slot.getDoc();
                 if (this.config.role !== 'owner' || !doc) {
+                    return;
+                }
+                // The admission gate (#71) runs BEFORE create_invite, which
+                // commits the group to a new epoch: a refusal has to leave the
+                // group exactly where it was, and there is no un-commit.
+                if (!this.admits(payload, slot.docId)) {
                     return;
                 }
                 const invite = doc.create_invite(payload);

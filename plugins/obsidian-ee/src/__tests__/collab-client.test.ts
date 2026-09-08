@@ -178,6 +178,9 @@ jest.unstable_mockModule('../wasm/collab_wasm', () => ({
         key_package: new Uint8Array([7, 7, 7]),
         free: jest.fn(),
     })),
+    // The gate (#71) reads the requester's identity out of the key package
+    // itself, so the mock must answer for the fixture bytes above.
+    key_package_identity: jest.fn(() => 'joiner'),
 }));
 
 const { WasmEncryptedDocument, generate_key_package } = await import('../wasm/collab_wasm');

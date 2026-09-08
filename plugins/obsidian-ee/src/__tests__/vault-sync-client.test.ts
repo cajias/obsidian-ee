@@ -61,7 +61,7 @@ describe('Vault sync over its own MLS group (two clients)', () => {
         manifestPaths: string[][];
     }
 
-    function makeClient(userId: string, role: CollabRole): TestClient {
+    function makeClient(userId: string, role: CollabRole, allowedJoiners?: string[]): TestClient {
         const vaultSync = new WasmVaultSync([], [], true, true);
         const config: CollabClientConfig = {
             relayUrl: RELAY_URL,
@@ -70,6 +70,9 @@ describe('Vault sync over its own MLS group (two clients)', () => {
             role,
             vaultSync,
             manifestDocId: MANIFEST_DOC_ID,
+            // An owner admits only the joiners it names (#71). One list gates
+            // both the file group and the manifest group.
+            ...(allowedJoiners ? { allowedJoiners } : {}),
         };
         const client = new CollabClient(config);
         const errors: CollabError[] = [];
@@ -87,7 +90,7 @@ describe('Vault sync over its own MLS group (two clients)', () => {
      * relay fan-out drives both MLS handshakes (file + manifest) to completion.
      */
     async function connectedPair(tag: string): Promise<{ a: TestClient; b: TestClient }> {
-        const a = makeClient(`alice-${tag}`, 'owner');
+        const a = makeClient(`alice-${tag}`, 'owner', [`bob-${tag}`]);
         const b = makeClient(`bob-${tag}`, 'joiner');
         await a.client.connect();
         await wait(50);

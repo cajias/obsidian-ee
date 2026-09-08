@@ -76,7 +76,12 @@ describe('owner-side join gate (#71)', () => {
             role,
             ...(allowedJoiners ? { allowedJoiners } : {}),
         };
-        const entry: TestClient = { userId, client: new CollabClient(config), errors: [], updates: [] };
+        const entry: TestClient = {
+            userId,
+            client: new CollabClient(config),
+            errors: [],
+            updates: [],
+        };
         entry.client.onError((e) => entry.errors.push(e));
         entry.client.onUpdate((text) => entry.updates.push(text));
         live.push(entry);
@@ -129,6 +134,23 @@ describe('owner-side join gate (#71)', () => {
         expect(alice.client.sendUpdate('members only')).toBe(true);
         await wait(200);
         expect(mallory.updates).toEqual([]);
+    });
+
+    it('an owner that configured no allowlist admits nobody', async () => {
+        // The default plugin settings ship an empty list. An unset list must not
+        // read as "admit everyone" — that is the open admission #71 closes.
+        const alice = makeClient('alice-nolist', 'owner');
+        const bob = makeClient('bob-nolist', 'joiner');
+
+        await alice.client.connect();
+        await wait(50);
+        await bob.client.connect();
+        await wait(400);
+
+        expect(handshakesFrom('bob-nolist', 'key_package')).toHaveLength(1);
+        expect(handshakesFrom('alice-nolist', 'welcome')).toHaveLength(0);
+        expect(groupOf(alice.client)?.epoch).toBe(0n);
+        expect(groupOf(bob.client)).toBeNull();
     });
 
     it('an allowlisted joiner is still welcomed and still receives content', async () => {

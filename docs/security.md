@@ -34,6 +34,7 @@ The AES-128-GCM AEAD in the ciphersuite is internal to MLS; there is no standalo
 | **Impersonation** | Ed25519 signature verification |
 | **Concurrent edit conflicts** | Yrs CRDT deterministic resolution |
 | **Non-member access** | MLS group membership enforcement |
+| **Uninvited admission** | Owner-side allowlist checked against the key package's own credential before `add_members` (issue #71); see below |
 
 ### What We Do NOT Protect Against
 
@@ -44,20 +45,61 @@ The AES-128-GCM AEAD in the ciphersuite is internal to MLS; there is no standalo
 | **Denial of service** | No rate limiting on the relay server currently |
 | **Document access control** | MLS group membership gates *decryption* always. *Content* (`YrsUpdate`) fan-out is gated by per-document subscribe authorization (issue #29), **on by default** since #72 and disabled with `RELAY_SUBSCRIBE_AUTHZ=0`. *Subscription* itself stays open so the MLS join can bootstrap, so metadata remains visible to any identified client; see [Per-Document Subscribe Authorization](#per-document-subscribe-authorization-issue-29) |
 | **User authentication** | User IDs are self-asserted; no identity verification system. A subscribe capability binds a `user_id`, but that is the same self-asserted relay identity — it stops replay-as-another-subscriber, not impersonation of a fabricated identity |
-| **Group admission control** | The owner auto-invites ANY key package arriving on the document channel; see below |
+| **Admission by a known name** | The owner's allowlist matches self-asserted `BasicCredential` names, so an attacker who learns both a `doc_id` and an allowlisted user id can still be admitted; see below |
 
-#### Open admission (current model)
+#### Admission control (issue #71)
 
-In the plugin client (`plugins/obsidian-ee/src/collab-client.ts`, `handleMlsHandshake`),
-an owner with an established group answers every `key_package` message received on its
-document channel with a Welcome. There is no allowlist, invitation token, or user
-confirmation step: anyone who can reach the relay and send a key package on a known
-`doc_id` is admitted to the MLS group and can decrypt all subsequent updates.
-Relay-reachability therefore equals admission today. MLS still guarantees everything
-above (the relay itself learns nothing, non-members who were never welcomed cannot
-decrypt), but the decision of WHO becomes a member is unguarded. An explicit admission
-gate (owner approval / pre-shared invite verification before `create_invite`) is
-deliberately deferred and tracked in a follow-up issue.
+An owner admits only the identities it has listed. In the plugin client
+(`plugins/obsidian-ee/src/collab-client.ts`, `applyGroupHandshake` case
+`'key_package'`), an inbound key package is answered with a Welcome only when
+`CollabClientConfig.allowedJoiners` contains the requester. The check runs
+*before* `create_invite`, which commits the group to a new epoch: a refusal
+leaves the group exactly where it was, and there is no un-commit.
+
+The list is set per vault in the plugin's **Allowed joiners** setting, as
+comma-separated user ids. A joiner's id is printed to the developer console when
+its session starts and must be exchanged out of band. One list gates both the
+file group and the vault-manifest group (#32), which share this handshake.
+
+The gate fails closed on every uncertainty:
+
+- **No list, or an empty list, admits nobody.** This is the shipped default. An
+  owner that has not said who may join has authorized no one, and an unset list
+  must never read as "admit everyone".
+- **A key package that does not parse or validate is refused**, rather than
+  admitted on a name read from unvalidated bytes.
+- **A joiner never answers a key package at all** — the role guard precedes the
+  gate.
+
+**The identity checked is the one inside the key package**, read via
+`collab_core::key_package_identity` after MLS validation of the leaf
+signature that binds the credential to its signature key. It is deliberately
+*not* the `from` field the relay stamps on a fanned-out frame: that is whatever
+the sender typed at `Identify` on an untrusted zero-knowledge router, so a gate
+reading it would admit anyone willing to claim an allowlisted name. The
+regression test for this is
+`plugins/obsidian-ee/src/__tests__/join-gate.test.ts`, whose impostor case
+presents a key package minted for one identity from a connection identified as
+another.
+
+##### Residual weaknesses
+
+- **Names are self-asserted.** A `BasicCredential` identity is a UTF-8 string the
+  requester chose; there is no PKI and no identity verification (see **User
+  authentication** above). Knowing an allowlisted user id is therefore sufficient
+  to be admitted. The gate raises the bar from "knows a `doc_id`" to "knows a
+  `doc_id` and an invited user id" — it is not authentication. Pinning the key
+  package's signature public key instead of its name is the upgrade path and
+  needs an out-of-band key exchange the plugin does not have yet.
+- **The list is per vault, not per document.** Every document this vault hosts
+  admits the same set.
+- **Admission is not revocation.** Removing an id from the list does not evict a
+  member already in the group; that is `remove_member` (issue #31).
+- **The native CLI has no allowlist**, because its invite path is operator-typed
+  and already human-gated (`crates/collab-cli/src/commands.rs`).
+- **Subscription is still open.** Admission gates *membership*; who may subscribe
+  to a document's ciphertext stream and observe metadata is issue #29, and content
+  fan-out gating is #72. Neither subsumes this one.
 
 ## Zero-Knowledge Relay Design
 
