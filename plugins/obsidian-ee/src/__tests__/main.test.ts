@@ -1,5 +1,5 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { mockObsidianModule } from './helpers/mock-obsidian';
+import { findSetting, mockObsidianModule } from './helpers/mock-obsidian';
 import {
     createCollabWasmMock,
     createMockClientInstance,
@@ -608,5 +608,120 @@ describe('persisted MLS state across stopSession/startSession (#93)', () => {
         const first = ctor.mock.calls[0][0] as { userId: string };
         const second = ctor.mock.calls[1][0] as { userId: string };
         expect(second.userId).toBe(first.userId);
+    });
+});
+
+/**
+ * #97 admission window. `setAllowedJoiners` reaches a RUNNING owner's MLS
+ * gate, and credential identities are self-asserted, so a per-keystroke
+ * publish briefly admits `u`, then `us`, then `use`... — short ids an
+ * attacker can pre-mint key packages for and spam at the document channel.
+ * One hit inside the typing window is full group membership. The commit is
+ * blur/Enter rather than a debounce: a debounce still publishes a prefix on
+ * every pause, which narrows the window instead of closing it.
+ */
+describe('allowed-joiners settings field', () => {
+    // The obsidian and CollabClient mocks are module-scoped, so their call
+    // logs accumulate across the file; clearing here is what makes the
+    // per-keystroke call count below mean THIS test's typing.
+    beforeEach(() => {
+        jest.clearAllMocks();
+        mockCompile.mockResolvedValue(mockWasmModule as WebAssembly.Module);
+        mockWasmInit.mockResolvedValue(undefined);
+    });
+
+    const TYPED = 'user-1730000000000, user-1730000000001';
+    const PARSED = ['user-1730000000000', 'user-1730000000001'];
+
+    const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+    async function renderSettings() {
+        const plugin = createMockPlugin();
+        await plugin.onload();
+        // A session already running — this is the live gate the paste has
+        // to reach, and the one a prefix must never reach.
+        const client = { setAllowedJoiners: jest.fn() };
+        (plugin as any).collabClient = client;
+        const saveData = jest.spyOn(plugin as any, 'saveData');
+
+        const { Setting } = await import('obsidian');
+        (Setting as unknown as jest.Mock).mockClear();
+        const tab = (plugin as any).settingTab;
+        tab.display();
+
+        // The positive half of the absence assertions below: the row really
+        // rendered and really built its text field, so a silent spy is the
+        // commit gate holding rather than a settings tab that never ran.
+        const texts = findSetting(Setting, 'Allowed joiners')?.texts ?? [];
+        expect(texts).toHaveLength(1);
+        const [text] = texts;
+        return { plugin, client, saveData, text, tab };
+    }
+
+    it('publishes nothing while the owner types, then commits once on blur', async () => {
+        const { plugin, client, saveData, text } = await renderSettings();
+
+        ['u', 'us', 'use', 'user', TYPED].forEach((prefix) => text.type(prefix));
+        await flush();
+
+        expect(client.setAllowedJoiners).not.toHaveBeenCalled();
+        expect(saveData).not.toHaveBeenCalled();
+        expect(plugin.settings.allowedJoiners).toEqual([]);
+
+        text.blur();
+        await flush();
+
+        expect(client.setAllowedJoiners).toHaveBeenCalledTimes(1);
+        expect(client.setAllowedJoiners).toHaveBeenCalledWith(PARSED);
+        expect(plugin.settings.allowedJoiners).toEqual(PARSED);
+        expect(saveData).toHaveBeenCalledTimes(1);
+    });
+
+    it('commits once on Enter', async () => {
+        const { plugin, client, text } = await renderSettings();
+
+        text.type(TYPED);
+        text.pressEnter();
+        await flush();
+
+        expect(client.setAllowedJoiners).toHaveBeenCalledTimes(1);
+        expect(client.setAllowedJoiners).toHaveBeenCalledWith(PARSED);
+        expect(plugin.settings.allowedJoiners).toEqual(PARSED);
+    });
+
+    // Chromium does not fire `blur` when the focused input is removed from the
+    // DOM, so closing the settings pane mid-edit reaches ONLY `hide()`. Without
+    // that third commit path the typed list is silently dropped and the owner
+    // is left debugging a join gate that was never configured.
+    it('commits a value the owner typed and never blurred when the pane closes', async () => {
+        const { plugin, client, saveData, text, tab } = await renderSettings();
+
+        text.type(TYPED);
+        await flush();
+        expect(client.setAllowedJoiners).not.toHaveBeenCalled();
+
+        tab.hide();
+        await flush();
+
+        expect(client.setAllowedJoiners).toHaveBeenCalledTimes(1);
+        expect(client.setAllowedJoiners).toHaveBeenCalledWith(PARSED);
+        expect(plugin.settings.allowedJoiners).toEqual(PARSED);
+        expect(saveData).toHaveBeenCalledTimes(1);
+    });
+
+    // The three commit paths overlap in the normal case (blur, then the pane
+    // closes). Each reads the same live inputEl.value, so the repeat publishes
+    // an identical list rather than resurrecting a stale one.
+    it('re-commits the same list when blur and hide both fire', async () => {
+        const { plugin, client, text, tab } = await renderSettings();
+
+        text.type(TYPED);
+        text.blur();
+        tab.hide();
+        await flush();
+
+        expect(client.setAllowedJoiners).toHaveBeenCalledTimes(2);
+        expect(client.setAllowedJoiners.mock.calls).toEqual([[PARSED], [PARSED]]);
+        expect(plugin.settings.allowedJoiners).toEqual(PARSED);
     });
 });

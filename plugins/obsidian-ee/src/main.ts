@@ -573,9 +573,26 @@ export default class CollabPlugin extends Plugin {
 class CollabSettingTab extends PluginSettingTab {
     plugin: CollabPlugin;
 
+    /**
+     * Commits whatever the allowed-joiners field currently holds.
+     *
+     * Chromium does NOT fire `blur` when a focused input is removed from the
+     * DOM, so closing the settings pane mid-edit would drop the value the owner
+     * just typed — silently, and in a way that looks like the join gate is
+     * broken rather than unconfigured. `hide()` is Obsidian's "pane closed"
+     * hook, so it is the third commit path alongside blur and Enter. All three
+     * read the same live `inputEl.value`, so an overlap re-commits an identical
+     * list rather than publishing a stale one.
+     */
+    private commitAllowedJoiners: (() => void) | null = null;
+
     constructor(app: App, plugin: CollabPlugin) {
         super(app, plugin);
         this.plugin = plugin;
+    }
+
+    hide(): void {
+        this.commitAllowedJoiners?.();
     }
 
     display(): void {
@@ -603,18 +620,35 @@ class CollabSettingTab extends PluginSettingTab {
             .setDesc(
                 'Comma-separated user ids admitted to documents you host. Leave ' +
                     'empty to admit nobody. A joiner sees its id in the console when ' +
-                    'it starts a session; it must be exchanged out of band. This ' +
-                    'applies immediately, including to a session already running — ' +
-                    'a joiner you refused is told its request timed out and retries ' +
+                    'it starts a session; it must be exchanged out of band. The ' +
+                    'list is applied when you leave the field or press Enter — ' +
+                    'never mid-word — including to a session already running. A ' +
+                    'joiner you refused is told its request timed out and retries ' +
                     'the next time it connects.'
             )
-            .addText((text) =>
-                text
-                    .setPlaceholder('user-1730000000000, user-1730000000001')
-                    .setValue(plugin.settings.allowedJoiners.join(', '))
-                    .onChange(async (value) => {
-                        await plugin.setAllowedJoiners(parseAllowedJoiners(value));
-                    })
-            );
+            .addText((text) => {
+                text.setPlaceholder('user-1730000000000, user-1730000000001').setValue(
+                    plugin.settings.allowedJoiners.join(', ')
+                );
+                // Commit on blur/Enter/hide, NEVER per keystroke. `onChange`
+                // fires on every character, and setAllowedJoiners reaches a
+                // running owner's gate, so typing `user-1730000000000` would
+                // briefly admit `u`, then `us`, then `use`... Credential
+                // identities are self-asserted, so an attacker with pre-minted
+                // key packages named after short prefixes only has to land one
+                // during the typing window to be Welcomed into the group. A
+                // debounce would still publish a prefix on every pause; only a
+                // discrete commit point closes the window.
+                const commit = (): void => {
+                    void plugin.setAllowedJoiners(parseAllowedJoiners(text.inputEl.value));
+                };
+                this.commitAllowedJoiners = commit;
+                text.inputEl.addEventListener('blur', commit);
+                text.inputEl.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter') {
+                        commit();
+                    }
+                });
+            });
     }
 }
