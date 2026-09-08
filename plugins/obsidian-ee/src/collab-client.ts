@@ -50,6 +50,15 @@ export interface CollabClientConfig {
     docId: string;
     role: CollabRole; // owner creates the MLS group; joiner joins via a Welcome
     /**
+     * The user ids this owner admits to the document's MLS group (#71).
+     *
+     * Read only by an owner, and only when an inbound `key_package` asks to
+     * join. Absent or empty admits NOBODY: an owner that has not said who may
+     * join has authorized no one, and an unset list must not read as "admit
+     * everyone" — that is the open admission #71 closes.
+     */
+    allowedJoiners?: string[];
+    /**
      * Enables vault-manifest sync when provided (#32). The manifest rides the
      * same relay connection as its OWN MLS group on `manifestDocId`, established
      * by the same owner/joiner handshake as the file doc — never a shared key.
