@@ -192,7 +192,19 @@ impl MessageRouter {
             .get(&handle.user_id)
             .is_some_and(|previous| previous.conn_id() != handle.conn_id());
 
-        // ponytail: no-auth mode permits self-takeover (no identity to protect); shared-token binding + session liveness detection (ping/pong or idle-read timeout to reap dead sessions promptly) deferred until multi-tenant auth exists
+        // ponytail: this guard is defense-in-depth only — `handle_identify`
+        // returns early on a bad token, so `allow_takeover` is always true by
+        // the time it calls here and the `false` branch below is unreachable in
+        // production (only a unit test exercises it). Ceiling: RELAY_AUTH_TOKEN
+        // is one SHARED bearer token compared without reference to `user_id`, so
+        // any holder can claim and force-evict any user_id; `user_id` is
+        // otherwise self-asserted. A subscribe capability does not help — it
+        // proves group membership, not identity, and every member derives the
+        // same signing key. There is also no liveness detection (no ping/pong,
+        // no idle-read timeout, no reaper), so a half-open session lingers until
+        // TCP reaps it. Upgrade: bind user_id to a per-user credential, then
+        // reap dead sessions promptly. Revisit when the relay gains a second
+        // tenant.
         if has_stale_session && !allow_takeover {
             tracing::warn!(
                 user = %handle.user_id,
@@ -350,6 +362,8 @@ impl MessageRouter {
     /// user's subscription lifetime is tied to offline-queue retention.
     // ponytail: O(documents) scan per eviction; eviction is rare (only at
     // capacity), so a reverse user->docs index isn't worth the extra state.
+    // Upgrade: add the index if eviction stops being rare — i.e. if the relay
+    // routinely runs at DEFAULT_MAX_USERS, or if this scan shows up in a profile.
     async fn drop_subscriptions(&self, users: &[UserId]) {
         let mut subs = self.subscriptions.write().await;
         subs.retain(|_doc, members| {

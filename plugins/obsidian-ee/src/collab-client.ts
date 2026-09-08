@@ -365,6 +365,9 @@ export class CollabClient {
                 // one needs a current epoch learned out of band, and accepting
                 // one costs content delivery (the relay refuses a capability
                 // that does not match the current anchor), never confidentiality.
+                // Raise this once the client can learn the current anchor epoch
+                // from somewhere an attacker cannot roll back, which today needs
+                // a protocol message that does not exist.
                 slot.setDoc(
                     WasmEncryptedDocument.restore_encrypted(slot.docId, blob, snapshotKey, 0n)
                 );
@@ -455,7 +458,10 @@ export class CollabClient {
             // ponytail: the boolean is deliberately not checked. `send` returns
             // false only when it QUEUED the frame for the next flush, which is
             // not a failure — tearing the group down there would strand a frame
-            // that is still going to be sent.
+            // that is still going to be sent. Upgrade when a permanently
+            // content-blind session is reported in practice, or whenever
+            // `ServerMessage::Error` gains a doc_id for another reason — that
+            // field is the prerequisite and is cheap to ride along.
             //
             // The residual it cannot cover: `ws.send` returns, the frame is lost
             // at TCP level, and the relay never stores the anchor. Before #93 a
@@ -573,6 +579,8 @@ export class CollabClient {
      * machine is deliberately NOT built here (YAGNI); the join deadline
      * (`armJoinTimer`) is the cheap recovery — it empties the slot, which puts it
      * back in the filter below so the next connect re-sends a fresh key package.
+     * Upgrade when joiners drop mid-handshake often enough that waiting out the
+     * join deadline is visibly slow.
      */
     private establishGroup(): void {
         // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
@@ -1082,7 +1090,10 @@ export class CollabClient {
      * are indistinguishable from here and this is the one that fails closed.
      * Re-issuing a Welcome for the existing leaf would fix it properly, but the
      * joiner already freed the key package that leaf's private key came from, so
-     * it needs an owner-side re-invite protocol that does not exist yet.
+     * it needs an owner-side re-invite protocol that does not exist yet. Upgrade
+     * when retaining the key package private key across a failed join is cheaper
+     * than the manual remove/re-add — i.e. once users hit the stuck state often
+     * enough to report it.
      *
      * Fails closed on every uncertainty — no list, an empty list, an unlisted
      * name, an identity already admitted, or bytes that will not parse as a key
@@ -1093,8 +1104,11 @@ export class CollabClient {
      * self-asserted, so knowing an allowlisted name is sufficient — this stops
      * the stranger who knows only the doc id, not one who also knows who was
      * invited. Pinning the key package's signature public key is the upgrade
-     * path and needs an out-of-band exchange the plugin does not have yet; see
-     * the admission section of docs/security.md.
+     * path, and the out-of-band channel for it already exists — joiner ids are
+     * exchanged manually today to populate the allowlist (see the admission
+     * section of docs/security.md) — so the upgrade is to exchange a key-package
+     * fingerprint alongside the id and pin it here. Upgrade when an allowlisted
+     * name being guessable by a third party is worth the extra setup step.
      */
     private admits(doc: WasmEncryptedDocument, keyPackage: Uint8Array, docId: string): boolean {
         const allowed = this.allowedJoiners;

@@ -105,11 +105,13 @@ impl OfflineQueue {
 
     /// Default aggregate payload byte budget: 128 MiB.
     ///
-    /// Sized to comfortably hold a realistic burst — e.g. 128 users each
-    /// receiving a 1 MiB `MAX_MESSAGE_SIZE` frame while briefly offline — yet
-    /// four orders of magnitude below the ~1 TiB the count caps alone would
-    /// permit, so a single relay process cannot be driven to OOM by retained
-    /// offline messages.
+    /// Sized to comfortably hold a realistic burst — several hundred briefly-
+    /// offline users each holding a max-size frame — yet orders of magnitude
+    /// below what the count caps alone would permit, so a single relay process
+    /// cannot be driven to OOM by retained offline messages. Note the budget
+    /// charges DECODED `payload.len()`, not the wire size: frames are JSON text
+    /// and a `Vec<u8>` payload serializes as a number array, so a 1 MiB
+    /// `MAX_MESSAGE_SIZE` frame carries only ~300 KiB of payload.
     pub const DEFAULT_MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
     /// Create a new offline queue with default settings.
@@ -169,12 +171,27 @@ impl OfflineQueue {
         // globally would mean evicting whole *other* users (there is no
         // cross-user message ordering to drop from), destroying innocent peers'
         // queued data and subscriptions on an attacker's oversized burst.
-        // Refusing the single breaching message is surgical and O(1); the
-        // refused update is simply resynced by this user on reconnect, exactly
-        // as the per-user count cap already tolerates loss under pressure.
-        // ponytail: global byte cap only; a per-user byte cap is unneeded
-        // because the per-user *count* cap already bounds a single user — add
-        // one only if 1000 messages/user proves too large in practice.
+        // Refusing the single breaching message is surgical and O(1). It is NOT
+        // recoverable, though: the protocol carries no state-vector or sync-step
+        // message (`collab_proto::ClientMessage`/`ServerMessage`), so a dropped
+        // update is never resynced and the recipient's replica diverges — see
+        // the module docs. Loss under pressure is a correctness cost here, not
+        // just an availability one.
+        // ponytail: global byte cap only, no per-user byte cap. Ceiling: ONE
+        // recipient can hold the whole shared budget — a few hundred max-size
+        // frames fill DEFAULT_MAX_TOTAL_BYTES (each 1 MiB JSON text frame
+        // charges only ~300 KiB of decoded payload), still well under that
+        // user's 1000 count slots, and every other user's enqueue is then
+        // refused. A
+        // per-user cap would bound an HONEST heavy user but NOT an adversarial
+        // one, because puppet recipients are nearly free: a bare Subscribe with
+        // `authorized_epoch: None` needs no capability, handshake traffic is
+        // never content-gated (`Router::recipients`), and subscriptions survive
+        // disconnect — so any client that can Identify can park N offline
+        // sockpuppets and fill the budget with ungated `MlsHandshake` payloads.
+        // A cap of X just costs the attacker 128/X of them. Upgrade: per-user
+        // cap when an HONEST user is seen starving others; per-document or
+        // per-sender fair-share to close the adversarial case.
         if inner.total_bytes.saturating_add(msg_bytes) > self.max_total_bytes {
             drop(inner);
             return None;

@@ -414,9 +414,15 @@ export default class CollabPlugin extends Plugin {
      *
      * ponytail: a plain key file. Obsidian's DataAdapter cannot set file modes,
      * so unlike the CLI's 0600 this inherits the vault's permissions — anything
-     * that can read the vault can read the key. The upgrade path is Electron's
-     * `safeStorage` (OS keychain), which would bind the key to the user account;
-     * swap the body of this method and nothing else changes.
+     * that can read the vault can read the key, which is the ceiling. Electron's
+     * `safeStorage` is NOT the upgrade path: it is a main-process API and a
+     * plugin runs in the renderer, with no bridge in (a plugin cannot ship
+     * native modules, and `@electron/remote` needs host-side initialization).
+     * The path is Obsidian's own `SecretStorage` plugin API, added in v1.11.4 —
+     * today it is plaintext LocalStorage, but Obsidian's lead has publicly
+     * committed to backing it with `safeStorage`. Upgrade once that migration
+     * ships; call `SecretStorage`, never `safeStorage` directly. Swap the body
+     * of this method and nothing else changes.
      */
     private async atRestKey(): Promise<Uint8Array> {
         const adapter = this.app.vault.adapter;
@@ -530,9 +536,13 @@ export default class CollabPlugin extends Plugin {
             // build a fresh epoch-0 group whose TOFU registration the relay
             // refuses against the already-anchored document (#93 path 3).
             //
-            // ponytail: fire-and-forget, because stopSession is sync and
-            // saveData is not — onunload may exit before the write lands. Await
-            // it if surviving a hard quit matters.
+            // ponytail: fire-and-forget, because Obsidian's onunload is sync and
+            // saveData is not — onunload may exit before the write lands. That is
+            // a platform ceiling, not a shortcut: there is no awaitable unload
+            // hook. Losing the write costs one re-bootstrap on next start, not
+            // divergence. Upgrade when Obsidian gains an awaitable unload, or by
+            // moving the snapshot to a periodic autosave so the unload write is
+            // never the only one.
             // The key is resolved at session START and cached, so the snapshot
             // itself is synchronous and destroy() is not deferred behind a
             // promise. Only the WRITE is async.
