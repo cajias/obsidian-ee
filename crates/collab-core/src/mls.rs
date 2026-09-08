@@ -91,6 +91,31 @@ fn credential_identity(credential: &Credential) -> Result<String> {
         .map_err(|e| Error::Mls(format!("Credential identity is not valid UTF-8: {e:?}")))
 }
 
+/// The `user_id` a serialized key package would join a group under.
+///
+/// The package is VALIDATED before its credential is read. Validation checks the
+/// leaf node's self-signature, which binds the credential to the signature key
+/// that signed it — so the name returned is the one that would actually land in
+/// the group, not a string pasted beside someone else's key material.
+///
+/// This is the only identity an admission gate may compare against. A sender
+/// field on the inbound frame is whatever the sender typed at `Identify`; the
+/// relay is an untrusted router and does not verify it.
+///
+/// # Errors
+///
+/// Returns an error if the bytes are not a valid MLS key package, or if its
+/// credential is not a UTF-8 [`BasicCredential`].
+pub fn key_package_identity(key_package_bytes: &[u8]) -> Result<String> {
+    let crypto = OpenMlsRustCrypto::default();
+    let key_package_in = KeyPackageIn::tls_deserialize_exact(key_package_bytes)
+        .map_err(|e| Error::Mls(format!("Failed to deserialize key package: {e:?}")))?;
+    let key_package = key_package_in
+        .validate(crypto.crypto(), ProtocolVersion::Mls10)
+        .map_err(|e| Error::Mls(format!("Failed to validate key package: {e:?}")))?;
+    credential_identity(key_package.leaf_node().credential())
+}
+
 /// A pending member waiting to join a group.
 ///
 /// This struct holds the crypto state needed to process a welcome message.
@@ -428,6 +453,23 @@ impl MlsDocumentGroup {
         Ok(members.into_iter().find(|(id, _)| id == user_id).map(|(_, index)| index))
     }
 
+    /// Whether a current member's credential identity is `user_id`.
+    ///
+    /// The owner's admission gate reads this before adding a leaf (issue #71).
+    /// MLS puts NO uniqueness constraint on credential identities, so adding the
+    /// same identity twice succeeds and leaves two leaves — and
+    /// [`Self::remove_member`] resolves exactly one of them via
+    /// [`Self::find_member_leaf`], so a later revocation (issue #31) would leave
+    /// the other still in the group and still decrypting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any member's credential is not a valid UTF-8
+    /// `BasicCredential`.
+    pub fn is_member(&self, user_id: &str) -> Result<bool> {
+        Ok(self.find_member_leaf(user_id)?.is_some())
+    }
+
     /// Owner-only: remove the member whose credential identity == `member_user_id`.
     ///
     /// Advances the epoch and rekeys the group, cutting the removed member off
@@ -718,6 +760,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_package_identity_reads_the_credential_the_member_would_join_under() {
+        let bob = MlsDocumentGroup::generate_key_package("bob").unwrap();
+
+        assert_eq!(key_package_identity(bob.key_package()).unwrap(), "bob");
+    }
+
+    #[test]
+    fn key_package_identity_rejects_bytes_that_are_not_a_key_package() {
+        // The gate's input is relay-supplied: garbage must surface as an error
+        // the caller can fail closed on, never a name it might admit.
+        assert!(key_package_identity(b"not a key package").is_err());
+        assert!(key_package_identity(&[]).is_err());
+    }
+
+    #[test]
+    fn key_package_identity_rejects_a_package_whose_signature_was_tampered_with() {
+        // Validation is what makes the returned name trustworthy: flipping a byte
+        // in the signed body must fail validation rather than yield an identity.
+        let bob = MlsDocumentGroup::generate_key_package("bob").unwrap();
+        let mut tampered = bob.key_package().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+
+        assert!(key_package_identity(&tampered).is_err());
+    }
+
+    #[test]
     fn test_create_group() {
         let (group, key_package) = MlsDocumentGroup::create("alice").unwrap();
 
@@ -1005,6 +1074,22 @@ mod tests {
         assert!(alice.is_owner(), "creator must be the owner");
         assert!(!bob.is_owner(), "a joiner must not be the owner");
         assert!(!carol.is_owner(), "a joiner must not be the owner");
+    }
+
+    #[test]
+    fn is_member_tracks_the_roster_the_admission_gate_reads() {
+        // The owner refuses a key package for an identity already in the group
+        // (#71), because MLS would happily add a SECOND leaf for it and
+        // remove_member resolves only one.
+        let (mut alice, bob, _carol) = three_member_group();
+        assert!(alice.is_member("alice").unwrap(), "the owner is a member");
+        assert!(alice.is_member("bob").unwrap(), "an added member is a member");
+        assert!(!alice.is_member("mallory").unwrap(), "a stranger is not a member");
+        assert!(bob.is_member("alice").unwrap(), "a joiner sees the owner in the roster");
+
+        // ...and a removal frees the name again, so a re-invite is admissible.
+        alice.remove_member("carol", DOC_A).unwrap();
+        assert!(!alice.is_member("carol").unwrap(), "a removed member is no longer a member");
     }
 
     #[test]

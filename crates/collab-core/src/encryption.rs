@@ -168,6 +168,19 @@ impl EncryptedDocument {
         self.mls.is_owner()
     }
 
+    /// Whether `user_id` is already in this document's group — the owner's
+    /// duplicate-admission check (issue #71). MLS permits two leaves to carry
+    /// the same credential identity, and [`Self::remove_member`] can only
+    /// revoke one of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a member's credential is not a valid
+    /// `BasicCredential`.
+    pub fn is_member(&self, user_id: &str) -> Result<bool> {
+        self.mls.is_member(user_id)
+    }
+
     /// Get the current MLS epoch.
     #[must_use]
     pub fn epoch(&self) -> u64 {

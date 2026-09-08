@@ -62,6 +62,9 @@ global.WebSocket = MockWebSocket;
 const MOCK_EPOCH = 3n;
 const makeMockDoc = (docId: string) => ({
     docId,
+    // The gate (#71) refuses an identity already in the group; nobody has joined
+    // these mock groups, so the roster is empty.
+    is_member: jest.fn<(userId: string) => boolean>().mockReturnValue(false),
     get_content: jest.fn<() => string>().mockReturnValue(''),
     insert: jest.fn(),
     delete: jest.fn(),
@@ -149,6 +152,9 @@ jest.unstable_mockModule('../wasm/collab_wasm', () => ({
         key_package: new Uint8Array([7, 7, 7]),
         free: jest.fn(),
     })),
+    // The gate (#71) reads the requester's identity out of the key package
+    // itself, so the mock must answer for the fixture bytes above.
+    key_package_identity: jest.fn(() => 'joiner'),
 }));
 
 const { WasmEncryptedDocument } = await import('../wasm/collab_wasm');
@@ -177,13 +183,20 @@ function makeConfig(overrides: Partial<CollabClientConfig> = {}): CollabClientCo
         userId: 'user1',
         docId: 'doc1',
         role: 'owner',
+        // The owner admits nobody it has not listed (#71); the mocked
+        // key_package_identity above answers 'joiner' for every key package.
+        allowedJoiners: ['joiner'],
         ...overrides,
     };
 }
 
+// Advances to 0 — the delay the mock socket schedules its onopen at — rather
+// than running every timer: onopen arms deadlines (the stability window, and a
+// joiner's join deadline) that runAllTimers would collapse to zero virtual
+// time, firing them before the test's first assertion.
 async function connectClient(client: CollabClient): Promise<void> {
     const promise = client.connect();
-    jest.runAllTimers();
+    jest.advanceTimersByTime(0);
     await promise;
 }
 

@@ -7,13 +7,29 @@ import { EditorSync } from './editor-sync';
 
 interface CollabPluginSettings {
     relayUrl: string;
+    /**
+     * User ids this vault admits to the MLS group of a document it hosts (#71).
+     *
+     * Empty admits nobody, which is the safe default: an owner that has not said
+     * who may join has authorized no one.
+     */
+    allowedJoiners: string[];
 }
 
 // SECURITY: Default uses ws:// for local development only.
 // Production deployments MUST use wss:// (TLS-encrypted WebSocket).
 const DEFAULT_SETTINGS: CollabPluginSettings = {
     relayUrl: 'ws://localhost:8080',
+    allowedJoiners: [],
 };
+
+/** Split the comma-separated allowlist setting into trimmed, non-empty ids. */
+function parseAllowedJoiners(raw: string): string[] {
+    return raw
+        .split(',')
+        .map((id) => id.trim())
+        .filter((id) => id.length > 0);
+}
 
 /**
  * Trust boundary for remote manifest paths (#32). The manifest is network-fed,
@@ -100,6 +116,12 @@ export default class CollabPlugin extends Plugin {
                     typeof loadedData?.relayUrl === 'string'
                         ? loadedData.relayUrl
                         : DEFAULT_SETTINGS.relayUrl,
+                // Anything that is not a list of strings on disk reads as the
+                // empty list, so a corrupt data.json fails closed rather than
+                // handing `allowedJoiners` something `includes` would mis-answer.
+                allowedJoiners: Array.isArray(loadedData?.allowedJoiners)
+                    ? loadedData.allowedJoiners.filter((id): id is string => typeof id === 'string')
+                    : [...DEFAULT_SETTINGS.allowedJoiners],
             };
             // Purge legacy fields from DISK immediately: without this rewrite the
             // old plaintext pre-MLS key would linger in data.json until the user
@@ -121,6 +143,22 @@ export default class CollabPlugin extends Plugin {
             console.error('[CollabPlugin] Failed to save settings:', error);
             new Notice('Failed to save collaboration settings');
         }
+    }
+
+    /**
+     * Persist the allowed-joiners list AND push it to a running session (#71).
+     *
+     * `CollabClient` copies the list at construction, so an edit that only
+     * touched settings left a live owner enforcing the old one. Admission is
+     * deny-by-default, so the normal first-run flow is: the joiner starts a
+     * session to learn its id and is refused, the owner pastes that id in — and
+     * that paste has to reach the client that is already running, or both sides
+     * have to stop and start before anyone can join.
+     */
+    async setAllowedJoiners(ids: string[]): Promise<void> {
+        this.settings.allowedJoiners = ids;
+        this.collabClient?.setAllowedJoiners(ids);
+        await this.saveSettings();
     }
 
     async initWasm(): Promise<void> {
@@ -206,6 +244,10 @@ export default class CollabPlugin extends Plugin {
         // Reuse the persisted id so the restored group's MLS leaf and the wire
         // identity agree; a first-ever session mints a new one.
         this.sessionUserId = saved.userId ?? `user-${Date.now()}`;
+        // Surfaced because it is the value an OWNER has to paste into its
+        // 'Allowed joiners' setting (#71): an allowlist whose entries cannot be
+        // discovered is a gate nobody can open.
+        console.log(`[CollabPlugin] This session's user id: ${this.sessionUserId}`);
 
         const config: CollabClientConfig = {
             relayUrl: this.settings.relayUrl,
@@ -217,6 +259,9 @@ export default class CollabPlugin extends Plugin {
             // the group's keys are derived by MLS, so a session fails closed until a
             // group is established (CollabClient.sendUpdate returns false, no plaintext).
             role,
+            // Who this owner will admit (#71). Ignored by a joiner, which never
+            // answers a key package.
+            allowedJoiners: this.settings.allowedJoiners,
             vaultSync: this.vaultSync,
             manifestDocId: manifest_doc_id(),
         };
@@ -550,6 +595,25 @@ class CollabSettingTab extends PluginSettingTab {
                         plugin.settings.relayUrl = value;
                         // saveSettings already handles errors internally
                         await plugin.saveSettings();
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName('Allowed joiners')
+            .setDesc(
+                'Comma-separated user ids admitted to documents you host. Leave ' +
+                    'empty to admit nobody. A joiner sees its id in the console when ' +
+                    'it starts a session; it must be exchanged out of band. This ' +
+                    'applies immediately, including to a session already running — ' +
+                    'a joiner you refused is told its request timed out and retries ' +
+                    'the next time it connects.'
+            )
+            .addText((text) =>
+                text
+                    .setPlaceholder('user-1730000000000, user-1730000000001')
+                    .setValue(plugin.settings.allowedJoiners.join(', '))
+                    .onChange(async (value) => {
+                        await plugin.setAllowedJoiners(parseAllowedJoiners(value));
                     })
             );
     }

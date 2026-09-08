@@ -137,13 +137,20 @@ class NodeWebSocket {
 const RELAY_PORT = 8083;
 const RELAY_URL = `ws://localhost:${RELAY_PORT}`;
 
-// Small helper: build a client on a given user/doc/role.
-function makeClient(userId: string, docId: string, role: CollabRole): CollabClient {
+// Small helper: build a client on a given user/doc/role. An owner admits only
+// the joiners it names (#71), so the round-trip below has to say who Bob is.
+function makeClient(
+    userId: string,
+    docId: string,
+    role: CollabRole,
+    allowedJoiners?: string[]
+): CollabClient {
     const config: CollabClientConfig = {
         relayUrl: RELAY_URL,
         userId,
         docId,
         role,
+        allowedJoiners,
     };
     return new CollabClientCtor(config);
 }
@@ -164,7 +171,7 @@ test.describe('Two User MLS Sync Integration', () => {
     });
 
     test('MLS handshake + round-trip: owner and joiner converge over the relay', async () => {
-        const owner = makeClient('alice', 'shared-doc', 'owner');
+        const owner = makeClient('alice', 'shared-doc', 'owner', ['bob']);
         const joiner = makeClient('bob', 'shared-doc', 'joiner');
 
         let bReceivedText = '';

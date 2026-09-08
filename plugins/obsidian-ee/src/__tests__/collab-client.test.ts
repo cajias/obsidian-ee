@@ -136,6 +136,9 @@ const MOCK_ROTATION: MockRotation = {
 // set_encryption_key / has_encryption_key / encode_state_encrypted here — the AES
 // CollabCore is gone; MLS derives keys from group membership.
 const makeMockDoc = () => ({
+    // The gate (#71) refuses an identity already in the group; nobody has joined
+    // these mock groups, so the roster is empty.
+    is_member: jest.fn<(userId: string) => boolean>().mockReturnValue(false),
     get_content: jest.fn<() => string>().mockReturnValue(''),
     insert: jest.fn(),
     delete: jest.fn(),
@@ -178,6 +181,9 @@ jest.unstable_mockModule('../wasm/collab_wasm', () => ({
         key_package: new Uint8Array([7, 7, 7]),
         free: jest.fn(),
     })),
+    // The gate (#71) reads the requester's identity out of the key package
+    // itself, so the mock must answer for the fixture bytes above.
+    key_package_identity: jest.fn(() => 'joiner'),
 }));
 
 const { WasmEncryptedDocument, generate_key_package } = await import('../wasm/collab_wasm');
@@ -201,9 +207,14 @@ function makeDefaultConfig(overrides: Partial<CollabClientConfig> = {}): CollabC
 // This is the standard "just get me connected" path used by the large majority
 // of tests; a handful of tests instead assert directly on the connect()
 // promise (resolves/rejects) and call connect()/runAllTimers() themselves.
+//
+// Advances to 0 — the delay MockWebSocket schedules its onopen at — rather than
+// running every timer: onopen arms deadlines (the stability window, and a
+// joiner's join deadline) that runAllTimers would collapse to zero virtual
+// time, silently firing them before the test's first assertion.
 async function connectClient(client: CollabClient): Promise<void> {
     const connectPromise = client.connect();
-    jest.runAllTimers();
+    jest.advanceTimersByTime(0);
     await connectPromise;
 }
 
@@ -576,6 +587,36 @@ describe('CollabClient', () => {
             });
         }
 
+        // Sockets that deliver their close event in a LATER tick, as a real
+        // browser does. Every other mock in this file fires onclose from inside
+        // close(), which cannot express the race an explicit disconnect() +
+        // connect() creates: the dropped socket's close lands after the
+        // replacement is already live. Returns the sockets in construction
+        // order, which is how these tests count live connections.
+        function installAsyncCloseWebSocket(openDelayMs = 0): MockWSInstance[] {
+            const sockets: MockWSInstance[] = [];
+            const Base = createMockWebSocket({
+                onConstruct: (ws) => {
+                    sockets.push(ws);
+                    setTimeout(() => {
+                        // A socket closed before it opened never opens.
+                        if (ws.readyState === 3) {
+                            return;
+                        }
+                        ws.readyState = 1;
+                        ws.onopen?.();
+                    }, openDelayMs);
+                },
+            });
+            (global as any).WebSocket = class extends Base {
+                close() {
+                    super.close();
+                    setTimeout(() => this.onclose?.(), 1);
+                }
+            };
+            return sockets;
+        }
+
         // Record the delays handleReconnect schedules. Every other setTimeout in
         // these tests is either a mock socket's 0 ms construction hop or the
         // stability window at `minStableConnectionMs`, so both are excluded by
@@ -613,8 +654,12 @@ describe('CollabClient', () => {
             }
         }
 
-        // Open the first socket without letting the stability window elapse:
-        // connectClient()'s runAllTimers would fire the stability timer too.
+        // Open the first socket without letting the stability window elapse.
+        // Unlike connectClient()'s advanceTimersByTime(0), this DRAINS every
+        // timer already queued at a later virtual time — which is how a mock's
+        // deferred close event gets delivered — while still leaving the
+        // stability window (armed during onopen, after this call started)
+        // pending.
         async function connectWithoutStability(target: CollabClient): Promise<void> {
             const connectPromise = target.connect();
             jest.runOnlyPendingTimers();
@@ -780,6 +825,116 @@ describe('CollabClient', () => {
 
                 expect(constructions()).toBeGreaterThan(2);
                 expect(testClient.getConnectionState()).toBe('connected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('the socket disconnect() dropped cannot re-arm the retry loop after connect()', async () => {
+            // disconnect() sets `stopped` and closes socket #1; connect() clears
+            // `stopped` and opens socket #2. Socket #1's close is delivered by
+            // the browser LATER, so it sails past handleReconnect's stopped
+            // check and runs the full drop path against the LIVE connection: it
+            // clears socket #2's stability window, spends a retry, and one
+            // backoff later opens a socket #3 that reassigns this.ws — orphaning
+            // #2 while the relay has already dropped #2's entry in favour of
+            // #3's identify. The client then talks on a socket the relay no
+            // longer maps to it.
+            const OriginalWebSocket = global.WebSocket;
+            const sockets = installAsyncCloseWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: 10_000 })
+            );
+
+            try {
+                await connectWithoutStability(testClient);
+                testClient.disconnect();
+                // Delivers socket #2's onopen first, then socket #1's queued
+                // close — the observed real-world order.
+                await connectWithoutStability(testClient);
+
+                // No retry armed from the dead socket...
+                expect((testClient as any).reconnectTimer).toBeNull();
+                // ...and the positive half: the live connection is intact, its
+                // stability window still running rather than cleared by a drop
+                // that belonged to a socket nobody is using.
+                expect((testClient as any).stabilityTimer).toBeTruthy();
+                expect(testClient.getConnectionState()).toBe('connected');
+                expect(sockets).toHaveLength(2);
+                expect((testClient as any).ws).toBe(sockets[1]);
+
+                // Past the first backoff delay: no third socket appears, and
+                // this.ws still points at the one the client opened.
+                await pumpReconnectLoop(4);
+                expect(sockets).toHaveLength(2);
+                expect((testClient as any).ws).toBe(sockets[1]);
+                expect(testClient.getConnectionState()).toBe('connected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('connect() on a live client replaces its socket instead of orphaning one', async () => {
+            // The idempotent-start half of the same defect: a second connect()
+            // without a disconnect() reassigns this.ws and leaves the previous
+            // socket open, unreferenced, and still registered at the relay.
+            const OriginalWebSocket = global.WebSocket;
+            const sockets = installAsyncCloseWebSocket();
+            const testClient = new CollabClient(
+                makeDefaultConfig({ minStableConnectionMs: 10_000 })
+            );
+
+            try {
+                await connectWithoutStability(testClient);
+                await connectWithoutStability(testClient);
+
+                expect(sockets).toHaveLength(2);
+                expect(sockets[0].readyState).toBe(3);
+                expect((testClient as any).ws).toBe(sockets[1]);
+
+                // The replaced socket's close must not restart the loop either.
+                expect((testClient as any).reconnectTimer).toBeNull();
+                await pumpReconnectLoop(4);
+                expect(sockets).toHaveLength(2);
+                expect(testClient.getConnectionState()).toBe('connected');
+            } finally {
+                testClient.disconnect();
+                global.WebSocket = OriginalWebSocket;
+            }
+        });
+
+        it('a superseded attempt settling late does not clear the live connectPromise', async () => {
+            // Same stale-attempt hole, one level down: connect() #1 is still
+            // CONNECTING when disconnect() closes its socket, so its promise
+            // settles only when that close is delivered — by which time
+            // connect() #2 owns connectPromise. Clearing the field from the old
+            // attempt's .finally re-opens the dedup guard mid-connect, so a
+            // concurrent connect() builds a second socket for one client.
+            const OriginalWebSocket = global.WebSocket;
+            const sockets = installAsyncCloseWebSocket(5);
+            const testClient = new CollabClient(makeDefaultConfig());
+
+            try {
+                const first = testClient.connect();
+                first.catch(() => {}); // settles as a rejection; nothing awaits it
+                testClient.disconnect();
+                const second = testClient.connect();
+
+                // Deliver socket #1's close while socket #2 is still connecting.
+                jest.advanceTimersByTime(1);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(sockets).toHaveLength(2);
+                expect((testClient as any).connectPromise).toBe(second);
+                // The dedup guard still holds, so no third socket is built.
+                expect(testClient.connect()).toBe(second);
+                expect(sockets).toHaveLength(2);
+
+                jest.advanceTimersByTime(5);
+                await expect(second).resolves.toBeUndefined();
             } finally {
                 testClient.disconnect();
                 global.WebSocket = OriginalWebSocket;
@@ -2394,5 +2549,174 @@ describe('CollabClient applyTextDiff edge cases', () => {
         // Insert ' World' at position 8
         expect(doc.delete).not.toHaveBeenCalled();
         expect(doc.insert).toHaveBeenCalledWith(8, ' World');
+    });
+});
+
+/**
+ * Bounded join handshake (#71 follow-up).
+ *
+ * The owner-side gate is deny-by-default, so a joiner the owner has not listed
+ * yet gets no Welcome — and used to get nothing else either. `bootstrapGroup`
+ * set `pending`, `establishGroup` bootstraps only slots with NEITHER a doc nor
+ * a pending, and `pending` was cleared only by a Welcome, `disconnect()` or
+ * `destroy()`. A refused joiner therefore sat on a consumed key package
+ * forever: silent to the user and inert across every automatic reconnect,
+ * indistinguishable from a dead relay.
+ *
+ * The reconnect half is the discriminating one. `disconnect()` already frees a
+ * doc-less slot (see its `filter((slot) => !slot.getDoc())`), so an explicit
+ * stop/start always re-bootstrapped; only the automatic backoff path
+ * (onclose -> handleReconnect -> connect -> onopen -> establishGroup) skipped
+ * the slot, and that is the path asserted below.
+ */
+describe('CollabClient join handshake timeout (#71 follow-up)', () => {
+    const JOIN_TIMEOUT_MS = 500;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        (generate_key_package as unknown as jest.Mock).mockClear();
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    /** Connect without draining the join/stability timers armed inside onopen. */
+    async function connectJoiner(target: CollabClient): Promise<void> {
+        const connectPromise = target.connect();
+        jest.runOnlyPendingTimers();
+        await connectPromise;
+    }
+
+    function keyPackagesOn(target: CollabClient): string[] {
+        const ws = (target as any).ws;
+        return (ws?.sentMessages ?? []).filter((m: string) => {
+            const parsed = JSON.parse(m);
+            return parsed.type === 'mls_handshake' && parsed.message_type === 'key_package';
+        });
+    }
+
+    it('frees the pending key package on timeout and re-bootstraps on the next reconnect', async () => {
+        const OriginalWebSocket = global.WebSocket;
+        installStaysOpenWebSocket();
+        const client = new CollabClient(
+            makeDefaultConfig({
+                userId: 'bob',
+                role: 'joiner',
+                joinTimeoutMs: JOIN_TIMEOUT_MS,
+            })
+        );
+        const errorCallback = jest.fn<(error: any) => void>();
+        client.onError(errorCallback);
+
+        try {
+            await connectJoiner(client);
+
+            // The key package really went out, so the timeout below is a
+            // decision about a real in-flight handshake, not a vacuum.
+            expect(keyPackagesOn(client)).toHaveLength(1);
+            const pendingHandle = (client as any).pending;
+            expect(pendingHandle).not.toBeNull();
+
+            // No Welcome ever arrives (the owner refused, or the relay dropped it).
+            jest.advanceTimersByTime(JOIN_TIMEOUT_MS);
+
+            // Assert the STATE, not that anything resolved: the slot is empty,
+            // the wasm handle was released exactly once, and the user was told.
+            expect((client as any).pending).toBeNull();
+            expect(pendingHandle.free).toHaveBeenCalledTimes(1);
+            expect(errorCallback).toHaveBeenCalledTimes(1);
+            expect(errorCallback.mock.calls[0][0].type).toBe('sync');
+            expect(errorCallback.mock.calls[0][0].docId).toBe('doc1');
+            expect(errorCallback.mock.calls[0][0].message).toContain('doc1');
+
+            // The empty slot is what lets the automatic backoff path re-send.
+            // Nothing else on this path clears `pending`.
+            (client as any).ws?.onclose?.();
+            for (let i = 0; i < 5; i++) {
+                jest.runOnlyPendingTimers();
+                await Promise.resolve();
+                await Promise.resolve();
+            }
+
+            expect(client.getConnectionState()).toBe('connected');
+            expect(generate_key_package as unknown as jest.Mock).toHaveBeenCalledTimes(2);
+            expect(keyPackagesOn(client)).toHaveLength(1); // on the NEW socket
+        } finally {
+            client.destroy();
+            global.WebSocket = OriginalWebSocket;
+        }
+    });
+
+    it('destroy() before the timeout leaves no timer behind and reports nothing', async () => {
+        // CLAUDE.md: a timer must not outlive its owner, and must never touch a
+        // freed wasm handle. destroy() frees the pending, so a surviving timer
+        // would fire against a dead handle on a destroyed client.
+        const OriginalWebSocket = global.WebSocket;
+        installStaysOpenWebSocket();
+        const client = new CollabClient(
+            makeDefaultConfig({
+                userId: 'bob',
+                role: 'joiner',
+                joinTimeoutMs: JOIN_TIMEOUT_MS,
+            })
+        );
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        try {
+            await connectJoiner(client);
+            expect(keyPackagesOn(client)).toHaveLength(1);
+
+            client.destroy();
+
+            // The invariant itself: nothing is left scheduled at all.
+            expect(jest.getTimerCount()).toBe(0);
+
+            jest.advanceTimersByTime(JOIN_TIMEOUT_MS * 4);
+            expect(errorCallback).not.toHaveBeenCalled();
+            expect((client as any).pending).toBeNull();
+        } finally {
+            global.WebSocket = OriginalWebSocket;
+        }
+    });
+
+    it('a Welcome that arrives in time cancels the timeout', async () => {
+        const OriginalWebSocket = global.WebSocket;
+        installStaysOpenWebSocket();
+        const client = new CollabClient(
+            makeDefaultConfig({
+                userId: 'bob',
+                role: 'joiner',
+                joinTimeoutMs: JOIN_TIMEOUT_MS,
+            })
+        );
+        const errorCallback = jest.fn();
+        client.onError(errorCallback);
+
+        try {
+            await connectJoiner(client);
+            (client as any).ws?.onmessage?.({
+                data: JSON.stringify({
+                    type: 'mls_handshake',
+                    message_type: 'welcome',
+                    doc_id: 'doc1',
+                    payload: [1, 2],
+                }),
+            });
+            const joinedDoc = (client as any).doc;
+            expect(joinedDoc).not.toBeNull();
+
+            jest.advanceTimersByTime(JOIN_TIMEOUT_MS * 4);
+
+            // A joined member must not be told its join timed out, and its group
+            // must survive the window it was armed for.
+            expect(errorCallback).not.toHaveBeenCalled();
+            expect((client as any).doc).toBe(joinedDoc);
+            expect(joinedDoc.free).not.toHaveBeenCalled();
+        } finally {
+            client.destroy();
+            global.WebSocket = OriginalWebSocket;
+        }
     });
 });

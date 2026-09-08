@@ -23,7 +23,7 @@ pub use connection::{
 };
 pub use document::CollabDocument;
 pub use encryption::{EncryptedDocument, EncryptedOp, Invite};
-pub use mls::{AnchorRotation, MlsDocumentGroup, PendingMember};
+pub use mls::{key_package_identity, AnchorRotation, MlsDocumentGroup, PendingMember};
 pub use registry::{
     DocumentEntry, DocumentRegistry, DocumentVariant, EncryptionMetadata, RegistryError,
 };

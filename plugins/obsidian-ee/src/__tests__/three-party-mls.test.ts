@@ -56,8 +56,19 @@ describe('three-party MLS: the add-commit reaches existing members', () => {
         updates: string[];
     }
 
-    function makeClient(userId: string, role: 'owner' | 'joiner'): TestClient {
-        const config: CollabClientConfig = { relayUrl: RELAY_URL, userId, docId: FILE_DOC, role };
+    function makeClient(
+        userId: string,
+        role: 'owner' | 'joiner',
+        allowedJoiners?: string[]
+    ): TestClient {
+        // The owner admits only the joiners it names (#71); both of these are invited.
+        const config: CollabClientConfig = {
+            relayUrl: RELAY_URL,
+            userId,
+            docId: FILE_DOC,
+            role,
+            allowedJoiners,
+        };
         const client = new CollabClient(config);
         const errors: CollabError[] = [];
         const updates: string[] = [];
@@ -75,7 +86,7 @@ describe('three-party MLS: the add-commit reaches existing members', () => {
     async function connectedTrio(
         tag: string
     ): Promise<{ alice: TestClient; bob: TestClient; carol: TestClient }> {
-        const alice = makeClient(`alice-${tag}`, 'owner');
+        const alice = makeClient(`alice-${tag}`, 'owner', [`bob-${tag}`, `carol-${tag}`]);
         const bob = makeClient(`bob-${tag}`, 'joiner');
         const carol = makeClient(`carol-${tag}`, 'joiner');
         await alice.client.connect();

@@ -89,6 +89,13 @@ export class RecordingMockRelay {
     private clients: Map<string, WebSocket> = new Map();
     frames: RecordedFrame[] = [];
 
+    /**
+     * Frames matching this are still RECORDED (the sender did send them) but are
+     * NOT fanned out — the lost-in-transit case a relay blip or a disconnect
+     * between the commit and the Welcome produces. Null fans everything out.
+     */
+    withhold: ((msg: any) => boolean) | null = null;
+
     async start(port: number): Promise<void> {
         return new Promise((resolve, reject) => {
             this.wss = new WebSocketServer({ port });
@@ -105,6 +112,9 @@ export class RecordingMockRelay {
                         if (msg.type === 'subscribe') {
                             ws.send(JSON.stringify({ type: 'subscribed', doc_id: msg.doc_id }));
                         } else if (msg.type === 'yrs_update' || msg.type === 'mls_handshake') {
+                            if (this.withhold?.(msg)) {
+                                return;
+                            }
                             this.clients.forEach((client, id) => {
                                 if (id !== clientId && client.readyState === WebSocket.OPEN) {
                                     client.send(JSON.stringify({ ...msg, from: clientId }));

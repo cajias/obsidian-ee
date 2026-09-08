@@ -32,6 +32,18 @@ pub fn generate_key_package(user_id: &str) -> Result<WasmPendingMember, JsError>
     MlsDocumentGroup::generate_key_package(user_id).map(WasmPendingMember).map_err(js_err)
 }
 
+/// The `user_id` an inbound key package would join the group under, read from
+/// the package's own MLS credential after validation (issue #71).
+///
+/// An owner's admission gate must compare THIS against its allowlist. The
+/// relay stamps a sender field on every fanned-out frame, but that is whatever
+/// the sender typed at `Identify` on an untrusted router — a gate reading it
+/// admits anyone willing to claim an allowlisted name.
+#[wasm_bindgen]
+pub fn key_package_identity(key_package: &[u8]) -> Result<String, JsError> {
+    collab_core::key_package_identity(key_package).map_err(js_err)
+}
+
 /// The `RegisterDocKey` payload that moves the relay's subscribe anchor to the
 /// epoch a commit just created (issue #29). Send all four fields verbatim.
 #[wasm_bindgen]
@@ -186,6 +198,14 @@ impl WasmEncryptedDocument {
     /// True iff this client created the document's group (is the owner).
     pub fn is_owner(&self) -> bool {
         self.0.is_owner()
+    }
+
+    /// True iff `user_id` is already a member of this document's group — the
+    /// owner's duplicate-admission check (issue #71). MLS does not require
+    /// credential identities to be unique, so admitting one twice leaves two
+    /// leaves and `remove_member` can revoke only one of them.
+    pub fn is_member(&self, user_id: &str) -> Result<bool, JsError> {
+        self.0.is_member(user_id).map_err(js_err)
     }
 
     pub fn insert(&mut self, index: u32, text: &str) {
