@@ -145,6 +145,22 @@ export default class CollabPlugin extends Plugin {
         }
     }
 
+    /**
+     * Persist the allowed-joiners list AND push it to a running session (#71).
+     *
+     * `CollabClient` copies the list at construction, so an edit that only
+     * touched settings left a live owner enforcing the old one. Admission is
+     * deny-by-default, so the normal first-run flow is: the joiner starts a
+     * session to learn its id and is refused, the owner pastes that id in — and
+     * that paste has to reach the client that is already running, or both sides
+     * have to stop and start before anyone can join.
+     */
+    async setAllowedJoiners(ids: string[]): Promise<void> {
+        this.settings.allowedJoiners = ids;
+        this.collabClient?.setAllowedJoiners(ids);
+        await this.saveSettings();
+    }
+
     async initWasm(): Promise<void> {
         if (this.wasmInitialized) {
             return;
@@ -587,18 +603,17 @@ class CollabSettingTab extends PluginSettingTab {
             .setDesc(
                 'Comma-separated user ids admitted to documents you host. Leave ' +
                     'empty to admit nobody. A joiner sees its id in the console when ' +
-                    'it starts a session; it must be exchanged out of band. Like the ' +
-                    'relay URL, this applies to the NEXT session — after editing it, ' +
-                    'restart your session, and the joiner must restart theirs too ' +
-                    '(a refused joiner does not retry on its own).'
+                    'it starts a session; it must be exchanged out of band. This ' +
+                    'applies immediately, including to a session already running — ' +
+                    'a joiner you refused is told its request timed out and retries ' +
+                    'the next time it connects.'
             )
             .addText((text) =>
                 text
                     .setPlaceholder('user-1730000000000, user-1730000000001')
                     .setValue(plugin.settings.allowedJoiners.join(', '))
                     .onChange(async (value) => {
-                        plugin.settings.allowedJoiners = parseAllowedJoiners(value);
-                        await plugin.saveSettings();
+                        await plugin.setAllowedJoiners(parseAllowedJoiners(value));
                     })
             );
     }

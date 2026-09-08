@@ -37,6 +37,12 @@ const DEFAULT_MIN_STABLE_CONNECTION_MS = 10000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 5;
 
+// How long a joiner waits for the Welcome answering its key package (#71).
+// Deny-by-default admission means "no answer" is the NORMAL outcome for a
+// requester the owner has not listed yet, so the wait has to be bounded or that
+// joiner sits on a consumed key package forever, silent and un-retryable.
+const DEFAULT_JOIN_TIMEOUT_MS = 10000;
+
 /**
  * Narrow view of WasmVaultSync (#32): the client only needs to apply remote
  * manifest updates; local file-event handling stays with the plugin.
@@ -58,11 +64,10 @@ export interface CollabClientConfig {
      * join has authorized no one, and an unset list must not read as "admit
      * everyone" — that is the open admission #71 closes.
      *
-     * A snapshot, like every other field here: editing the plugin setting does
-     * not reach a running session. And a refused joiner is fail-closed but
-     * inert — `establishGroup` skips a slot that still holds a pending key
-     * package, so it does not re-send even across a reconnect. Both sides
-     * restart their session after an id is added to the list.
+     * The INITIAL list only: `setAllowedJoiners` replaces it on a running
+     * client, so pasting an id into the plugin setting takes effect without
+     * restarting the owner's session. A joiner refused before that gives up on
+     * its attempt after `joinTimeoutMs` and re-sends on its next connect.
      */
     allowedJoiners?: string[];
     /**
@@ -93,6 +98,11 @@ export interface CollabClientConfig {
      * `DEFAULT_MAX_RECONNECT_ATTEMPTS`; 0 gives up on the first drop.
      */
     maxReconnectAttempts?: number;
+    /**
+     * How long a joiner waits for the Welcome that answers its key package
+     * before giving up on THAT attempt. Defaults to `DEFAULT_JOIN_TIMEOUT_MS`.
+     */
+    joinTimeoutMs?: number;
     /**
      * MLS group state saved by a previous session, keyed by document id (#93).
      *
@@ -281,6 +291,14 @@ export class CollabClient {
     // group — this flag does.
     private destroyed = false;
     private config: CollabClientConfig;
+    // The live admission list (#71), NOT read from config: an owner edits it
+    // mid-session via setAllowedJoiners, and config is a construction-time
+    // snapshot. Owned by this client — never the caller's array.
+    private allowedJoiners: string[];
+    // Per-slot join-handshake deadlines, keyed by document id (a slot's docId is
+    // its identity; validateVaultSyncConfig keeps the two distinct). A timer
+    // exists only while that slot holds an un-answered key package.
+    private readonly joinTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private onUpdateCallback: UpdateCallback | null = null;
     private onManifestPathsCallback: ManifestPathsCallback | null = null;
     private onDisconnectCallback: DisconnectCallback | null = null;
@@ -299,10 +317,16 @@ export class CollabClient {
     private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
     private isInitialConnect = true;
     private connectPromise: Promise<void> | null = null;
+    // Bumped by every connect() attempt. A socket's close/error events can land
+    // AFTER the attempt that replaced it started (browsers deliver `close`
+    // asynchronously), and such a superseded attempt must not write shared
+    // state — see the guards in connect().
+    private connectGeneration = 0;
 
     constructor(config: CollabClientConfig) {
         validateConfig(config);
         this.config = config;
+        this.allowedJoiners = [...(config.allowedJoiners ?? [])];
         this.restoreSlots();
     }
 
@@ -457,6 +481,77 @@ export class CollabClient {
             payload: [...pending.key_package],
             message_type: 'key_package',
         });
+        // The request is on the wire (or queued for the next flush), so start
+        // its clock. Deny-by-default admission (#71) means silence is the
+        // expected answer for an unlisted requester, and without a deadline this
+        // slot keeps a pending forever and establishGroup never re-bootstraps it.
+        this.armJoinTimer(slot);
+    }
+
+    /**
+     * Bound the wait for the Welcome answering `slot`'s key package (#71).
+     *
+     * The timer is owned by the slot, not the socket: it is cleared when the
+     * Welcome lands and by `freeSlot` — which `disconnect()`, `destroy()` and
+     * `establishGroup`'s per-slot undo all route through — so it can never fire
+     * against a freed handle or a stopped client. A socket DROP deliberately
+     * does not clear it: the mid-handshake-drop case fails closed and stays
+     * pending, and this deadline is what eventually releases it too.
+     */
+    private armJoinTimer(slot: GroupSlot): void {
+        this.clearJoinTimer(slot.docId);
+        this.joinTimers.set(
+            slot.docId,
+            setTimeout(() => {
+                this.joinTimers.delete(slot.docId);
+                this.expireJoin(slot);
+            }, this.config.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS)
+        );
+    }
+
+    private clearJoinTimer(docId: string): void {
+        const timer = this.joinTimers.get(docId);
+        if (timer) {
+            clearTimeout(timer);
+            this.joinTimers.delete(docId);
+        }
+    }
+
+    /**
+     * Give up on this slot's un-answered key package.
+     *
+     * Releases the wasm handle and empties the slot IN LOCKSTEP (freeSlot does
+     * both, so nothing can observe a slot pointing at a dead handle), then tells
+     * the user which document went unanswered — a refusal that produced no
+     * Welcome and no error is indistinguishable from a dead relay.
+     *
+     * Emptying the slot is also the recovery: `establishGroup` bootstraps
+     * exactly the slots with neither a doc nor a pending, so the next connect —
+     * including an automatic reconnect, which never calls `freeSlot` — sends a
+     * fresh key package. This does NOT re-send on the live connection; a joiner
+     * refused while the owner is still deciding retries on its next connect.
+     */
+    private expireJoin(slot: GroupSlot): void {
+        // A Welcome that landed in the same tick, or a teardown, already cleared
+        // this. Never free twice, never report a join that actually completed.
+        if (!slot.getPending() || slot.getDoc()) {
+            return;
+        }
+        this.freeSlot(slot);
+        this.reportError(
+            'sync',
+            'Join request timed out:',
+            new Error(
+                `no Welcome for ${slot.docId} within ` +
+                    `${this.config.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS}ms. ` +
+                    'The owner may not have added this user id to its allowed ' +
+                    'joiners, may be offline, or may already hold a stale ' +
+                    'membership for it that has to be removed first — all three ' +
+                    'look identical from here.'
+            ),
+            '',
+            slot.docId
+        );
     }
 
     /**
@@ -475,7 +570,9 @@ export class CollabClient {
      * ponytail: first-cut behavior — a joiner whose socket drops mid-handshake
      * (before the Welcome) stays un-joined and fails closed (no plaintext), which
      * is strictly better than a divergent group. A mid-handshake resume state
-     * machine is deliberately NOT built here (YAGNI).
+     * machine is deliberately NOT built here (YAGNI); the join deadline
+     * (`armJoinTimer`) is the cheap recovery — it empties the slot, which puts it
+     * back in the filter below so the next connect re-sends a fresh key package.
      */
     private establishGroup(): void {
         // Vault sync (#32): the manifest is a SEPARATE MLS group on manifestDocId,
@@ -607,6 +704,15 @@ export class CollabClient {
         // it gets here, so this cannot revive a stopped client.
         this.stopped = false;
         this.connectionState = 'connecting';
+        // Supersede the previous attempt BEFORE closing its socket: close()
+        // delivers onclose synchronously in some environments (and in the test
+        // mocks), so a socket closed before the bump would still read itself as
+        // current and re-arm the retry loop against this attempt.
+        const generation = ++this.connectGeneration;
+        // Idempotent restart: a connect() on a client that never disconnected
+        // would otherwise strand the previous socket, still open and still
+        // registered at the relay, with nothing holding a reference to it.
+        this.ws?.close();
         this.connectPromise = new Promise<void>((resolve, reject) => {
             // Per-attempt flag: has THIS socket reached onopen yet? Every attempt
             // (initial or reconnect) must settle its promise exactly once, so that
@@ -653,8 +759,10 @@ export class CollabClient {
                         // onclose, which follows onerror, to drive the backoff loop).
                         console.error('WebSocket error:', error);
                         reject(error);
-                    } else {
+                    } else if (generation === this.connectGeneration) {
                         // Post-open error on a live connection: surface via error callback.
+                        // A superseded socket is not the user's connection any
+                        // more, so its late errors are not reported as one.
                         this.reportError(
                             'connection',
                             'WebSocket error:',
@@ -671,6 +779,12 @@ export class CollabClient {
                         // dedup guard is unblocked, then delegate to the backoff scheduler.
                         // Settling does NOT abort the retry chain — handleReconnect() runs
                         // on its own timer independent of this promise.
+                        //
+                        // Settled unconditionally, BEFORE the generation guard
+                        // below: a superseded attempt still has a caller
+                        // awaiting it, and connect-settles-exactly-once is what
+                        // keeps the dedup guard from returning a promise that
+                        // never resolves.
                         reject(
                             new Error(
                                 this.isInitialConnect
@@ -678,10 +792,26 @@ export class CollabClient {
                                     : 'WebSocket closed during reconnection'
                             )
                         );
-                        if (!this.isInitialConnect) {
-                            this.handleReconnect();
-                        }
-                    } else {
+                    }
+                    // A socket this client has already replaced must never drive
+                    // the retry loop. disconnect() closes socket #1 and connect()
+                    // clears `stopped`, so #1's late close would otherwise pass
+                    // handleReconnect's stopped check: it clears the LIVE
+                    // connection's stability window, spends a retry, and one
+                    // backoff later opens a third socket that orphans the live
+                    // one — the relay drops the old entry on the new identify,
+                    // leaving the client talking on a socket it no longer maps.
+                    //
+                    // Generation, NOT `this.ws === socket`: failConnect() nulls
+                    // this.ws before the browser delivers close, so an identity
+                    // check would also swallow the retry after an onopen
+                    // initialization failure, ending the backoff chain silently.
+                    // The mocks fire onclose synchronously from close(), so that
+                    // regression would not show up in this suite.
+                    if (generation !== this.connectGeneration) {
+                        return;
+                    }
+                    if (hasOpened || !this.isInitialConnect) {
                         this.handleReconnect();
                     }
                 };
@@ -689,8 +819,15 @@ export class CollabClient {
                 reject(error);
             }
         }).finally(() => {
-            // Clear promise tracking on completion (success or failure)
-            this.connectPromise = null;
+            // Clear promise tracking on completion (success or failure) — but
+            // only while this attempt still owns the field. A superseded attempt
+            // settles LATE (its socket's close arrives after the replacement
+            // connect()), and clearing unconditionally would null out a NEWER
+            // attempt's promise mid-flight, re-opening the dedup guard so a
+            // concurrent connect() builds a second socket.
+            if (generation === this.connectGeneration) {
+                this.connectPromise = null;
+            }
         });
 
         return this.connectPromise;
@@ -932,9 +1069,25 @@ export class CollabClient {
      * the sender typed at `identify` on an untrusted router, so a gate reading
      * it would admit anyone willing to claim an allowlisted name.
      *
+     * An identity ALREADY in the group is refused too. MLS puts no uniqueness
+     * constraint on credential identities, so a second admission for one adds a
+     * SECOND leaf — reachable whenever a Welcome is lost in transit, because the
+     * join deadline then frees the joiner's key package and its next connect
+     * re-sends. `remove_member` resolves exactly one leaf per identity
+     * (crates/collab-core/src/mls.rs, `find_member_leaf`), so the duplicate
+     * would survive a revocation (#31) and keep decrypting.
+     *
+     * ponytail: a joiner whose Welcome genuinely went missing is now stuck until
+     * the owner removes it and re-adds it — deliberately, because the two cases
+     * are indistinguishable from here and this is the one that fails closed.
+     * Re-issuing a Welcome for the existing leaf would fix it properly, but the
+     * joiner already freed the key package that leaf's private key came from, so
+     * it needs an owner-side re-invite protocol that does not exist yet.
+     *
      * Fails closed on every uncertainty — no list, an empty list, an unlisted
-     * name, or bytes that will not parse as a key package. Living in the shared
-     * handshake means the manifest group (#32) is gated by the same list.
+     * name, an identity already admitted, or bytes that will not parse as a key
+     * package. Living in the shared handshake means the manifest group (#32) is
+     * gated by the same list.
      *
      * ponytail: names, not public keys. A BasicCredential identity is
      * self-asserted, so knowing an allowlisted name is sufficient — this stops
@@ -943,17 +1096,19 @@ export class CollabClient {
      * path and needs an out-of-band exchange the plugin does not have yet; see
      * the admission section of docs/security.md.
      */
-    private admits(keyPackage: Uint8Array, docId: string): boolean {
-        const allowed = this.config.allowedJoiners;
-        if (!allowed?.length) {
+    private admits(doc: WasmEncryptedDocument, keyPackage: Uint8Array, docId: string): boolean {
+        const allowed = this.allowedJoiners;
+        if (!allowed.length) {
             console.warn(
                 `[CollabClient] Refusing to admit a member to ${docId}: no allowedJoiners configured`
             );
             return false;
         }
         let requester: string;
+        let alreadyMember: boolean;
         try {
             requester = key_package_identity(keyPackage);
+            alreadyMember = doc.is_member(requester);
         } catch (error) {
             console.warn(`[CollabClient] Refusing an unreadable key package on ${docId}:`, error);
             return false;
@@ -961,6 +1116,13 @@ export class CollabClient {
         if (!allowed.includes(requester)) {
             console.warn(
                 `[CollabClient] Refusing to admit ${requester} to ${docId}: not in allowedJoiners`
+            );
+            return false;
+        }
+        if (alreadyMember) {
+            console.warn(
+                `[CollabClient] Refusing to admit ${requester} to ${docId} twice: already a ` +
+                    'member. Remove the member before re-admitting it.'
             );
             return false;
         }
@@ -987,7 +1149,7 @@ export class CollabClient {
                 // The admission gate (#71) runs BEFORE create_invite, which
                 // commits the group to a new epoch: a refusal has to leave the
                 // group exactly where it was, and there is no un-commit.
-                if (!this.admits(payload, slot.docId)) {
+                if (!this.admits(doc, payload, slot.docId)) {
                     return;
                 }
                 const invite = doc.create_invite(payload);
@@ -1051,6 +1213,10 @@ export class CollabClient {
                 // socket-drops-mid-handshake case: un-joined, no plaintext, a fresh
                 // session is required to retry.
                 slot.setPending(null);
+                // Beside setPending, not after join(): a Welcome that throws
+                // still consumed the handle, and a timer left armed would then
+                // fire on a slot whose pending is already gone.
+                this.clearJoinTimer(slot.docId);
                 slot.setDoc(WasmEncryptedDocument.join(invite, pending));
                 // A member only now, so able to mint only now: re-subscribing with
                 // a capability upgrades this connection from handshake-only to
@@ -1200,6 +1366,18 @@ export class CollabClient {
 
     onManifestPaths(callback: ManifestPathsCallback): void {
         this.onManifestPathsCallback = callback;
+    }
+
+    /**
+     * Replace the ids this owner admits (#71), effective immediately.
+     *
+     * The plugin's setting is edited while a session runs, and an allowlist that
+     * only applies to the NEXT session makes the first-run flow a stop/start
+     * ritual on both sides. Copied, not retained: a later mutation of the
+     * caller's array must not widen the gate behind this client's back.
+     */
+    setAllowedJoiners(ids: string[]): void {
+        this.allowedJoiners = [...ids];
     }
 
     /**
@@ -1383,6 +1561,9 @@ export class CollabClient {
      * pending handle by value, so freeing it here too would double-free.
      */
     private freeSlot(slot: GroupSlot): void {
+        // First: the deadline exists only to release the pending this frees, and
+        // a timer outliving destroy() would fire against a dead handle.
+        this.clearJoinTimer(slot.docId);
         slot.getDoc()?.free();
         slot.setDoc(null);
         slot.getPending()?.free();

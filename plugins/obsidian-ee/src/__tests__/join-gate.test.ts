@@ -52,6 +52,16 @@ function groupOf(client: CollabClient): { epoch: bigint } | null {
     return (client as unknown as { doc: { epoch: bigint } | null }).doc;
 }
 
+/**
+ * The un-answered key package a joiner is still holding, or null when it holds
+ * none. Same reasoning as `groupOf`: `pending` is an internal detail everywhere
+ * except here, where "did the refused joiner let go of its key package?" IS the
+ * thing under test.
+ */
+function pendingOf(client: CollabClient): object | null {
+    return (client as unknown as { pending: object | null }).pending;
+}
+
 describe('owner-side join gate (#71)', () => {
     let relay: RecordingMockRelay;
     const live: TestClient[] = [];
@@ -68,13 +78,19 @@ describe('owner-side join gate (#71)', () => {
             );
     }
 
-    function makeClient(userId: string, role: 'owner' | 'joiner', allowedJoiners?: string[]) {
+    function makeClient(
+        userId: string,
+        role: 'owner' | 'joiner',
+        allowedJoiners?: string[],
+        overrides: Partial<CollabClientConfig> = {}
+    ) {
         const config: CollabClientConfig = {
             relayUrl: RELAY_URL,
             userId,
             docId: FILE_DOC,
             role,
             allowedJoiners,
+            ...overrides,
         };
         const entry: TestClient = {
             userId,
@@ -105,6 +121,9 @@ describe('owner-side join gate (#71)', () => {
         // destroy(), not disconnect(): these clients hold REAL wasm groups, which
         // disconnect() deliberately keeps alive for a resume.
         live.splice(0).forEach((t) => t.client.destroy());
+        // The relay outlives every test in this file; a withhold left armed
+        // would silently break the next one.
+        relay.withhold = null;
         await wait(50);
     });
 
@@ -171,6 +190,151 @@ describe('owner-side join gate (#71)', () => {
         await wait(300);
         expect(bob.updates).toContain(secret);
         expect(bob.errors).toEqual([]);
+    });
+
+    it('an owner that adds an id mid-session admits the joiner it just refused', async () => {
+        // The first-run flow, end to end, against the REAL wasm: a joiner must
+        // start a session to learn its id, that attempt is refused, the owner
+        // pastes the id in, and the joiner retries. Before this the owner's list
+        // was a snapshot captured at construction and the refused joiner never
+        // let go of its key package, so BOTH sides had to restart.
+        const JOIN_TIMEOUT_MS = 150;
+        const alice = makeClient('alice-live', 'owner', []);
+        const bob = makeClient('bob-live', 'joiner', undefined, {
+            joinTimeoutMs: JOIN_TIMEOUT_MS,
+        });
+
+        await alice.client.connect();
+        await wait(50);
+        await bob.client.connect();
+        await wait(400);
+
+        // Refused, as the gate requires — and the request really arrived.
+        expect(handshakesFrom('bob-live', 'key_package')).toHaveLength(1);
+        expect(handshakesFrom('alice-live', 'welcome')).toHaveLength(0);
+        // ...and the refusal is now VISIBLE and recoverable: the timeout freed
+        // the un-answered key package and told the user.
+        expect(pendingOf(bob.client)).toBeNull();
+        expect(bob.errors.map((e) => e.type)).toEqual(['sync']);
+        expect(bob.errors[0].message).toContain(FILE_DOC);
+
+        // The owner pastes bob's id in. No restart, no new client.
+        alice.client.setAllowedJoiners(['bob-live']);
+
+        // Bob retries; the emptied slot is what lets establishGroup re-bootstrap.
+        bob.client.disconnect();
+        await bob.client.connect();
+        await wait(500);
+
+        expect(handshakesFrom('bob-live', 'key_package')).toHaveLength(2);
+        expect(handshakesFrom('alice-live', 'welcome')).toHaveLength(1);
+        expect(groupOf(bob.client)).not.toBeNull();
+
+        // Membership, not just a Welcome frame: bob decrypts alice's content.
+        const secret = 'readable once the owner said yes, without restarting';
+        expect(alice.client.sendUpdate(secret)).toBe(true);
+        await wait(300);
+        expect(bob.updates).toContain(secret);
+        expect(groupOf(alice.client)?.epoch).toBe(1n);
+    });
+
+    it('admits an identity ONCE, even when its Welcome is lost and it retries', async () => {
+        // The join deadline lets a joiner whose key package went unanswered free
+        // it and re-send on its next connect. That retry makes DOUBLE admission
+        // reachable: if the Welcome is lost in transit the owner has ALREADY
+        // added a leaf for that identity, and answering the retry adds a second
+        // one. MLS puts no uniqueness constraint on credential identities, so
+        // both leaves carry "bob" — and `remove_member` resolves exactly ONE per
+        // identity (crates/collab-core/src/mls.rs, `find_member_leaf`), so a
+        // later revocation (#31) would leave the other one in the group, still
+        // decrypting. The owner therefore admits an identity exactly once.
+        const JOIN_TIMEOUT_MS = 150;
+        const alice = makeClient('alice-dup', 'owner', ['bob-dup', 'carol-dup']);
+        const bob = makeClient('bob-dup', 'joiner', undefined, {
+            joinTimeoutMs: JOIN_TIMEOUT_MS,
+        });
+        // The relay swallows Welcomes; every other frame still routes, so the
+        // owner's side of the handshake completes exactly as it would in the
+        // relay-blip case this reproduces.
+        relay.withhold = (msg) => msg.message_type === 'welcome';
+
+        await alice.client.connect();
+        await wait(50);
+        await bob.client.connect();
+        await wait(400);
+
+        // Admitted once: the owner minted a Welcome that never arrived, and the
+        // add-commit already advanced the group — the leaf exists.
+        expect(handshakesFrom('alice-dup', 'welcome')).toHaveLength(1);
+        expect(groupOf(bob.client)).toBeNull();
+        expect(groupOf(alice.client)?.epoch).toBe(1n);
+
+        // The deadline freed the un-answered key package, so the next connect
+        // sends a fresh one — the retry that opens the hole.
+        expect(pendingOf(bob.client)).toBeNull();
+        bob.client.disconnect();
+        await bob.client.connect();
+        await wait(500);
+
+        // The retry really reached the owner and the owner really had a group to
+        // extend, so the refusal below is a decision, not a missing handshake.
+        expect(handshakesFrom('bob-dup', 'key_package')).toHaveLength(2);
+        expect(groupOf(alice.client)).not.toBeNull();
+        // ...and it was refused: no second Welcome, and no second commit — the
+        // group is still at the epoch bob's FIRST admission put it at, so there
+        // is exactly one leaf for "bob".
+        expect(handshakesFrom('alice-dup', 'welcome')).toHaveLength(1);
+        expect(handshakesFrom('alice-dup', 'commit')).toHaveLength(1);
+        expect(groupOf(alice.client)?.epoch).toBe(1n);
+
+        // Park bob before the discriminator below. `disconnect()` clears the
+        // retry budget, and it has to be explicit: the close of the socket bob
+        // disconnected above is delivered AFTER the connect() that replaced it,
+        // and that stale onclose schedules a reconnect against a client that is
+        // already connected — one that fires 1s later, opens a third connection
+        // and sends a third key package. That is a connection-lifecycle bug in
+        // its own right (reported separately); this test must measure the
+        // admission gate, not race it.
+        bob.client.disconnect();
+
+        // The discriminator, and the positive half of bob's silence: the owner
+        // did not simply stop answering key packages once it had a member. A
+        // DIFFERENT allowlisted id still joins and still decrypts, so the
+        // refusal is per-identity rather than a gate that fell shut.
+        relay.withhold = null;
+        const carol = makeClient('carol-dup', 'joiner');
+        await carol.client.connect();
+        await wait(400);
+
+        expect(handshakesFrom('alice-dup', 'welcome')).toHaveLength(2);
+        expect(groupOf(carol.client)).not.toBeNull();
+        expect(groupOf(alice.client)?.epoch).toBe(2n);
+
+        const secret = 'readable by a member the owner admitted exactly once';
+        expect(alice.client.sendUpdate(secret)).toBe(true);
+        await wait(300);
+        expect(carol.updates).toContain(secret);
+    }, 15000);
+
+    it('setAllowedJoiners keeps a defensive copy and still refuses an unlisted id', async () => {
+        // Fail-closed regression: the live setter must not widen the gate, and
+        // must not retain the caller's array — a later push() by the settings
+        // tab would otherwise admit whoever it appended.
+        const ids = ['bob-copy'];
+        const alice = makeClient('alice-copy', 'owner', []);
+        alice.client.setAllowedJoiners(ids);
+        ids.push('mallory-copy');
+
+        const mallory = makeClient('mallory-copy', 'joiner');
+        await alice.client.connect();
+        await wait(50);
+        await mallory.client.connect();
+        await wait(400);
+
+        expect(handshakesFrom('mallory-copy', 'key_package')).toHaveLength(1);
+        expect(handshakesFrom('alice-copy', 'welcome')).toHaveLength(0);
+        expect(groupOf(mallory.client)).toBeNull();
+        expect(groupOf(alice.client)?.epoch).toBe(0n);
     });
 
     it('refuses a key package whose credential is not the allowlisted name it claims', async () => {

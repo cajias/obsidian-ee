@@ -61,16 +61,19 @@ comma-separated user ids. A joiner's id is printed to the developer console when
 its session starts and must be exchanged out of band. One list gates both the
 file group and the vault-manifest group (#32), which share this handshake.
 
-**Operationally, both sides restart after an id is added.** A client's config is
-a snapshot taken when its session starts — true of the relay URL too — so editing
-the setting does not reach a running session; and a refused joiner is fail-closed
-but inert, because `establishGroup` skips a slot that still holds a pending key
-package, so it does not re-send even across a reconnect. The first-run sequence is
-therefore: the joiner starts a session to learn its id (this attempt is refused),
-the owner pastes the id in and restarts, the joiner restarts. Making a settings
-edit reach a live session, and giving a refused joiner a timeout it can report, are
-follow-up work; the failure is safe but currently indistinguishable from a dead
-relay on the joiner's side.
+**The list takes effect immediately on a running session.** `allowedJoiners` is the
+one setting that does: `CollabClient.setAllowedJoiners` replaces a private field
+(with a defensive copy) that the gate reads, and the settings tab calls it on the
+live client. Every *other* field of `CollabClientConfig`, the relay URL included,
+remains a construction-time snapshot that needs a session restart.
+
+**A joiner that is not answered gives up after `joinTimeoutMs` (default 10s).** It
+frees its pending key package, reports a `sync` error naming the document, and —
+because `establishGroup` bootstraps exactly the slots holding neither a doc nor a
+pending — sends a fresh key package on its next connect. It does NOT re-send on the
+live connection, so a joiner refused while the owner is still deciding recovers on
+its next connect rather than instantly. Before this deadline existed, a refused
+joiner was inert forever and silent, which was indistinguishable from a dead relay.
 
 The gate fails closed on every uncertainty:
 
@@ -81,6 +84,9 @@ The gate fails closed on every uncertainty:
   admitted on a name read from unvalidated bytes.
 - **A joiner never answers a key package at all** — the role guard precedes the
   gate.
+- **An identity already in the group is refused a second admission.** MLS enforces
+  leaf-key uniqueness, not *identity* uniqueness, so without this `create_invite`
+  happily adds a second leaf for the same user id. See below.
 
 **The identity checked is the one inside the key package**, read via
 `collab_core::key_package_identity` after MLS validation of the leaf
@@ -92,6 +98,29 @@ regression test for this is
 `plugins/obsidian-ee/src/__tests__/join-gate.test.ts`, whose impostor case
 presents a key package minted for one identity from a connection identified as
 another.
+
+##### One identity, one leaf (and the trade it forces)
+
+A retry can present a second key package for an identity that is already a member —
+routinely, once the deadline above exists: if a Welcome is lost in transit, the
+joiner times out and re-sends. MLS would accept it and add a second leaf for the
+same user id. That is not merely untidy: `remove_member` resolves ONE leaf for a
+user id, so a revocation (#31) would silently leave the other leaf in the group.
+
+`admits()` therefore refuses an identity that `is_member` already reports
+(`collab_core::MlsDocumentGroup::is_member`, exposed through `EncryptedDocument` and
+the wasm binding).
+
+**The deliberate cost:** a joiner whose Welcome was genuinely lost is now stuck
+until the owner removes and re-admits it. The two cases are indistinguishable from
+the owner's side. The tempting alternative — remove the stale leaf and re-add
+automatically — was rejected because it hands anyone who can capture a key package
+off the relay an **eviction primitive**: replaying it for an allowlisted identity
+would evict the live member and re-add a leaf whose private key that member already
+freed. A stuck joiner recoverable by an owner action is strictly better than a
+remotely triggerable eviction. Re-issuing a Welcome for the *existing* leaf is not
+possible today, because the joiner freed the key package that leaf's private key
+came from.
 
 ##### Residual weaknesses
 

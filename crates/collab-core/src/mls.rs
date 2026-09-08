@@ -453,6 +453,23 @@ impl MlsDocumentGroup {
         Ok(members.into_iter().find(|(id, _)| id == user_id).map(|(_, index)| index))
     }
 
+    /// Whether a current member's credential identity is `user_id`.
+    ///
+    /// The owner's admission gate reads this before adding a leaf (issue #71).
+    /// MLS puts NO uniqueness constraint on credential identities, so adding the
+    /// same identity twice succeeds and leaves two leaves — and
+    /// [`Self::remove_member`] resolves exactly one of them via
+    /// [`Self::find_member_leaf`], so a later revocation (issue #31) would leave
+    /// the other still in the group and still decrypting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any member's credential is not a valid UTF-8
+    /// `BasicCredential`.
+    pub fn is_member(&self, user_id: &str) -> Result<bool> {
+        Ok(self.find_member_leaf(user_id)?.is_some())
+    }
+
     /// Owner-only: remove the member whose credential identity == `member_user_id`.
     ///
     /// Advances the epoch and rekeys the group, cutting the removed member off
@@ -1057,6 +1074,22 @@ mod tests {
         assert!(alice.is_owner(), "creator must be the owner");
         assert!(!bob.is_owner(), "a joiner must not be the owner");
         assert!(!carol.is_owner(), "a joiner must not be the owner");
+    }
+
+    #[test]
+    fn is_member_tracks_the_roster_the_admission_gate_reads() {
+        // The owner refuses a key package for an identity already in the group
+        // (#71), because MLS would happily add a SECOND leaf for it and
+        // remove_member resolves only one.
+        let (mut alice, bob, _carol) = three_member_group();
+        assert!(alice.is_member("alice").unwrap(), "the owner is a member");
+        assert!(alice.is_member("bob").unwrap(), "an added member is a member");
+        assert!(!alice.is_member("mallory").unwrap(), "a stranger is not a member");
+        assert!(bob.is_member("alice").unwrap(), "a joiner sees the owner in the roster");
+
+        // ...and a removal frees the name again, so a re-invite is admissible.
+        alice.remove_member("carol", DOC_A).unwrap();
+        assert!(!alice.is_member("carol").unwrap(), "a removed member is no longer a member");
     }
 
     #[test]

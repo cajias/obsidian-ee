@@ -200,6 +200,14 @@ impl WasmEncryptedDocument {
         self.0.is_owner()
     }
 
+    /// True iff `user_id` is already a member of this document's group — the
+    /// owner's duplicate-admission check (issue #71). MLS does not require
+    /// credential identities to be unique, so admitting one twice leaves two
+    /// leaves and `remove_member` can revoke only one of them.
+    pub fn is_member(&self, user_id: &str) -> Result<bool, JsError> {
+        self.0.is_member(user_id).map_err(js_err)
+    }
+
     pub fn insert(&mut self, index: u32, text: &str) {
         self.0.insert(index, text);
     }

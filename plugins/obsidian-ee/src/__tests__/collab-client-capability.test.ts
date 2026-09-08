@@ -62,6 +62,9 @@ global.WebSocket = MockWebSocket;
 const MOCK_EPOCH = 3n;
 const makeMockDoc = (docId: string) => ({
     docId,
+    // The gate (#71) refuses an identity already in the group; nobody has joined
+    // these mock groups, so the roster is empty.
+    is_member: jest.fn<(userId: string) => boolean>().mockReturnValue(false),
     get_content: jest.fn<() => string>().mockReturnValue(''),
     insert: jest.fn(),
     delete: jest.fn(),
@@ -187,9 +190,13 @@ function makeConfig(overrides: Partial<CollabClientConfig> = {}): CollabClientCo
     };
 }
 
+// Advances to 0 — the delay the mock socket schedules its onopen at — rather
+// than running every timer: onopen arms deadlines (the stability window, and a
+// joiner's join deadline) that runAllTimers would collapse to zero virtual
+// time, firing them before the test's first assertion.
 async function connectClient(client: CollabClient): Promise<void> {
     const promise = client.connect();
-    jest.runAllTimers();
+    jest.advanceTimersByTime(0);
     await promise;
 }
 
