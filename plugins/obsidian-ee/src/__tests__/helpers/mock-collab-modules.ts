@@ -21,6 +21,8 @@ export function createMockClientInstance() {
         onError: jest.fn(),
         onDisconnect: jest.fn(),
         onManifestPaths: jest.fn(),
+        // #71/#97: the owner's admission allowlist, pushed to a live session.
+        setAllowedJoiners: jest.fn(),
         // #93: the snapshot a session hands back before destroy().
         snapshot: jest
             .fn<(key: Uint8Array) => Record<string, Uint8Array>>()
