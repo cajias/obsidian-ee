@@ -20,7 +20,33 @@ use collab_proto::{DocumentId, ServerMessage, UserId};
 use tokio::sync::RwLock;
 
 use crate::relay::ClientHandle;
-use crate::storage::OfflineQueue;
+use crate::storage::{EnqueueOutcome, OfflineQueue};
+
+/// Log any message loss the offline queue reported.
+///
+/// The protocol has no retransmit request, so a dropped frame is recovered only
+/// if a later one happens to carry the same state — which for a lost `Welcome`
+/// or `Commit` never happens. Drops must therefore never be silent; see
+/// [`EnqueueOutcome`], whose `displaced` also covers `max_per_user` count-cap
+/// drops, the same class of loss.
+///
+/// `admitting_for` is the recipient this message was being queued FOR, not
+/// necessarily the one that lost data: displacement takes from whichever user
+/// holds the most of that kind. [`EnqueueOutcome`] does not carry the victim's
+/// identity, so the log deliberately does not claim one.
+fn warn_on_queue_loss(admitting_for: &str, doc_id: &str, outcome: &EnqueueOutcome) {
+    if outcome.refused {
+        tracing::warn!(%admitting_for, %doc_id, "Offline queue refused a message; it is not retried");
+    }
+    if outcome.displaced > 0 {
+        tracing::warn!(
+            %admitting_for,
+            %doc_id,
+            displaced = outcome.displaced,
+            "Offline queue admitted a message by dropping older ones"
+        );
+    }
+}
 
 /// A per-document subscribe-authorization anchor (issue #29).
 ///
@@ -347,8 +373,9 @@ impl MessageRouter {
         // slots forever (the per-doc / global caps would fill with dead members).
         let mut evicted: Vec<UserId> = Vec::new();
         for subscriber_id in offline.iter().chain(slow.iter().map(|(id, _)| id)) {
-            let user = self.offline.enqueue(subscriber_id, message.clone()).await;
-            evicted.extend(user);
+            let outcome = self.offline.enqueue(subscriber_id, message.clone()).await;
+            warn_on_queue_loss(subscriber_id, doc_id, &outcome);
+            evicted.extend(outcome.evicted_user);
         }
         if !evicted.is_empty() {
             self.drop_subscriptions(&evicted).await;

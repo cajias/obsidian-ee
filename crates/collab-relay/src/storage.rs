@@ -1,8 +1,8 @@
 //! Storage for offline message queuing.
 //!
 //! Messages destined for a subscribed-but-disconnected user are buffered here
-//! and drained when the user reconnects, so briefly-offline peers do not lose
-//! updates (which would cause the CRDT replicas to diverge permanently).
+//! and drained when the user reconnects, so briefly-offline peers do not miss
+//! updates and handshakes while away.
 //!
 //! This is an in-memory implementation. Memory is bounded on three axes to keep
 //! the zero-knowledge relay safe from a client that queues without ever
@@ -10,12 +10,34 @@
 //! - `max_per_user` caps the messages retained for a single user (oldest first).
 //! - `max_users` caps the number of distinct users tracked; when full, the
 //!   least-recently-inserted user's queue is evicted.
-//! - `max_total_bytes` caps the aggregate payload bytes retained across all
-//!   users. Without it the per-message and per-user count caps still allow
+//! - `ByteLimits` caps the retained payload bytes. Without a byte ceiling the
+//!   per-message and per-user count caps still allow
 //!   `max_users * max_per_user * MAX_MESSAGE_SIZE` (~1 TiB) of retained memory,
 //!   because subscriptions survive disconnect: an attacker can amass many
 //!   offline-but-subscribed user ids on a document and push max-size frames to
 //!   each. The byte budget is the ceiling that actually prevents OOM.
+//!
+//! The byte ceiling is split two ways, because a single first-come-first-served
+//! budget starves whoever asks second. NEITHER kind is safely droppable — see
+//! `Kind` — so the split is not about which loss is tolerable:
+//! - **By kind.** `YrsUpdate` content and `MlsHandshake` traffic get separate
+//!   budgets so that a flood of one cannot consume the budget the other needs.
+//!   Handshake traffic is ungated — any identified client can broadcast it to
+//!   any document (`Router::recipients`) — so on a shared budget that flood
+//!   evicts queued content.
+//! - **By user.** Each user has its own per-kind cap, and admitting a message
+//!   over budget evicts the OLDEST message of that kind from whichever user
+//!   holds the MOST of it, rather than refusing the newcomer. A modest queue is
+//!   therefore never the victim while a bigger consumer exists.
+//!
+//! Largest-queue eviction also recovers better than refusing the newcomer did.
+//! A `YrsUpdate` carries the FULL cumulative document state (`Document::
+//! encode_state` encodes against a default `StateVector`), so a dropped content
+//! frame is healed by the next frame from any peer holding the change — as long
+//! as that frame is itself admitted. Under refuse-the-newcomer the byte cap was
+//! a global saturation condition: the pressure that dropped frame N persisted
+//! into N+1 and blocked the very frame that would have closed the gap. Now the
+//! hog is trimmed and the healing frame gets in.
 //!
 //! A `DynamoDB`-backed implementation can be introduced later behind a Cargo
 //! feature (see `Cargo.toml`).
@@ -26,20 +48,33 @@ use std::sync::Arc;
 use collab_proto::{ServerMessage, UserId};
 use tokio::sync::RwLock;
 
-/// Internal, lock-guarded state for [`OfflineQueue`].
-#[derive(Default)]
-struct Inner {
-    /// Queued messages per user.
-    queues: HashMap<UserId, VecDeque<ServerMessage>>,
-    /// Insertion order of the currently-tracked users, used to evict the
-    /// least-recently-inserted user when `max_users` is exceeded. Kept in sync
-    /// with `queues`: every key in `queues` appears exactly once here.
-    order: VecDeque<UserId>,
-    /// Running sum of [`message_bytes`] over every message in `queues`.
-    /// Maintained incrementally: charged on enqueue, credited back on every
-    /// removal (drain, per-user count-cap drop, user eviction). Never recomputed
-    /// by scanning, so all queue operations stay O(1) in the byte accounting.
-    total_bytes: usize,
+/// Which byte budget a message is charged against.
+///
+/// Both budgeted kinds carry drops that hurt, so neither budget may be spent on
+/// the other's traffic:
+/// - A dropped `YrsUpdate` is healed by the NEXT content frame, because each one
+///   is a full cumulative snapshot — but only once some peer edits again.
+/// - A dropped `MlsHandshake` recovers only for a `KeyPackage`, which the join
+///   timer re-sends. A lost `Welcome` strands the joiner until an owner re-invites
+///   it (it has already freed the key package holding its leaf private key —
+///   `plugins/obsidian-ee/src/collab-client.ts`), and a lost `Commit` leaves
+///   members behind the epoch advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// `YrsUpdate` — document content.
+    Content,
+    /// `MlsHandshake` — group handshake traffic.
+    Handshake,
+    /// Fixed-size control frames: negligible, never budgeted.
+    Unbudgeted,
+}
+
+const fn message_kind(message: &ServerMessage) -> Kind {
+    match message {
+        ServerMessage::YrsUpdate { .. } => Kind::Content,
+        ServerMessage::MlsHandshake { .. } => Kind::Handshake,
+        _ => Kind::Unbudgeted,
+    }
 }
 
 /// Payload byte size charged against the queue's byte budget for a message.
@@ -57,15 +92,172 @@ const fn message_bytes(message: &ServerMessage) -> usize {
     }
 }
 
-/// Drop oldest messages from `queue` until it holds at most `max_per_user`,
-/// returning the total payload bytes dropped so the caller can credit the
-/// aggregate counter.
-fn trim_to_cap(queue: &mut VecDeque<ServerMessage>, max_per_user: usize) -> usize {
-    let mut freed = 0;
-    while queue.len() > max_per_user {
-        freed += queue.pop_front().map_or(0, |m| message_bytes(&m));
+/// One user's queue plus its per-kind byte counters.
+///
+/// The counters live next to the deque they describe, rather than in a parallel
+/// map, so they cannot drift out of sync with it.
+#[derive(Default)]
+struct UserQueue {
+    /// A SINGLE deque across both kinds, so [`OfflineQueue::drain`] stays FIFO
+    /// in wire order and no client ordering assumption changes.
+    messages: VecDeque<ServerMessage>,
+    content_bytes: usize,
+    handshake_bytes: usize,
+}
+
+impl UserQueue {
+    const fn bytes(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Content => self.content_bytes,
+            Kind::Handshake => self.handshake_bytes,
+            Kind::Unbudgeted => 0,
+        }
     }
-    freed
+
+    const fn charge(&mut self, kind: Kind, bytes: usize) {
+        match kind {
+            Kind::Content => self.content_bytes += bytes,
+            Kind::Handshake => self.handshake_bytes += bytes,
+            Kind::Unbudgeted => {}
+        }
+    }
+
+    const fn credit(&mut self, kind: Kind, bytes: usize) {
+        match kind {
+            Kind::Content => self.content_bytes -= bytes,
+            Kind::Handshake => self.handshake_bytes -= bytes,
+            Kind::Unbudgeted => {}
+        }
+    }
+}
+
+/// Internal, lock-guarded state for [`OfflineQueue`].
+#[derive(Default)]
+struct Inner {
+    /// Queued messages per user, with that user's byte counters.
+    queues: HashMap<UserId, UserQueue>,
+    /// Insertion order of the currently-tracked users, used to evict the
+    /// least-recently-inserted user when `max_users` is exceeded. Kept in sync
+    /// with `queues`: every key in `queues` appears exactly once here.
+    order: VecDeque<UserId>,
+    /// Running sums of [`message_bytes`] per kind over every queued message.
+    /// Maintained incrementally: charged on enqueue, credited back on every
+    /// removal (drain, count-cap drop, budget eviction, user eviction). Never
+    /// recomputed by scanning, so charge/credit stays O(1).
+    content_bytes: usize,
+    handshake_bytes: usize,
+}
+
+impl Inner {
+    const fn bytes(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Content => self.content_bytes,
+            Kind::Handshake => self.handshake_bytes,
+            Kind::Unbudgeted => 0,
+        }
+    }
+
+    const fn charge(&mut self, kind: Kind, bytes: usize) {
+        match kind {
+            Kind::Content => self.content_bytes += bytes,
+            Kind::Handshake => self.handshake_bytes += bytes,
+            Kind::Unbudgeted => {}
+        }
+    }
+
+    const fn credit(&mut self, kind: Kind, bytes: usize) {
+        match kind {
+            Kind::Content => self.content_bytes -= bytes,
+            Kind::Handshake => self.handshake_bytes -= bytes,
+            Kind::Unbudgeted => {}
+        }
+    }
+
+    /// Remove the message at `idx` of `user`'s queue, crediting BOTH the
+    /// per-user and aggregate counters. The single removal path is what keeps
+    /// the two from drifting apart.
+    fn remove_at(&mut self, user: &str, idx: usize) -> bool {
+        let Some(queue) = self.queues.get_mut(user) else { return false };
+        let Some(message) = queue.messages.remove(idx) else { return false };
+        let kind = message_kind(&message);
+        let bytes = message_bytes(&message);
+        queue.credit(kind, bytes);
+        self.credit(kind, bytes);
+        true
+    }
+
+    /// Drop `user`'s oldest message of `kind`. Returns false when it holds none.
+    // ponytail: O(queue) walk to find the oldest message of one kind, because a
+    // single deque is what keeps drain FIFO across kinds. Only runs under budget
+    // pressure. Upgrade: a per-kind index of deque positions if eviction stops
+    // being rare.
+    fn drop_oldest_of(&mut self, user: &str, kind: Kind) -> bool {
+        let idx = self
+            .queues
+            .get(user)
+            .and_then(|q| q.messages.iter().position(|m| message_kind(m) == kind));
+        idx.is_some_and(|i| self.remove_at(user, i))
+    }
+
+    /// The user holding the most `kind` bytes, if any holds more than zero.
+    // ponytail: O(users) scan per evicted message. Only runs under budget
+    // pressure; the happy path stays O(1). Upgrade: a per-kind max-heap keyed by
+    // bytes if the relay routinely sits at its budget.
+    fn largest_holder(&self, kind: Kind) -> Option<UserId> {
+        self.queues
+            .iter()
+            .filter(|(_, q)| q.bytes(kind) > 0)
+            .max_by_key(|(_, q)| q.bytes(kind))
+            .map(|(user, _)| user.clone())
+    }
+}
+
+/// Drop `user`'s oldest messages until the queue holds at most `max_per_user`,
+/// returning how many were dropped.
+fn trim_to_cap(inner: &mut Inner, user: &str, max_per_user: usize) -> usize {
+    let mut dropped = 0;
+    while inner.queues.get(user).is_some_and(|q| q.messages.len() > max_per_user) {
+        if !inner.remove_at(user, 0) {
+            break;
+        }
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Drop `user`'s oldest `kind` messages until `needed` more bytes fit under the
+/// per-user cap, returning how many were dropped.
+fn trim_user_budget(inner: &mut Inner, user: &str, kind: Kind, needed: usize, cap: usize) -> usize {
+    let held = |inner: &Inner| inner.queues.get(user).map_or(0, |q| q.bytes(kind));
+    let mut dropped = 0;
+    while held(inner) + needed > cap {
+        if !inner.drop_oldest_of(user, kind) {
+            break;
+        }
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Free space in the `kind` budget until `needed` more bytes fit, by repeatedly
+/// dropping the OLDEST message of that kind from whichever user holds the MOST
+/// of it. Returns how many messages were dropped.
+///
+/// The caller guarantees `needed <= budget`, so this always makes room: the
+/// aggregate counter is the sum of the per-user ones, hence it reaches zero
+/// before [`Inner::largest_holder`] runs out of victims. A user may be left with
+/// an empty queue; that is harmless — `drain` and the `max_users` eviction both
+/// clean the entry up, and `has_messages` already reports it as empty.
+fn make_room(inner: &mut Inner, kind: Kind, needed: usize, budget: usize) -> usize {
+    let mut dropped = 0;
+    while inner.bytes(kind) + needed > budget {
+        let Some(victim) = inner.largest_holder(kind) else { break };
+        if !inner.drop_oldest_of(&victim, kind) {
+            break;
+        }
+        dropped += 1;
+    }
+    dropped
 }
 
 /// Evict the least-recently-inserted user's queue while at or above capacity.
@@ -76,12 +268,71 @@ fn evict_if_full(inner: &mut Inner, max_users: usize) -> Option<UserId> {
     while inner.queues.len() >= max_users {
         let oldest = inner.order.pop_front()?;
         if let Some(queue) = inner.queues.remove(&oldest) {
-            inner.total_bytes -= queue.iter().map(message_bytes).sum::<usize>();
+            inner.content_bytes -= queue.content_bytes;
+            inner.handshake_bytes -= queue.handshake_bytes;
             tracing::warn!(evicted = %oldest, "Offline queue at capacity; evicted oldest user");
             return Some(oldest);
         }
     }
     None
+}
+
+/// What an [`OfflineQueue::enqueue`] did, so callers can log the loss.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct EnqueueOutcome {
+    /// Whole queue evicted at `max_users` capacity; caller must prune that
+    /// user's subscriptions.
+    pub(crate) evicted_user: Option<UserId>,
+    /// The message could not be queued at all.
+    pub(crate) refused: bool,
+    /// Previously-queued messages dropped for this one: byte-budget evictions
+    /// plus any `max_per_user` count-cap drops. Both are silent loss otherwise.
+    pub(crate) displaced: usize,
+}
+
+/// Byte budgets for [`OfflineQueue`], split by message kind.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ByteLimits {
+    /// Aggregate `YrsUpdate` payload bytes retained across all users.
+    pub(crate) content: usize,
+    /// Aggregate `MlsHandshake` payload bytes retained across all users.
+    pub(crate) handshake: usize,
+    /// `YrsUpdate` payload bytes retained for any single user.
+    pub(crate) user_content: usize,
+    /// `MlsHandshake` payload bytes retained for any single user.
+    pub(crate) user_handshake: usize,
+}
+
+impl ByteLimits {
+    /// Aggregate budget for `kind`. `Unbudgeted` messages are never charged, so
+    /// their budget is irrelevant; `usize::MAX` keeps every check trivially true.
+    const fn budget(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Content => self.content,
+            Kind::Handshake => self.handshake,
+            Kind::Unbudgeted => usize::MAX,
+        }
+    }
+
+    /// Per-user cap for `kind`.
+    const fn per_user(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Content => self.user_content,
+            Kind::Handshake => self.user_handshake,
+            Kind::Unbudgeted => usize::MAX,
+        }
+    }
+}
+
+impl Default for ByteLimits {
+    fn default() -> Self {
+        Self {
+            content: OfflineQueue::DEFAULT_MAX_CONTENT_BYTES,
+            handshake: OfflineQueue::DEFAULT_MAX_HANDSHAKE_BYTES,
+            user_content: OfflineQueue::DEFAULT_MAX_USER_CONTENT_BYTES,
+            user_handshake: OfflineQueue::DEFAULT_MAX_USER_HANDSHAKE_BYTES,
+        }
+    }
 }
 
 /// Stores messages for offline clients.
@@ -91,9 +342,9 @@ pub struct OfflineQueue {
     max_per_user: usize,
     /// Maximum number of distinct users tracked (prevents unbounded key growth).
     max_users: usize,
-    /// Maximum aggregate payload bytes retained across all users (prevents OOM;
-    /// see the module docs for the exploit this closes).
-    max_total_bytes: usize,
+    /// Payload byte budgets, split per kind and per user (prevents OOM and
+    /// starvation; see the module docs for what this closes).
+    bytes: ByteLimits,
 }
 
 impl OfflineQueue {
@@ -103,7 +354,10 @@ impl OfflineQueue {
     /// Default maximum number of distinct users tracked.
     pub const DEFAULT_MAX_USERS: usize = 10_000;
 
-    /// Default aggregate payload byte budget: 128 MiB.
+    /// Total payload byte ceiling: 128 MiB, split between
+    /// `DEFAULT_MAX_CONTENT_BYTES` and
+    /// `DEFAULT_MAX_HANDSHAKE_BYTES`, which are derived from it so the
+    /// sum stays exact.
     ///
     /// Sized to comfortably hold a realistic burst — several hundred briefly-
     /// offline users each holding a max-size frame — yet orders of magnitude
@@ -114,6 +368,28 @@ impl OfflineQueue {
     /// `MAX_MESSAGE_SIZE` frame carries only ~300 KiB of payload.
     pub const DEFAULT_MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
+    /// Default `MlsHandshake` byte budget: 16 MiB.
+    ///
+    /// Handshake traffic is ungated — any identified client can broadcast it to
+    /// any document (`Router::recipients`) — so it is the flood risk, and gets
+    /// the smaller slice of [`Self::DEFAULT_MAX_TOTAL_BYTES`]. Sized for real
+    /// handshake volume, which is a few frames per join, not per keystroke.
+    pub(crate) const DEFAULT_MAX_HANDSHAKE_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Default `YrsUpdate` byte budget: the rest of the total, 112 MiB.
+    ///
+    /// Content is the high-volume kind — one frame per edit burst per document,
+    /// each a full state snapshot — so it takes the larger slice. Being its own
+    /// budget is what stops a handshake flood from evicting it.
+    pub(crate) const DEFAULT_MAX_CONTENT_BYTES: usize =
+        Self::DEFAULT_MAX_TOTAL_BYTES - Self::DEFAULT_MAX_HANDSHAKE_BYTES;
+
+    /// Default per-user `YrsUpdate` byte cap: 8 MiB.
+    pub(crate) const DEFAULT_MAX_USER_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Default per-user `MlsHandshake` byte cap: 1 MiB.
+    pub(crate) const DEFAULT_MAX_USER_HANDSHAKE_BYTES: usize = 1024 * 1024;
+
     /// Create a new offline queue with default settings.
     #[must_use]
     pub fn new() -> Self {
@@ -121,81 +397,67 @@ impl OfflineQueue {
             inner: Arc::new(RwLock::new(Inner::default())),
             max_per_user: Self::DEFAULT_MAX_PER_USER,
             max_users: Self::DEFAULT_MAX_USERS,
-            max_total_bytes: Self::DEFAULT_MAX_TOTAL_BYTES,
+            bytes: ByteLimits::default(),
         }
     }
 
     /// Create a new offline queue with custom per-user and user-count caps.
     ///
-    /// The aggregate byte budget stays at [`Self::DEFAULT_MAX_TOTAL_BYTES`]; use
-    /// [`Self::with_byte_limit`] to override it.
+    /// The byte budgets stay at their `ByteLimits` defaults.
     #[must_use]
     pub fn with_limits(max_per_user: usize, max_users: usize) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner::default())),
             max_per_user,
             max_users,
-            max_total_bytes: Self::DEFAULT_MAX_TOTAL_BYTES,
+            bytes: ByteLimits::default(),
         }
     }
 
     /// Create a new offline queue with custom per-user, user-count, and
-    /// aggregate-byte caps.
-    #[must_use]
-    pub fn with_byte_limit(max_per_user: usize, max_users: usize, max_total_bytes: usize) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Inner::default())),
-            max_per_user,
-            max_users,
-            max_total_bytes,
-        }
+    /// byte caps.
+    #[cfg(test)]
+    pub(crate) fn with_byte_limits(
+        max_per_user: usize,
+        max_users: usize,
+        bytes: ByteLimits,
+    ) -> Self {
+        Self { inner: Arc::new(RwLock::new(Inner::default())), max_per_user, max_users, bytes }
     }
 
     /// Queue a message for an offline user.
     ///
-    /// If the user's queue exceeds `max_per_user`, the oldest message is
-    /// dropped. If tracking this user would exceed `max_users`, the
-    /// least-recently-inserted user's entire queue is evicted first. If queuing
-    /// the message would push the aggregate payload bytes over `max_total_bytes`,
-    /// the message is refused (dropped) instead — nothing is mutated on that
-    /// path, so no other user loses data or subscriptions.
+    /// The message is admitted unless it alone exceeds a budget for its kind
+    /// (see [`ByteLimits`]); making room for it costs OTHER messages of the same
+    /// kind, taken oldest-first from whichever user holds the most of that kind.
+    /// A user's queue is also trimmed to `max_per_user` messages, and tracking a
+    /// new user at `max_users` capacity evicts the least-recently-inserted one.
     ///
-    /// Returns the evicted user id (if any). The router uses this to also prune
-    /// that user's subscriptions, so a never-reconnecting user cannot pin
-    /// subscription slots forever.
-    pub async fn enqueue(&self, user_id: &str, message: ServerMessage) -> Option<UserId> {
+    /// EVERY drop is reported in the returned [`EnqueueOutcome`] — byte-budget
+    /// evictions and `max_per_user` count-cap drops alike — because none of them
+    /// is safe to lose silently (see [`Kind`]) and the protocol has no
+    /// retransmit request: recovery depends entirely on a later frame arriving.
+    /// Callers are expected to log it. `evicted_user` additionally requires the
+    /// router to prune that user's subscriptions, so a never-reconnecting user
+    /// cannot pin subscription slots forever.
+    pub(crate) async fn enqueue(&self, user_id: &str, message: ServerMessage) -> EnqueueOutcome {
+        let kind = message_kind(&message);
         let msg_bytes = message_bytes(&message);
         let mut inner = self.inner.write().await;
 
-        // Refuse rather than exceed the aggregate byte budget. "Drop oldest"
-        // globally would mean evicting whole *other* users (there is no
-        // cross-user message ordering to drop from), destroying innocent peers'
-        // queued data and subscriptions on an attacker's oversized burst.
-        // Refusing the single breaching message is surgical and O(1). It is NOT
-        // recoverable, though: the protocol carries no state-vector or sync-step
-        // message (`collab_proto::ClientMessage`/`ServerMessage`), so a dropped
-        // update is never resynced and the recipient's replica diverges — see
-        // the module docs. Loss under pressure is a correctness cost here, not
-        // just an availability one.
-        // ponytail: global byte cap only, no per-user byte cap. Ceiling: ONE
-        // recipient can hold the whole shared budget — a few hundred max-size
-        // frames fill DEFAULT_MAX_TOTAL_BYTES (each 1 MiB JSON text frame
-        // charges only ~300 KiB of decoded payload), still well under that
-        // user's 1000 count slots, and every other user's enqueue is then
-        // refused. A
-        // per-user cap would bound an HONEST heavy user but NOT an adversarial
-        // one, because puppet recipients are nearly free: a bare Subscribe with
-        // `authorized_epoch: None` needs no capability, handshake traffic is
-        // never content-gated (`Router::recipients`), and subscriptions survive
-        // disconnect — so any client that can Identify can park N offline
-        // sockpuppets and fill the budget with ungated `MlsHandshake` payloads.
-        // A cap of X just costs the attacker 128/X of them. Upgrade: per-user
-        // cap when an HONEST user is seen starving others; per-document or
-        // per-sender fair-share to close the adversarial case.
-        if inner.total_bytes.saturating_add(msg_bytes) > self.max_total_bytes {
+        // Refuse only what can never fit: a message over its own kind's per-user
+        // cap or aggregate budget. Both are checked before anything is mutated,
+        // so a refusal costs no other user data or subscriptions — and because
+        // the message does fit past this point, the eviction loops below are
+        // guaranteed to make room for it.
+        if msg_bytes > self.bytes.per_user(kind) || msg_bytes > self.bytes.budget(kind) {
             drop(inner);
-            return None;
+            return EnqueueOutcome { refused: true, ..EnqueueOutcome::default() };
         }
+
+        let mut displaced =
+            trim_user_budget(&mut inner, user_id, kind, msg_bytes, self.bytes.per_user(kind));
+        displaced += make_room(&mut inner, kind, msg_bytes, self.bytes.budget(kind));
 
         let evicted = if inner.queues.contains_key(user_id) {
             None
@@ -205,13 +467,13 @@ impl OfflineQueue {
             evicted
         };
 
-        inner.total_bytes += msg_bytes;
+        inner.charge(kind, msg_bytes);
         let queue = inner.queues.entry(user_id.to_string()).or_default();
-        queue.push_back(message);
-        let freed = trim_to_cap(queue, self.max_per_user);
-        inner.total_bytes -= freed;
+        queue.charge(kind, msg_bytes);
+        queue.messages.push_back(message);
+        displaced += trim_to_cap(&mut inner, user_id, self.max_per_user);
         drop(inner);
-        evicted
+        EnqueueOutcome { evicted_user: evicted, refused: false, displaced }
     }
 
     /// Retrieve and clear all queued messages for a user.
@@ -219,27 +481,27 @@ impl OfflineQueue {
     /// Returns messages in the order they were queued (FIFO).
     pub async fn drain(&self, user_id: &str) -> Vec<ServerMessage> {
         let mut inner = self.inner.write().await;
-        let drained = inner.queues.remove(user_id).map(Vec::from);
-        if let Some(messages) = drained.as_ref() {
-            let freed: usize = messages.iter().map(message_bytes).sum();
-            inner.total_bytes -= freed;
+        let drained = inner.queues.remove(user_id);
+        if let Some(queue) = drained.as_ref() {
+            inner.content_bytes -= queue.content_bytes;
+            inner.handshake_bytes -= queue.handshake_bytes;
             inner.order.retain(|u| u != user_id);
         }
         drop(inner);
-        drained.unwrap_or_default()
+        drained.map_or_else(Vec::new, |q| q.messages.into())
     }
 
     /// Check if there are queued messages for a user.
     pub async fn has_messages(&self, user_id: &str) -> bool {
         let inner = self.inner.read().await;
-        inner.queues.get(user_id).is_some_and(|q| !q.is_empty())
+        inner.queues.get(user_id).is_some_and(|q| !q.messages.is_empty())
     }
 
     /// Get the number of queued messages for a user.
     #[cfg(test)]
     pub async fn message_count(&self, user_id: &str) -> usize {
         let inner = self.inner.read().await;
-        inner.queues.get(user_id).map_or(0, VecDeque::len)
+        inner.queues.get(user_id).map_or(0, |q| q.messages.len())
     }
 
     /// Get the number of distinct users currently tracked.
@@ -249,11 +511,11 @@ impl OfflineQueue {
         inner.queues.len()
     }
 
-    /// Get the running aggregate payload-byte total.
+    /// Get the running aggregate payload-byte total across both budgets.
     #[cfg(test)]
     pub async fn total_bytes(&self) -> usize {
         let inner = self.inner.read().await;
-        inner.total_bytes
+        inner.content_bytes + inner.handshake_bytes
     }
 }
 
@@ -293,6 +555,30 @@ mod tests {
         }
     }
 
+    /// An `MlsHandshake` whose payload is exactly `bytes` long.
+    fn make_handshake(doc_id: &str, from: &str, bytes: usize) -> ServerMessage {
+        ServerMessage::MlsHandshake {
+            doc_id: doc_id.into(),
+            from: from.into(),
+            payload: vec![0u8; bytes],
+            message_type: collab_proto::MlsMessageType::Commit,
+        }
+    }
+
+    /// Byte limits with every budget set to `n`, so a test's numbers stay small
+    /// and only the axis it exercises can bite.
+    const fn flat_limits(n: usize) -> ByteLimits {
+        ByteLimits { content: n, handshake: n, user_content: n, user_handshake: n }
+    }
+
+    fn count_kinds(messages: &[ServerMessage]) -> (usize, usize) {
+        let content =
+            messages.iter().filter(|m| matches!(m, ServerMessage::YrsUpdate { .. })).count();
+        let handshake =
+            messages.iter().filter(|m| matches!(m, ServerMessage::MlsHandshake { .. })).count();
+        (content, handshake)
+    }
+
     #[tokio::test]
     #[allow(clippy::excessive_nesting)]
     async fn test_offline_user_receives_on_reconnect() {
@@ -328,10 +614,13 @@ mod tests {
     async fn test_max_messages_limit() {
         let queue = OfflineQueue::with_limits(3, OfflineQueue::DEFAULT_MAX_USERS);
 
-        // Queue 5 messages for bob (exceeds limit of 3)
+        // Queue 5 messages for bob (exceeds limit of 3). The count cap is a
+        // silent drop path unless it is reported, so collect what it reports.
+        let mut displaced = Vec::new();
         for i in 1..=5 {
-            queue.enqueue("bob", make_update("doc1", "alice", i)).await;
+            displaced.push(queue.enqueue("bob", make_update("doc1", "alice", i)).await.displaced);
         }
+        assert_eq!(displaced, vec![0, 0, 0, 1, 1], "count-cap drops must be reported too");
 
         // Only last 3 should remain
         assert_eq!(queue.message_count("bob").await, 3);
@@ -411,37 +700,40 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::excessive_nesting)]
-    async fn test_byte_budget_refuses_overflow() {
+    async fn test_byte_budget_evicts_largest_queue() {
         // Budget for 3 messages of 100 bytes; plenty of per-user/user headroom
         // so only the byte cap can bite.
-        let queue = OfflineQueue::with_byte_limit(1000, 1000, 300);
+        let queue = OfflineQueue::with_byte_limits(1000, 1000, flat_limits(300));
 
         // Three 100-byte messages across two users exactly fill the budget.
-        assert_eq!(queue.enqueue("alice", make_sized("doc1", "x", 100)).await, None);
-        assert_eq!(queue.enqueue("alice", make_sized("doc1", "x", 100)).await, None);
-        assert_eq!(queue.enqueue("bob", make_sized("doc1", "x", 100)).await, None);
+        queue.enqueue("alice", make_sized("doc1", "x", 100)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 100)).await;
+        queue.enqueue("bob", make_sized("doc1", "x", 100)).await;
         assert_eq!(queue.total_bytes().await, 300);
 
-        // The fourth would breach the budget: refused, nothing mutated.
-        assert_eq!(queue.enqueue("carol", make_sized("doc1", "x", 100)).await, None);
-        assert!(queue.total_bytes().await <= 300, "byte budget must hold");
-        assert_eq!(queue.total_bytes().await, 300);
-        assert!(!queue.has_messages("carol").await, "refused message must not be stored");
-        assert_eq!(queue.tracked_users().await, 2, "refused enqueue must not track a new user");
+        // The fourth is admitted by evicting the OLDEST message of the LARGEST
+        // queue (alice, 200 bytes) — the newcomer is not the victim.
+        let outcome = queue.enqueue("carol", make_sized("doc1", "x", 100)).await;
+        assert!(!outcome.refused, "a modest newcomer must not be refused");
+        assert_eq!(outcome.displaced, 1);
+        assert!(queue.has_messages("carol").await, "newcomer must be queued");
+        assert_eq!(queue.message_count("alice").await, 1, "largest queue gives up its oldest");
+        assert!(queue.has_messages("bob").await, "a smaller queue is never the victim");
+        assert_eq!(queue.total_bytes().await, 300, "byte budget must hold");
 
-        // Draining credits bytes back, making room again.
-        let drained = queue.drain("alice").await;
-        assert_eq!(drained.len(), 2);
-        assert_eq!(queue.total_bytes().await, 100);
-        assert_eq!(queue.enqueue("carol", make_sized("doc1", "x", 100)).await, None);
-        assert_eq!(queue.total_bytes().await, 200);
+        // A message that alone exceeds the budget is refused, and mutates nothing.
+        let too_big = queue.enqueue("dave", make_sized("doc1", "x", 301)).await;
+        assert!(too_big.refused);
+        assert_eq!(too_big.displaced, 0, "a refusal must not displace anything");
+        assert_eq!(queue.total_bytes().await, 300);
+        assert!(!queue.has_messages("dave").await, "refused message must not be stored");
     }
 
     #[tokio::test]
     #[allow(clippy::excessive_nesting)]
     async fn test_byte_accounting_survives_count_cap_and_eviction() {
         // Per-user cap of 2 messages, 2 users max, generous byte budget.
-        let queue = OfflineQueue::with_byte_limit(2, 2, 1_000_000);
+        let queue = OfflineQueue::with_byte_limits(2, 2, flat_limits(1_000_000));
 
         // Overflow alice's per-user count cap: oldest dropped, bytes credited.
         for _ in 0..5 {
@@ -454,8 +746,133 @@ mod tests {
         queue.enqueue("bob", make_sized("doc1", "x", 100)).await;
         assert_eq!(queue.total_bytes().await, 300);
         let evicted = queue.enqueue("carol", make_sized("doc1", "x", 100)).await;
-        assert_eq!(evicted, Some("alice".to_string()));
+        assert_eq!(evicted.evicted_user, Some("alice".to_string()));
         // alice's 200 bytes credited on eviction; bob(100) + carol(100) remain.
         assert_eq!(queue.total_bytes().await, 200, "user eviction must credit bytes");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
+    async fn test_one_user_cannot_starve_another() {
+        let queue = OfflineQueue::with_byte_limits(1000, 1000, flat_limits(300));
+
+        // Alice alone fills the whole content budget.
+        for _ in 0..3 {
+            queue.enqueue("alice", make_sized("doc1", "x", 100)).await;
+        }
+        assert_eq!(queue.total_bytes().await, 300);
+
+        // Bob's first, modest message must still be accepted — his ACCEPTANCE
+        // is the discriminator, not alice's trimming.
+        let outcome = queue.enqueue("bob", make_sized("doc1", "x", 100)).await;
+        assert!(!outcome.refused, "a full budget must not starve a new recipient");
+        assert!(queue.has_messages("bob").await, "bob must be queued");
+        // And alice keeps most of hers: the budget is shared, not handed over.
+        assert!(queue.has_messages("alice").await, "alice must not be wholly evicted");
+        assert_eq!(queue.message_count("alice").await, 2);
+        assert_eq!(queue.total_bytes().await, 300, "byte budget must hold");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
+    async fn test_handshake_flood_cannot_evict_content() {
+        let queue = OfflineQueue::with_byte_limits(1000, 1000, flat_limits(300));
+
+        // A handshake flood saturates the handshake budget...
+        for _ in 0..10 {
+            queue.enqueue("bob", make_handshake("doc1", "x", 100)).await;
+        }
+        // ...which must leave the content budget untouched.
+        let outcome = queue.enqueue("bob", make_sized("doc1", "x", 100)).await;
+        assert!(!outcome.refused, "a handshake flood must not refuse content");
+        // Flooding again must not reach the content already queued.
+        for _ in 0..10 {
+            queue.enqueue("bob", make_handshake("doc1", "x", 100)).await;
+        }
+
+        let (content, handshakes) = count_kinds(&queue.drain("bob").await);
+        assert_eq!(content, 1, "content must survive a handshake flood");
+        // Positive half: the flood demonstrably happened and stayed bounded, so
+        // the surviving update is evidence of a split budget, not an empty queue.
+        assert_eq!(handshakes, 3, "handshakes are retained up to their own budget");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
+    async fn test_handshake_budget_is_separate_from_content() {
+        // Asymmetric aggregate budgets, and per-user caps set well above what
+        // any single flooding user sends — so only the AGGREGATE handshake
+        // budget, not a per-user cap or the content budget, can be the
+        // limiter below.
+        let limits = ByteLimits { handshake: 300, user_handshake: 1000, ..flat_limits(100_000) };
+        let queue = OfflineQueue::with_byte_limits(1000, 1000, limits);
+
+        // A content message queued before the flood must survive it untouched.
+        queue.enqueue("carl", make_sized("doc1", "x", 100)).await;
+        assert_eq!(queue.total_bytes().await, 100);
+
+        // Flood from 5 distinct users, 3 messages of 100 bytes each: 1500
+        // bytes sent, far over the 300-byte handshake budget, while each
+        // user's own 300 bytes stays well under its 1000-byte cap — no
+        // single per-user cap can be what bounds this.
+        for user in ["hs0", "hs1", "hs2", "hs3", "hs4"] {
+            for _ in 0..3 {
+                queue.enqueue(user, make_handshake("doc1", "x", 100)).await;
+            }
+        }
+
+        // Aggregate handshake bytes must settle at the HANDSHAKE budget
+        // (300), not the much larger content budget: subtracting the
+        // untouched content bytes isolates the handshake side.
+        assert_eq!(
+            queue.total_bytes().await - 100,
+            300,
+            "handshake retention must be bounded by its own aggregate budget, not content's"
+        );
+        // Positive half: content survived the flood, so the bound above is
+        // evidence of a real eviction on the handshake side, not an emptied
+        // queue.
+        assert!(queue.has_messages("carl").await, "content must survive the handshake flood");
+        assert_eq!(queue.message_count("carl").await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
+    async fn test_enqueue_reports_refusal_and_displacement() {
+        let limits = ByteLimits { user_content: 200, ..flat_limits(300) };
+        let queue = OfflineQueue::with_byte_limits(1000, 1000, limits);
+
+        // Success path: nothing refused, nothing displaced, nobody evicted.
+        let ok = queue.enqueue("alice", make_sized("doc1", "x", 100)).await;
+        assert_eq!(ok, EnqueueOutcome::default());
+
+        // A message larger than the per-user cap is refused outright.
+        let refused = queue.enqueue("alice", make_sized("doc1", "x", 201)).await;
+        assert!(refused.refused, "a message over the per-user cap must be refused");
+        assert_eq!(refused.displaced, 0);
+        assert_eq!(queue.total_bytes().await, 100, "a refusal must mutate nothing");
+
+        // Fill the budget (alice 200, bob 100), then a newcomer displaces.
+        queue.enqueue("alice", make_sized("doc1", "x", 100)).await;
+        queue.enqueue("bob", make_sized("doc1", "x", 100)).await;
+        let displaced = queue.enqueue("carol", make_sized("doc1", "x", 100)).await;
+        assert!(!displaced.refused);
+        assert_eq!(displaced.displaced, 1, "one message dropped to make room");
+        assert_eq!(queue.message_count("alice").await, 1, "the largest queue pays");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
+    async fn test_per_user_content_cap_bounds_one_user() {
+        // Room for 10 messages globally, but only 2 for any single user.
+        let limits = ByteLimits { user_content: 250, ..flat_limits(10_000) };
+        let queue = OfflineQueue::with_byte_limits(1000, 1000, limits);
+
+        for _ in 0..20 {
+            queue.enqueue("alice", make_sized("doc1", "x", 100)).await;
+        }
+
+        assert_eq!(queue.message_count("alice").await, 2, "per-user cap must bound one user");
+        assert_eq!(queue.total_bytes().await, 200);
     }
 }
