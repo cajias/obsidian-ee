@@ -217,8 +217,14 @@ async fn a_restored_cli_listener_receives_content_over_an_authz_relay() {
         .unwrap();
     assert!(matches!(blind.recv().await.unwrap(), ServerMessage::Subscribed { .. }));
 
-    // A peer publishes content.
+    // A peer publishes content. It presents a capability of its own: publishing
+    // is gated on the same current-epoch authorization as receiving, so an
+    // unsubscribed publisher is refused and routes nothing.
     let mut peer = TestClient::connect_as(server.url(), "peer").await.unwrap();
+    peer.send(&collab_cli::commands::subscribe_frame("peer", &doc_id, Some(&restored)).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(peer.recv().await.unwrap(), ServerMessage::Subscribed { .. }));
     peer.send(&ClientMessage::YrsUpdate {
         doc_id: doc_id.clone(),
         encrypted: b"opaque ciphertext".to_vec(),

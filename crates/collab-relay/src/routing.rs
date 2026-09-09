@@ -399,6 +399,27 @@ impl MessageRouter {
         });
     }
 
+    /// Whether `user_id` may PUBLISH content to `doc_id`.
+    ///
+    /// The same predicate [`Self::recipients`] applies to receivers, applied to
+    /// the sender instead. With gating off everyone may publish, unchanged. With
+    /// it on the sender must itself hold a subscription authorized at the doc's
+    /// CURRENT anchor epoch, so a rekey revokes the right to write exactly as it
+    /// revokes the right to read, and an outsider cannot flood content at a
+    /// document it was never admitted to.
+    pub(crate) async fn is_content_authorized(&self, user_id: &str, doc_id: &str) -> bool {
+        if !self.content_gating.load(Ordering::Relaxed) {
+            return true;
+        }
+        // No anchor means nobody is content-authorized — fail closed, as in
+        // `recipients`.
+        let Some(anchor) = self.get_anchor(doc_id).await else {
+            return false;
+        };
+        self.subscriptions.read().await.get(doc_id).and_then(|members| members.get(user_id))
+            == Some(&Some(anchor.epoch))
+    }
+
     /// Snapshot of the subscribers of `doc_id` eligible for `message`, excluding
     /// the sender. Returns `None` when nobody is eligible.
     ///
