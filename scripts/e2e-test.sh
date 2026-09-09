@@ -5,7 +5,7 @@ echo "=== Starting E2E Test Suite ==="
 
 COMPOSE="docker compose -f docker/docker-compose.yml"
 
-# ponytail: shared gate invariant with xtask/src/main.rs run_e2e() — gate on the
+# sync-invariant: shared gate rule with xtask/src/main.rs run_e2e() — gate on the
 # relay healthcheck before running tests, and pass `--include-ignored` so BOTH the
 # in-process and the #[ignore]d wire tests run. Keep this rule in sync across both
 # entry points. The docker-absent/daemon-down case intentionally DIFFERS: this

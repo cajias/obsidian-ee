@@ -39,6 +39,17 @@ const CHANNEL_CAPACITY: usize = 1024;
 /// caps the amplification of a single frame fanned out to N subscribers.
 const MAX_MESSAGE_SIZE: usize = 1 << 20;
 
+/// Maximum accepted `MlsHandshake` payload (256 KiB).
+///
+/// The 1 MiB frame cap is far too loose for a handshake. Measured sizes for
+/// this ciphersuite (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`):
+/// `KeyPackage` 279 B; `Welcome` 791 B at 2 members, 2.6 KB at 11, 9.7 KB at
+/// 51, 18.6 KB at 101 — roughly linear in group size, extrapolating to ~30-35
+/// KB at 200 members. `Commit` is smaller. This cap is ~10x that extrapolation,
+/// so it never bites a real group while denying the flood headroom the frame
+/// cap alone leaves on the ungated handshake path.
+const MAX_HANDSHAKE_PAYLOAD: usize = 256 * 1024;
+
 /// Maximum accepted length of a `doc_id` or `user_id` string.
 const MAX_ID_LEN: usize = 256;
 
@@ -656,6 +667,17 @@ impl RelayServer {
             return;
         }
 
+        // Sender-side authorization, symmetric with the receiver check in
+        // `MessageRouter::recipients`. Without it any identified client — in
+        // no-auth mode, anyone at all — could push content at any document and
+        // have it fanned out to, and queued for, every legitimate subscriber.
+        // Deliberately silent: the refused frame IS the flood, and a log line
+        // per frame would just relocate the amplification into the log.
+        if !self.router.is_content_authorized(uid, &doc_id).await {
+            send_unauthorized(tx, "not authorized to send content for this document").await;
+            return;
+        }
+
         let message = ServerMessage::YrsUpdate {
             doc_id: doc_id.clone(),
             from: uid.clone(),
@@ -680,6 +702,23 @@ impl RelayServer {
             return;
         };
         if !validate_doc_id(tx, &doc_id).await {
+            return;
+        }
+
+        // The handshake path stays open to unauthorized senders — a joiner must
+        // publish its KeyPackage before it can be a member — so it carries its
+        // own payload bound rather than inheriting the far looser frame cap.
+        if payload.len() > MAX_HANDSHAKE_PAYLOAD {
+            send_msg(
+                tx,
+                ServerMessage::Error {
+                    code: ErrorCode::LimitExceeded,
+                    message: format!(
+                        "MLS handshake payload exceeds maximum length of {MAX_HANDSHAKE_PAYLOAD}"
+                    ),
+                },
+            )
+            .await;
             return;
         }
 
@@ -1150,7 +1189,12 @@ mod tests {
     /// A capability naming `user_id` for `AUTHZ_DOC` at `AUTHZ_EPOCH` signed by
     /// `signer`, expiring far in the future.
     fn cap_for(signer: &SigningKey, user_id: &str) -> SubscribeCapability {
-        sign_subscribe_capability(signer, user_id, AUTHZ_DOC, AUTHZ_EPOCH, u64::MAX)
+        cap_at(signer, user_id, AUTHZ_EPOCH)
+    }
+
+    /// The same, at an arbitrary `epoch` — for the post-rotation cases.
+    fn cap_at(signer: &SigningKey, user_id: &str, epoch: u64) -> SubscribeCapability {
+        sign_subscribe_capability(signer, user_id, AUTHZ_DOC, epoch, u64::MAX)
     }
 
     /// A member (holding the anchor key) can register then subscribe with a
@@ -1234,6 +1278,8 @@ mod tests {
         member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
         assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
         register_anchor(&mut member, &signer).await;
+        // The sender must itself be content-authorized to publish.
+        member.subscribe_ok(cap_for(&signer, "member")).await;
 
         let mut joiner = TestClient::connect(&server).await;
         joiner.send(ClientMessage::Identify { user_id: "joiner".into(), token: None }).await;
@@ -1315,6 +1361,8 @@ mod tests {
         member.send(ClientMessage::Identify { user_id: "member".into(), token: None }).await;
         assert!(matches!(member.recv().await, ServerMessage::Identified { .. }));
         register_anchor(&mut member, &signer).await;
+        // The sender must itself be content-authorized to publish.
+        member.subscribe_ok(cap_for(&signer, "member")).await;
 
         // Eve mints a capability with her OWN (non-anchor) key.
         let eve_key = SigningKey::from_bytes(&[9u8; 32]);
@@ -1568,7 +1616,10 @@ mod tests {
         // Content half: `stale` keeps its subscription across the rotation but its
         // stored epoch no longer matches the anchor, so post-rotation content is
         // withheld. `member` (re-authorized at epoch 2) is the positive control.
+        // The sender is content-authorized at the NEW epoch too: publishing is
+        // gated on the same predicate as receiving.
         let mut sender = TestClient::connect_as(&server, "sender").await;
+        sender.subscribe_ok(cap_at(&next_signer, "sender", AUTHZ_EPOCH + 1)).await;
         sender
             .send(ClientMessage::YrsUpdate {
                 doc_id: AUTHZ_DOC.into(),
@@ -1583,6 +1634,208 @@ mod tests {
         assert!(
             stale.try_recv(QUIET).await.is_none(),
             "a rotation revokes content for a subscriber authorized at the OLD epoch"
+        );
+    }
+
+    // ---- Sender-side content authorization ----------------------------------
+
+    /// A `YrsUpdate` for [`AUTHZ_DOC`] with a distinguishable body.
+    fn authz_update(epoch: u64, data: u8) -> ClientMessage {
+        ClientMessage::YrsUpdate { doc_id: AUTHZ_DOC.into(), encrypted: vec![data; 3], epoch }
+    }
+
+    /// With content gating on, an identified client that is NOT content-authorized
+    /// cannot PUSH content. Receiver-side gating alone never covered this: any
+    /// identified client — in no-auth mode, anyone — could fan a `YrsUpdate` out
+    /// to every legitimate subscriber, and have it queued for the offline ones.
+    ///
+    /// Eve is subscribed HANDSHAKE-ONLY rather than merely unsubscribed: that is
+    /// what discriminates "authorized at the CURRENT anchor epoch" from "present
+    /// in the subscription map at all". The refusal lands before `route_message`,
+    /// so nothing is queued for anyone either.
+    ///
+    /// POSITIVE HALF: the same observer receives an update from a properly
+    /// authorized sender, so its silence for Eve's frame is evidence rather than
+    /// a vacuum.
+    #[tokio::test]
+    async fn test_unauthorized_sender_cannot_push_content() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut observer = TestClient::connect_as(&server, "observer").await;
+        register_anchor(&mut observer, &signer).await;
+        observer.subscribe_ok(cap_for(&signer, "observer")).await;
+
+        // Identified and subscribed, but presented no capability.
+        let mut eve = TestClient::connect_as(&server, "eve").await;
+        eve.send(ClientMessage::Subscribe { doc_id: AUTHZ_DOC.into(), capability: None }).await;
+        assert!(matches!(eve.recv().await, ServerMessage::Subscribed { .. }));
+
+        eve.send(authz_update(AUTHZ_EPOCH, 6)).await;
+        // `try_recv`, not `recv`: without the gate nothing comes back at all, and
+        // a blocking receive would hang the suite instead of failing it.
+        assert!(
+            matches!(
+                eve.try_recv(QUIET).await,
+                Some(ServerMessage::Error { code: ErrorCode::Unauthorized, .. })
+            ),
+            "a handshake-only sender must be refused, not silently dropped"
+        );
+        assert!(
+            observer.try_recv(QUIET).await.is_none(),
+            "content from an unauthorized sender must reach no subscriber"
+        );
+
+        let mut author = TestClient::connect_as(&server, "author").await;
+        author.subscribe_ok(cap_for(&signer, "author")).await;
+        author.send(authz_update(AUTHZ_EPOCH, 1)).await;
+        assert!(
+            matches!(observer.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a content-authorized sender still reaches the same observer"
+        );
+    }
+
+    /// Sender authorization is compared against the doc's CURRENT anchor epoch,
+    /// exactly like the receiver check: a rekey revokes the right to publish. A
+    /// removed member holding an epoch-1 subscription cannot keep writing into
+    /// the group after the rotation to epoch 2.
+    #[tokio::test]
+    async fn test_sender_with_stale_epoch_cannot_push_content() {
+        let server = TestServer::start_with(RelayServer::new().with_subscribe_authz(true)).await;
+        let signer = member_key();
+
+        let mut owner = TestClient::connect_as(&server, "owner").await;
+        register_anchor(&mut owner, &signer).await;
+        owner.subscribe_ok(cap_for(&signer, "owner")).await;
+
+        // Authorized at epoch 1 — and never re-authorized after the rotation.
+        let mut stale = TestClient::connect_as(&server, "stale").await;
+        stale.subscribe_ok(cap_for(&signer, "stale")).await;
+
+        // Rekey: rotate the anchor to epoch 2 under a new key.
+        let next = SigningKey::from_bytes(&[12u8; 32]);
+        let next_key = next.verifying_key().to_bytes();
+        owner
+            .send(ClientMessage::RegisterDocKey {
+                doc_id: AUTHZ_DOC.into(),
+                epoch: AUTHZ_EPOCH + 1,
+                public_key: next_key.to_vec(),
+                proof: sign_doc_key_proof(&next, AUTHZ_DOC, AUTHZ_EPOCH + 1),
+                rotation_proof: sign_anchor_rotation(
+                    &signer,
+                    AUTHZ_DOC,
+                    AUTHZ_EPOCH + 1,
+                    &next_key,
+                ),
+            })
+            .await;
+        owner.subscribe_ok(cap_at(&next, "owner", AUTHZ_EPOCH + 1)).await;
+
+        let mut observer = TestClient::connect_as(&server, "observer").await;
+        observer.subscribe_ok(cap_at(&next, "observer", AUTHZ_EPOCH + 1)).await;
+
+        stale.send(authz_update(AUTHZ_EPOCH + 1, 6)).await;
+        assert!(
+            matches!(
+                stale.try_recv(QUIET).await,
+                Some(ServerMessage::Error { code: ErrorCode::Unauthorized, .. })
+            ),
+            "a sender authorized at the OLD epoch must be refused after the rotation"
+        );
+        assert!(
+            observer.try_recv(QUIET).await.is_none(),
+            "content from a stale-epoch sender must reach no subscriber"
+        );
+
+        // POSITIVE HALF: the owner, re-authorized at the new epoch, still writes.
+        owner.send(authz_update(AUTHZ_EPOCH + 1, 1)).await;
+        assert!(
+            matches!(observer.recv().await, ServerMessage::YrsUpdate { .. }),
+            "a sender re-authorized at the NEW epoch still reaches the observer"
+        );
+    }
+
+    /// The MLS handshake path is deliberately open to unauthorized senders (a
+    /// joiner must publish its `KeyPackage` before it can be a member), so its
+    /// payload carries its own bound rather than inheriting the 1 MiB frame cap.
+    ///
+    /// POSITIVE HALF: a payload of exactly [`MAX_HANDSHAKE_PAYLOAD`] is accepted
+    /// and delivered, so the refusal above reads as the cap firing at the right
+    /// boundary and not as a broken handshake path.
+    ///
+    /// The oversized payload is a LITERAL 300 KiB rather than
+    /// `MAX_HANDSHAKE_PAYLOAD + 1`: derived from the const it would track any
+    /// loosening of the cap and stay green, reading only "some cap exists". A
+    /// fixed size above 256 KiB pins the boundary itself, so raising the const
+    /// turns this RED. It stays well under the 1 MiB frame cap so the refusal
+    /// comes from the handler and not from the WebSocket layer.
+    ///
+    /// The fill byte is a single digit for the same reason: `Vec<u8>` serializes
+    /// as a JSON number array, so a three-digit byte would triple the frame and
+    /// the connection would die before the handler ran — the wrong gate.
+    #[tokio::test]
+    async fn test_oversized_handshake_payload_is_refused() {
+        let server = TestServer::start().await;
+
+        let mut observer = TestClient::connect_as(&server, "observer").await;
+        observer.send(ClientMessage::Subscribe { doc_id: "doc1".into(), capability: None }).await;
+        assert!(matches!(observer.recv().await, ServerMessage::Subscribed { .. }));
+
+        let mut sender = TestClient::connect_as(&server, "sender").await;
+        sender
+            .send(ClientMessage::MlsHandshake {
+                doc_id: "doc1".into(),
+                payload: vec![1u8; 300 * 1024],
+                message_type: MlsMessageType::Commit,
+            })
+            .await;
+        assert!(
+            matches!(
+                sender.try_recv(QUIET).await,
+                Some(ServerMessage::Error { code: ErrorCode::LimitExceeded, .. })
+            ),
+            "a handshake payload over the cap must be refused with LimitExceeded"
+        );
+        assert!(
+            observer.try_recv(QUIET).await.is_none(),
+            "an oversized handshake must reach no subscriber"
+        );
+
+        sender
+            .send(ClientMessage::MlsHandshake {
+                doc_id: "doc1".into(),
+                payload: vec![1u8; MAX_HANDSHAKE_PAYLOAD],
+                message_type: MlsMessageType::Commit,
+            })
+            .await;
+        assert!(
+            matches!(observer.recv().await, ServerMessage::MlsHandshake { .. }),
+            "a handshake payload exactly at the cap must still be delivered"
+        );
+    }
+
+    /// Content gating OFF — the default, and the no-auth deployment — is
+    /// unchanged: a sender that never subscribed still publishes, so the new
+    /// sender check cannot regress a relay running without authorization.
+    #[tokio::test]
+    async fn test_gating_off_allows_unauthorized_sender() {
+        let server = TestServer::start().await;
+
+        let mut observer = TestClient::connect_as(&server, "observer").await;
+        observer.send(ClientMessage::Subscribe { doc_id: "doc1".into(), capability: None }).await;
+        assert!(matches!(observer.recv().await, ServerMessage::Subscribed { .. }));
+
+        let mut sender = TestClient::connect_as(&server, "sender").await;
+        sender
+            .send(ClientMessage::YrsUpdate {
+                doc_id: "doc1".into(),
+                encrypted: vec![1, 2, 3],
+                epoch: 1,
+            })
+            .await;
+        assert!(
+            matches!(observer.recv().await, ServerMessage::YrsUpdate { .. }),
+            "with gating off an unsubscribed sender publishes as before"
         );
     }
 }

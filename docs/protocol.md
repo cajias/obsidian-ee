@@ -238,7 +238,15 @@ sequenceDiagram
 The relay includes an `OfflineQueue` for clients that temporarily disconnect:
 
 - **Capacity**: 1,000 messages per user (configurable)
-- **Eviction**: FIFO - oldest messages dropped when queue is full
+- **Byte budgets**: split by message kind, so a flood of one cannot starve the
+  other — 112 MiB content (`YrsUpdate`) and 16 MiB handshake (`MlsHandshake`)
+  in aggregate, with an 8 MiB / 1 MiB per-user cap on each
+- **Eviction**: FIFO within a user for the count cap — oldest messages dropped
+  first. Byte-budget pressure instead evicts the *oldest* message of that kind
+  from whichever user holds the *most* of it, so a heavy user's backlog is
+  trimmed before a light user's is touched
+- **Loss is reported, not silent**: every drop (count-cap trim or byte-budget
+  eviction) is returned to the router so it can be logged
 - **Delivery**: All queued messages sent on reconnection
 - **Storage**: Currently in-memory; DynamoDB persistence planned
 

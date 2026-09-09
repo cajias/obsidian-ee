@@ -912,9 +912,12 @@ pub fn load_state(
 /// existing one with looser permissions is refused rather than silently used.
 ///
 /// ponytail: a 0600 key file is the lazy source. The upgrade path is the OS
-/// keychain (macOS Keychain / libsecret), which would protect the key against a
-/// file-level read by another process running as the same user; this does not.
-/// Swap the body of this function and nothing else changes.
+/// keychain (macOS Keychain / libsecret) via the `keyring` crate, which is not a
+/// dependency today; it would protect the key against a file-level read by
+/// another process running as the same user, which this does not. Swap the body
+/// of this function and nothing else changes. Upgrade when the CLI runs on a
+/// host with untrusted same-user code, or when the Obsidian plugin gains a
+/// keychain path and the two should match.
 ///
 /// # Errors
 ///

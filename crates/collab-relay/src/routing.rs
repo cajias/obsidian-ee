@@ -20,7 +20,48 @@ use collab_proto::{DocumentId, ServerMessage, UserId};
 use tokio::sync::RwLock;
 
 use crate::relay::ClientHandle;
-use crate::storage::OfflineQueue;
+use crate::storage::{EnqueueOutcome, OfflineQueue};
+
+/// Log any message loss the offline queue reported.
+///
+/// The protocol has no retransmit request, so a dropped frame is recovered only
+/// if a later one happens to carry the same state — which for a lost `Welcome`
+/// or `Commit` never happens. Drops must therefore never be silent; see
+/// [`EnqueueOutcome`], which reports two distinct kinds of loss:
+/// - `displaced` (byte-budget pressure) is abnormal — the relay is at a
+///   resource limit — and stays a `warn!`.
+/// - `trimmed` (`max_per_user` count-ring overflow) is routine: any
+///   long-offline user hits it on every further message once their queue is
+///   full. Warning on it would fire per routed message per saturated user,
+///   drowning the genuine contention signal `displaced` exists to surface —
+///   so it logs at `debug!` instead.
+///
+/// `admitting_for` is the recipient this message was being queued FOR, not
+/// necessarily the one that lost data: both kinds of drop take from whichever
+/// user holds the most of that kind (byte pressure) or the recipient's own
+/// oldest message (count ring). [`EnqueueOutcome`] does not carry the
+/// byte-pressure victim's identity, so the log deliberately does not claim one.
+fn log_queue_loss(admitting_for: &str, doc_id: &str, outcome: &EnqueueOutcome) {
+    if outcome.refused {
+        tracing::warn!(%admitting_for, %doc_id, "Offline queue refused a message; it is not retried");
+    }
+    if outcome.displaced > 0 {
+        tracing::warn!(
+            %admitting_for,
+            %doc_id,
+            displaced = outcome.displaced,
+            "Offline queue admitted a message by dropping older ones under byte pressure"
+        );
+    }
+    if outcome.trimmed > 0 {
+        tracing::debug!(
+            %admitting_for,
+            %doc_id,
+            trimmed = outcome.trimmed,
+            "Offline queue trimmed to the per-user message cap"
+        );
+    }
+}
 
 /// A per-document subscribe-authorization anchor (issue #29).
 ///
@@ -192,7 +233,19 @@ impl MessageRouter {
             .get(&handle.user_id)
             .is_some_and(|previous| previous.conn_id() != handle.conn_id());
 
-        // ponytail: no-auth mode permits self-takeover (no identity to protect); shared-token binding + session liveness detection (ping/pong or idle-read timeout to reap dead sessions promptly) deferred until multi-tenant auth exists
+        // ponytail: this guard is defense-in-depth only — `handle_identify`
+        // returns early on a bad token, so `allow_takeover` is always true by
+        // the time it calls here and the `false` branch below is unreachable in
+        // production (only a unit test exercises it). Ceiling: RELAY_AUTH_TOKEN
+        // is one SHARED bearer token compared without reference to `user_id`, so
+        // any holder can claim and force-evict any user_id; `user_id` is
+        // otherwise self-asserted. A subscribe capability does not help — it
+        // proves group membership, not identity, and every member derives the
+        // same signing key. There is also no liveness detection (no ping/pong,
+        // no idle-read timeout, no reaper), so a half-open session lingers until
+        // TCP reaps it. Upgrade: bind user_id to a per-user credential, then
+        // reap dead sessions promptly. Revisit when the relay gains a second
+        // tenant.
         if has_stale_session && !allow_takeover {
             tracing::warn!(
                 user = %handle.user_id,
@@ -335,8 +388,9 @@ impl MessageRouter {
         // slots forever (the per-doc / global caps would fill with dead members).
         let mut evicted: Vec<UserId> = Vec::new();
         for subscriber_id in offline.iter().chain(slow.iter().map(|(id, _)| id)) {
-            let user = self.offline.enqueue(subscriber_id, message.clone()).await;
-            evicted.extend(user);
+            let outcome = self.offline.enqueue(subscriber_id, message.clone()).await;
+            log_queue_loss(subscriber_id, doc_id, &outcome);
+            evicted.extend(outcome.evicted_user);
         }
         if !evicted.is_empty() {
             self.drop_subscriptions(&evicted).await;
@@ -350,12 +404,35 @@ impl MessageRouter {
     /// user's subscription lifetime is tied to offline-queue retention.
     // ponytail: O(documents) scan per eviction; eviction is rare (only at
     // capacity), so a reverse user->docs index isn't worth the extra state.
+    // Upgrade: add the index if eviction stops being rare — i.e. if the relay
+    // routinely runs at DEFAULT_MAX_USERS, or if this scan shows up in a profile.
     async fn drop_subscriptions(&self, users: &[UserId]) {
         let mut subs = self.subscriptions.write().await;
         subs.retain(|_doc, members| {
             members.retain(|member, _| !users.contains(member));
             !members.is_empty()
         });
+    }
+
+    /// Whether `user_id` may PUBLISH content to `doc_id`.
+    ///
+    /// The same predicate [`Self::recipients`] applies to receivers, applied to
+    /// the sender instead. With gating off everyone may publish, unchanged. With
+    /// it on the sender must itself hold a subscription authorized at the doc's
+    /// CURRENT anchor epoch, so a rekey revokes the right to write exactly as it
+    /// revokes the right to read, and an outsider cannot flood content at a
+    /// document it was never admitted to.
+    pub(crate) async fn is_content_authorized(&self, user_id: &str, doc_id: &str) -> bool {
+        if !self.content_gating.load(Ordering::Relaxed) {
+            return true;
+        }
+        // No anchor means nobody is content-authorized — fail closed, as in
+        // `recipients`.
+        let Some(anchor) = self.get_anchor(doc_id).await else {
+            return false;
+        };
+        self.subscriptions.read().await.get(doc_id).and_then(|members| members.get(user_id))
+            == Some(&Some(anchor.epoch))
     }
 
     /// Snapshot of the subscribers of `doc_id` eligible for `message`, excluding
