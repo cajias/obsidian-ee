@@ -195,13 +195,14 @@ Document-based pub/sub routing. When a message arrives for a document, the route
 
 ```rust
 pub struct OfflineQueue {
-    inner: Arc<RwLock<Inner>>,  // queues + insertion order
+    inner: Arc<RwLock<Inner>>,  // queues + per-kind byte counters
     max_per_user: usize,  // Default: 1000
     max_users: usize,     // Default: 10_000
+    bytes: ByteLimits,    // split content/handshake budgets, aggregate + per-user
 }
 ```
 
-In-memory FIFO queue per user. Memory is bounded on two axes: `max_per_user` caps the messages retained for a single user (oldest dropped first), and `max_users` caps the number of distinct users tracked (the least-recently-inserted user's queue is evicted when full). A DynamoDB-backed implementation is planned, behind a future Cargo feature; it is not wired up today.
+In-memory FIFO queue per user. Memory is bounded on three axes: `max_per_user` caps the messages retained for a single user (oldest dropped first), `max_users` caps the number of distinct users tracked (the least-recently-inserted user's queue is evicted when full), and `ByteLimits` caps retained payload bytes — split into separate `content` (`YrsUpdate`) and `handshake` (`MlsHandshake`) budgets, each with its own aggregate and per-user cap, so a flood of one kind cannot starve the other. When a kind's budget is full, `enqueue` makes room by evicting that kind's *oldest* message from whichever user holds the *most* of it, rather than refusing the incoming message — a modest queue is never the victim while a bigger one exists. `enqueue` returns an `EnqueueOutcome` reporting every drop (byte-budget eviction, count-cap trim, whole-user eviction), so message loss is observable rather than silent. A DynamoDB-backed implementation is planned, behind a future Cargo feature; it is not wired up today.
 
 ### Configuration
 

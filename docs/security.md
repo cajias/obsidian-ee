@@ -414,6 +414,16 @@ onto fan-out:
   content-authorized** — it fails closed.
 - The check runs *before* fan-out, so an unauthorized subscriber is excluded from
   the offline queue too and cannot accumulate content for later hand-over.
+- **Publishing is gated by the same predicate, applied to the sender**
+  (`MessageRouter::is_content_authorized`). Before this, any identified client —
+  in no-auth mode, anyone at all — could push `YrsUpdate` content at any
+  document. Now the sender must itself hold a subscription authorized at the
+  doc's current anchor epoch, so a rekey revokes the right to write exactly as
+  it revokes the right to read, and an outsider cannot flood content at a
+  document it was never admitted to. It fails closed the same way: no anchor
+  means no sender is authorized. `MlsHandshake` is deliberately exempt — a
+  joiner must publish its `KeyPackage` before it can be a member — and is
+  bounded instead by a 256 KiB payload cap.
 
 Content gating was the first half of the "MLS hardening" item; the default flip
 above is the second, and both have now landed.
@@ -451,8 +461,17 @@ above is the second, and both have now landed.
   subscriber that never gets enqueued is never reached by `drop_subscriptions`, so
   repeated connect/`Identify`/`Subscribe`/disconnect cycles can wedge a document's
   subscriber cap. Byte-boundedness still holds (the count cap times `MAX_ID_LEN`;
-  the offline queue is byte-capped separately). This is availability, not
-  confidentiality, and the bearer token (`RELAY_AUTH_TOKEN`) is the outer gate.
+  the offline queue's byte budget is now split by message kind — content and
+  handshake each get their own aggregate and per-user cap). That split is what
+  buys fair sharing here: `MlsHandshake` is the one channel that stays open to
+  unauthorized senders, so a handshake flood is confined to the handshake
+  budget and cannot consume the content budget, and largest-holder eviction
+  within a budget means one flooding user cannot starve another user's queue —
+  it only trims its own. This is availability, not confidentiality, and the
+  bearer token (`RELAY_AUTH_TOKEN`) is the outer gate. None of this implies
+  per-user identity: the relay still authenticates against a single shared
+  token and a self-asserted `user_id`, and an in-group member can still flood
+  within its own fair share.
 - **Offline content queued at epoch `N` is still delivered after a rotation to
   `N+1`** — `drain_offline` is unconditional. Not a confidentiality leak: the
   recipient was a member at epoch `N` and holds that epoch's key, so this is

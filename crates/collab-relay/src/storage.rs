@@ -285,9 +285,15 @@ pub(crate) struct EnqueueOutcome {
     pub(crate) evicted_user: Option<UserId>,
     /// The message could not be queued at all.
     pub(crate) refused: bool,
-    /// Previously-queued messages dropped for this one: byte-budget evictions
-    /// plus any `max_per_user` count-cap drops. Both are silent loss otherwise.
+    /// Previously-queued messages dropped under BYTE-budget pressure (per-user
+    /// or aggregate). Abnormal: it means the relay is at a resource limit.
     pub(crate) displaced: usize,
+    /// Previously-queued messages dropped by the `max_per_user` COUNT ring.
+    /// Routine: any long-offline user hits this on every further message once
+    /// their queue is full, so it must never be conflated with `displaced` —
+    /// otherwise a healthy steady state looks identical to real contention.
+    /// Still real loss (see [`Kind`]), so it is still reported here.
+    pub(crate) trimmed: usize,
 }
 
 /// Byte budgets for [`OfflineQueue`], split by message kind.
@@ -434,12 +440,15 @@ impl OfflineQueue {
     /// new user at `max_users` capacity evicts the least-recently-inserted one.
     ///
     /// EVERY drop is reported in the returned [`EnqueueOutcome`] — byte-budget
-    /// evictions and `max_per_user` count-cap drops alike — because none of them
-    /// is safe to lose silently (see [`Kind`]) and the protocol has no
-    /// retransmit request: recovery depends entirely on a later frame arriving.
-    /// Callers are expected to log it. `evicted_user` additionally requires the
-    /// router to prune that user's subscriptions, so a never-reconnecting user
-    /// cannot pin subscription slots forever.
+    /// evictions (`displaced`) and `max_per_user` count-cap drops (`trimmed`)
+    /// alike — because none of them is safe to lose silently (see [`Kind`]) and
+    /// the protocol has no retransmit request: recovery depends entirely on a
+    /// later frame arriving. The two are kept apart because they mean different
+    /// things: `displaced` signals resource contention, `trimmed` is routine for
+    /// any long-offline user. Callers are expected to log both, at different
+    /// severities. `evicted_user` additionally requires the router to prune
+    /// that user's subscriptions, so a never-reconnecting user cannot pin
+    /// subscription slots forever.
     pub(crate) async fn enqueue(&self, user_id: &str, message: ServerMessage) -> EnqueueOutcome {
         let kind = message_kind(&message);
         let msg_bytes = message_bytes(&message);
@@ -471,9 +480,9 @@ impl OfflineQueue {
         let queue = inner.queues.entry(user_id.to_string()).or_default();
         queue.charge(kind, msg_bytes);
         queue.messages.push_back(message);
-        displaced += trim_to_cap(&mut inner, user_id, self.max_per_user);
+        let trimmed = trim_to_cap(&mut inner, user_id, self.max_per_user);
         drop(inner);
-        EnqueueOutcome { evicted_user: evicted, refused: false, displaced }
+        EnqueueOutcome { evicted_user: evicted, refused: false, displaced, trimmed }
     }
 
     /// Retrieve and clear all queued messages for a user.
@@ -616,11 +625,16 @@ mod tests {
 
         // Queue 5 messages for bob (exceeds limit of 3). The count cap is a
         // silent drop path unless it is reported, so collect what it reports.
-        let mut displaced = Vec::new();
+        let mut trimmed = Vec::new();
         for i in 1..=5 {
-            displaced.push(queue.enqueue("bob", make_update("doc1", "alice", i)).await.displaced);
+            let outcome = queue.enqueue("bob", make_update("doc1", "alice", i)).await;
+            assert_eq!(
+                outcome.displaced, 0,
+                "a count-cap drop must not be reported as byte pressure"
+            );
+            trimmed.push(outcome.trimmed);
         }
-        assert_eq!(displaced, vec![0, 0, 0, 1, 1], "count-cap drops must be reported too");
+        assert_eq!(trimmed, vec![0, 0, 0, 1, 1], "count-cap drops must be reported too");
 
         // Only last 3 should remain
         assert_eq!(queue.message_count("bob").await, 3);
@@ -859,6 +873,29 @@ mod tests {
         assert!(!displaced.refused);
         assert_eq!(displaced.displaced, 1, "one message dropped to make room");
         assert_eq!(queue.message_count("alice").await, 1, "the largest queue pays");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::excessive_nesting)]
+    async fn test_count_ring_trim_is_not_reported_as_byte_pressure() {
+        // Byte budget huge (only the count ring can bite); max_per_user tiny.
+        let queue = OfflineQueue::with_byte_limits(2, 1000, flat_limits(1_000_000));
+
+        queue.enqueue("alice", make_sized("doc1", "x", 10)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 10)).await;
+
+        // Third message overflows the count ring only; nowhere near the byte cap.
+        let outcome = queue.enqueue("alice", make_sized("doc1", "x", 10)).await;
+        assert_eq!(outcome.trimmed, 1, "count-ring overflow must be reported as trimmed");
+        assert_eq!(outcome.displaced, 0, "a count-ring drop must not be reported as byte pressure");
+
+        // Positive half: genuine byte pressure elsewhere still reports displaced.
+        let tight = OfflineQueue::with_byte_limits(1000, 1000, flat_limits(20));
+        tight.enqueue("bob", make_sized("doc1", "x", 10)).await;
+        tight.enqueue("bob", make_sized("doc1", "x", 10)).await;
+        let byte_pressure = tight.enqueue("carol", make_sized("doc1", "x", 10)).await;
+        assert!(byte_pressure.displaced > 0, "genuine byte pressure must still report displaced");
+        assert_eq!(byte_pressure.trimmed, 0, "byte pressure must not be reported as a count trim");
     }
 
     #[tokio::test]
