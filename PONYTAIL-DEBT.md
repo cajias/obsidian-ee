@@ -4,7 +4,9 @@ Every deliberate shortcut in this repo carries a `ponytail:` comment naming its
 ceiling and its upgrade trigger. This is the harvest of those comments, with a
 disposition per row so a deferral cannot quietly become permanent.
 
-Audited 2026-09-09. Branched from `main` @ `8db2779`; all line numbers below are against this branch's HEAD, after the comment rewrites this audit made.
+Audited 2026-09-09. Branched from `main` @ `8db2779`. Line numbers are against
+this branch's HEAD, after both the comment rewrites this audit made and the
+three fixes it led to (`7f35087`, `445407b`, `f06d870`).
 
 **Disposition key**
 
@@ -15,53 +17,56 @@ Audited 2026-09-09. Branched from `main` @ `8db2779`; all line numbers below are
 | **SHARPENED** | Still deferred; the comment named no revisit trigger and now does. |
 | **MISFILED** | Not deferred work. Re-tagged out of the ledger. |
 | **DECISION** | Deferred, but the upgrade needs a call the code cannot make alone. |
+| **PAID** | No longer deferred. The shortcut was removed and the marker with it. |
 
 ---
 
 ## crates/collab-relay/src/storage.rs
 
-**`storage.rs:180` — no per-user byte cap on the offline queue. — CORRECTED**
+**`storage.rs:180` (removed) — no per-user byte cap on the offline queue. — PAID**
 
-- **Ceiling:** one recipient can hold the entire shared byte budget. A few
-  hundred max-size frames fill `DEFAULT_MAX_TOTAL_BYTES` (128 MiB), still well
-  under that user's 1000 count slots; every other user's `enqueue` is then
-  refused, and those peers' CRDT replicas diverge — the exact outcome the queue
-  exists to prevent.
-- **Why the old comment was wrong:** it claimed "the per-user *count* cap
-  already bounds a single user". It does not — the byte budget binds first, at
-  roughly 450 frames, so the count cap never engages.
-- **Arithmetic footnote:** the budget charges *decoded* `payload.len()`, not the
-  wire size. Frames are JSON text (`Message::Text` + `serde_json`,
-  `relay.rs:278`/`:300`/`:830`/`:838`) and `payload: Vec<u8>` carries no
-  `serde_bytes`/base64 attribute, so it serializes as a number array at ~3.5
-  chars per random byte. A 1 MiB `MAX_MESSAGE_SIZE` frame therefore charges only
-  ~300 KiB. The `DEFAULT_MAX_TOTAL_BYTES` doc comment had inherited the same
-  wire-size-equals-charged-size error and was corrected alongside the marker.
-- **Why the fix is still NOT a per-user byte cap:** it would bound an *honest*
-  heavy user but not an adversarial one, because puppet recipients are nearly
-  free and need no group membership at all. A bare `Subscribe` with
-  `authorized_epoch: None` requires no capability (`routing.rs:267-280`),
-  handshake traffic is never content-gated (`routing.rs:394-397`), and
-  subscriptions deliberately survive disconnect — so any client that can
-  `Identify` can park N offline sockpuppets and fill the budget with ungated
-  1 MiB `MlsHandshake` payloads. A per-user cap of X MiB just costs the attacker
-  128/X puppets. A counter that claims to close starvation and does not is worse
-  than an honest comment.
-- **Upgrade:** per-user cap if an honest user is observed starving others;
-  per-document or per-sender fair-share to close the adversarial case.
-- **Second false premise, in the same block, now corrected:** `storage.rs:174-179`
-  claimed a refused update "is simply resynced by this user on reconnect". It is
-  not. `ClientMessage`/`ServerMessage` (`crates/collab-proto/src/lib.rs:38-141`)
-  carry no state-vector, sync-step, or resync message in either direction — the
-  variants are `Identify`, `Subscribe`, `RegisterDocKey`, `Unsubscribe`,
-  `YrsUpdate`, `MlsHandshake` — so a dropped update is never recovered and the
-  module doc at `storage.rs:4-5` is the accurate one. That makes this a
-  **data-integrity** DoS, not merely an availability one, and raises the priority
-  of the fair-share upgrade above.
+Fixed in `7f35087`, `445407b` and `f06d870`; the marker is gone. What it
+described, and what closed it:
+
+- **The starvation itself.** One recipient could hold the whole shared byte
+  budget, after which every other user's `enqueue` was refused. The budget is now
+  split by kind (112 MiB content / 16 MiB handshake, per-user caps 8 MiB / 1 MiB),
+  and at budget the queue evicts from the LARGEST holder of that kind instead of
+  refusing the newcomer — so a modest user is never the victim while a hog exists.
+- **The aiming mechanism.** The marker's own analysis said a per-user cap would
+  not help because puppet recipients were free. That was right, and the reason was
+  worse than recorded: `handle_yrs_update` had no sender authorization at all, so
+  any identified client could push content at any document. Publishing is now
+  gated on the same predicate as receiving. The handshake channel must stay open
+  to non-members, so it is bounded by size instead (256 KiB, ~10x a measured
+  200-member Welcome).
+- **The silence.** `enqueue` returned `Option<UserId>`, which conflated refused,
+  queued and evicted — no caller could observe loss. It now returns
+  `EnqueueOutcome`, and the router logs contention as `warn` and routine count-ring
+  trims as `debug`.
+- **A claim this ledger got wrong twice.** The row previously asserted that a
+  dropped update diverges the replica permanently, then that it self-heals.
+  Neither is right. Content frames are cumulative full state
+  (`encryption.rs:71-72` -> `document.rs:64-66`), so a dropped one is carried by
+  the next frame — but only if some peer edits again, so a quiet document stays
+  diverged. A lost `Welcome` or `Commit` never heals at all, and that is the kind
+  an outsider could send. The corrected reasoning now lives on the `Kind` enum.
+
+Two NEW markers replace it, both recording ceilings of the fix rather than
+deferred work on the old one:
+
+**`storage.rs:190` — O(queue) walk to find the oldest message of one kind. — DEFERRED**
+The single deque is what keeps drain FIFO across kinds, which the TS client
+depends on. Runs only under budget pressure. Upgrade: a per-kind index of deque
+positions if eviction stops being rare.
+
+**`storage.rs:203` — O(users) scan per evicted message. — DEFERRED**
+The happy path stays O(1). Upgrade: a per-kind max-heap keyed by bytes if the
+relay routinely sits at its budget.
 
 ## crates/collab-relay/src/routing.rs
 
-**`routing.rs:195` — session takeover under a shared token. — CORRECTED**
+**`routing.rs:236` — session takeover under a shared token. — CORRECTED**
 
 - **Ceiling:** `RELAY_AUTH_TOKEN` is a single *shared* bearer token compared
   without reference to `user_id` (`relay.rs:370-371`), so any holder can claim
@@ -82,7 +87,7 @@ Audited 2026-09-09. Branched from `main` @ `8db2779`; all line numbers below are
 - **Upgrade:** bind `user_id` to a per-user credential, then reap dead sessions
   promptly. Revisit when the relay gains a second tenant.
 
-**`routing.rs:363` — O(documents) scan per eviction. — SHARPENED**
+**`routing.rs:405` — O(documents) scan per eviction. — SHARPENED**
 
 - **Ceiling:** `drop_subscriptions` scans every document's subscriber set.
   Eviction only happens at capacity, so a reverse `user -> docs` index is not
@@ -213,4 +218,6 @@ Verified nothing greps `ponytail:` in `.github/`, `.claude/`, or
 
 ---
 
-16 markers, 0 with no trigger.
+17 markers, 0 with no trigger. One deferral (offline-queue starvation) was paid
+down rather than re-deferred; the two markers that replaced it record the cost of
+the fix, not a reprieve from it.
