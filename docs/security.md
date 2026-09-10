@@ -463,15 +463,26 @@ above is the second, and both have now landed.
   subscriber cap. Byte-boundedness still holds (the count cap times `MAX_ID_LEN`;
   the offline queue's byte budget is now split by message kind — content and
   handshake each get their own aggregate and per-user cap). That split is what
-  buys fair sharing here: `MlsHandshake` is the one channel that stays open to
-  unauthorized senders, so a handshake flood is confined to the handshake
-  budget and cannot consume the content budget, and largest-holder eviction
-  within a budget means one flooding user cannot starve another user's queue —
-  it only trims its own. This is availability, not confidentiality, and the
-  bearer token (`RELAY_AUTH_TOKEN`) is the outer gate. None of this implies
-  per-user identity: the relay still authenticates against a single shared
-  token and a self-asserted `user_id`, and an in-group member can still flood
-  within its own fair share.
+  buys fair sharing between *recipients*: `MlsHandshake` is the one channel
+  that stays open to unauthorized senders, so a handshake flood is confined
+  to the handshake budget and cannot consume the content budget, and
+  largest-holder eviction across that budget means one flooded recipient
+  cannot grow past its share and starve a different recipient's queue. It
+  does not isolate *senders* within a single recipient's own queue:
+  `MlsHandshake` is never content-gated (`Router::recipients`), so any
+  identified client can address handshake frames at any document, and once a
+  recipient's handshake budget is exceeded, `trim_user_budget` evicts the
+  oldest handshake frame in its queue regardless of who sent it. If that
+  frame was a joiner's pending `Welcome`, the loss does not heal — the joiner
+  has already freed the key package its leaf private key came from, so it is
+  stranded until an owner re-invite (see the `Kind` enum docs in
+  `storage.rs` and the client's handling in `collab-client.ts`). The 256 KiB
+  payload cap and the handshake/content split bound how much volume a flood
+  can add; neither orders the queue. This is availability, not
+  confidentiality, and the bearer token (`RELAY_AUTH_TOKEN`) is the outer
+  gate. None of this implies per-user identity: the relay still
+  authenticates against a single shared token and a self-asserted `user_id`,
+  and an in-group member can still flood within its own fair share.
 - **Offline content queued at epoch `N` is still delivered after a rotation to
   `N+1`** — `drain_offline` is unconditional. Not a confidentiality leak: the
   recipient was a member at epoch `N` and holds that epoch's key, so this is

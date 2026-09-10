@@ -15,7 +15,10 @@
 //!   `max_users * max_per_user * MAX_MESSAGE_SIZE` (~1 TiB) of retained memory,
 //!   because subscriptions survive disconnect: an attacker can amass many
 //!   offline-but-subscribed user ids on a document and push max-size frames to
-//!   each. The byte budget is the ceiling that actually prevents OOM.
+//!   each. The byte budget is the ceiling that actually prevents OOM for
+//!   large-payload traffic — it bounds PAYLOAD bytes only (see
+//!   `message_bytes`), not the per-message `doc_id`/`from` id overhead, which
+//!   rides outside it and is bounded by the count caps alone.
 //!
 //! The byte ceiling is split two ways, because a single first-come-first-served
 //! budget starves whoever asks second. NEITHER kind is safely droppable — see
@@ -79,11 +82,17 @@ const fn message_kind(message: &ServerMessage) -> Kind {
 
 /// Payload byte size charged against the queue's byte budget for a message.
 ///
-/// Only the variable-length encrypted/handshake payload is counted — that is the
-/// attacker-controlled part that can approach `MAX_MESSAGE_SIZE`. Fixed-size
-/// fields (ids, epoch) are negligible and are ignored so the charge/credit is a
-/// cheap, unambiguous `O(1)` value that is identical every time it is computed
-/// for the same message.
+/// Only the variable-length encrypted/handshake payload is counted. The `epoch`
+/// field is genuinely fixed-size and negligible. `doc_id` and `from` are NOT
+/// fixed-size — both are attacker-chosen strings up to `MAX_ID_LEN` (256 bytes
+/// each, `relay.rs:54`) — but are deliberately left uncharged so the
+/// charge/credit stays a cheap, unambiguous `O(1)` value that is identical
+/// every time it is computed for the same message, and symmetric at both ends.
+// ponytail: leaves ~5 GiB of uncharged id bytes reachable at the default caps
+// (max_users 10,000 × max_per_user 1,000 × ~512 B/msg of ids) on top of the
+// 128 MiB payload ceiling — small-payload traffic is bounded by message COUNT,
+// not bytes. Upgrade: charge `doc_id.len() + from.len()` here too, or size
+// `max_users * max_per_user` against a real memory target.
 const fn message_bytes(message: &ServerMessage) -> usize {
     match message {
         ServerMessage::YrsUpdate { encrypted, .. } => encrypted.len(),
@@ -174,15 +183,21 @@ impl Inner {
     }
 
     /// Remove the message at `idx` of `user`'s queue, crediting BOTH the
-    /// per-user and aggregate counters. The single removal path is what keeps
-    /// the two from drifting apart.
+    /// per-user and aggregate counters, and reaping the user's entry once its
+    /// last message is gone. The single removal path is what keeps the counters
+    /// from drifting apart — and `queues` from drifting out of `order`.
     fn remove_at(&mut self, user: &str, idx: usize) -> bool {
         let Some(queue) = self.queues.get_mut(user) else { return false };
         let Some(message) = queue.messages.remove(idx) else { return false };
         let kind = message_kind(&message);
         let bytes = message_bytes(&message);
         queue.credit(kind, bytes);
+        let emptied = queue.messages.is_empty();
         self.credit(kind, bytes);
+        if emptied {
+            self.queues.remove(user);
+            self.order.retain(|u| u != user);
+        }
         true
     }
 
@@ -245,9 +260,9 @@ fn trim_user_budget(inner: &mut Inner, user: &str, kind: Kind, needed: usize, ca
 ///
 /// The caller guarantees `needed <= budget`, so this always makes room: the
 /// aggregate counter is the sum of the per-user ones, hence it reaches zero
-/// before [`Inner::largest_holder`] runs out of victims. A user may be left with
-/// an empty queue; that is harmless — `drain` and the `max_users` eviction both
-/// clean the entry up, and `has_messages` already reports it as empty.
+/// before [`Inner::largest_holder`] runs out of victims. A user drained to
+/// nothing is reaped by [`Inner::remove_at`] as its last message goes, so an
+/// emptied queue never inflates `queues.len()` toward the `max_users` threshold.
 fn make_room(inner: &mut Inner, kind: Kind, needed: usize, budget: usize) -> usize {
     let mut dropped = 0;
     while inner.bytes(kind) + needed > budget {
@@ -911,5 +926,58 @@ mod tests {
 
         assert_eq!(queue.message_count("alice").await, 2, "per-user cap must bound one user");
         assert_eq!(queue.total_bytes().await, 200);
+    }
+    #[tokio::test]
+    async fn test_emptied_victim_is_not_left_tracked() {
+        // Content budget 120; carol holds a little, alice holds the rest.
+        let queue = OfflineQueue::with_byte_limits(10, 10, flat_limits(120));
+        queue.enqueue("carol", make_sized("doc1", "x", 20)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+
+        // A 100-byte newcomer needs alice's whole 90 bytes: she is the largest
+        // holder at every step, so make_room drains her to nothing.
+        let outcome = queue.enqueue("bob", make_sized("doc1", "x", 100)).await;
+        assert!(!outcome.refused);
+        assert_eq!(outcome.displaced, 3, "alice's three messages pay for the newcomer");
+
+        // The emptied user must not be left parked as a zero-byte entry.
+        assert!(!queue.has_messages("alice").await);
+        // Positive half: this is selective reaping, not a cleared map — the
+        // users that still hold messages are still tracked.
+        assert_eq!(queue.tracked_users().await, 2, "only the emptied user is reaped");
+        assert_eq!(queue.message_count("carol").await, 1, "a smaller holder is untouched");
+        assert_eq!(queue.message_count("bob").await, 1, "the newcomer is queued");
+    }
+
+    #[tokio::test]
+    async fn test_reaping_keeps_order_and_queues_in_sync() {
+        // Room for 3 tracked users; a 120-byte content budget.
+        let queue = OfflineQueue::with_byte_limits(10, 3, flat_limits(120));
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+        queue.enqueue("alice", make_sized("doc1", "x", 30)).await;
+
+        // Each of these drains the previous sole holder completely.
+        queue.enqueue("bob", make_sized("doc1", "x", 120)).await;
+        queue.enqueue("carol", make_sized("doc1", "x", 10)).await;
+        assert_eq!(queue.tracked_users().await, 1, "alice and bob are both emptied and reaped");
+
+        // Refilling to capacity must not evict anyone: the reaped entries left
+        // no residue in `order` to pop, and no slot is falsely occupied.
+        assert!(queue.enqueue("dave", make_sized("doc1", "x", 10)).await.evicted_user.is_none());
+        let realice = queue.enqueue("alice", make_sized("doc1", "x", 10)).await;
+        assert!(realice.evicted_user.is_none(), "a reaped user re-enters without evicting");
+
+        // At capacity the victim is the genuinely oldest LIVE user, and the
+        // re-added user keeps her fresh position rather than her reaped one.
+        let full = queue.enqueue("erin", make_sized("doc1", "x", 10)).await;
+        assert_eq!(full.evicted_user, Some("carol".to_string()), "oldest live user is evicted");
+        assert_eq!(queue.tracked_users().await, 3, "tracked count equals users holding messages");
+        assert!(queue.has_messages("dave").await);
+        assert!(queue.has_messages("alice").await, "a re-added user must not be evicted early");
+        assert!(queue.has_messages("erin").await);
     }
 }
