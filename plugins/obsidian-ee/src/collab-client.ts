@@ -470,7 +470,11 @@ export class CollabClient {
             // un-anchored group is snapshotted and restored, so it is excluded
             // from bootstrapping and keeps presenting capabilities against an
             // anchor the relay never received — a permanently content-blind
-            // session that fails closed and resolves normally.
+            // session that fails closed. It is NOT silent: the relay rejects
+            // with `Unauthorized` and `handleMessage`'s `error` case surfaces it
+            // via `reportError`, and since sender authorization landed every
+            // subsequent `sendYrsUpdate` is refused too, so the signal repeats.
+            // What is missing is correlation, not noise.
             //
             // Closing it needs a retry driven by the relay's Unauthorized, which
             // is not expressible today: `ServerMessage::Error` carries a code and
