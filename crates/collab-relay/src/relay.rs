@@ -714,7 +714,7 @@ impl RelayServer {
                 ServerMessage::Error {
                     code: ErrorCode::LimitExceeded,
                     message: format!(
-                        "MLS handshake payload exceeds maximum length of {MAX_HANDSHAKE_PAYLOAD}"
+                        "MLS handshake payload exceeds maximum size of {MAX_HANDSHAKE_PAYLOAD} bytes"
                     ),
                 },
             )
