@@ -4,7 +4,18 @@ Every deliberate shortcut in this repo carries a `ponytail:` comment naming its
 ceiling and its upgrade trigger. This is the harvest of those comments, with a
 disposition per row so a deferral cannot quietly become permanent.
 
-Audited 2026-09-09. Branched from `main` @ `8db2779`. Line numbers are against
+> **Line numbers drift.** They are a convenience, not an identity — any edit
+> above a marker shifts it, and two PRs touching one file will desync this file
+> from the tree even when both are individually correct (that happened three
+> times while this ledger was being written). Re-snapshot with the scan below
+> and diff it against the rows before trusting any line number here; the
+> enclosing function name is the stable identifier.
+>
+> ```
+> grep -rnE '(#|//|\*) ?ponytail:' crates/ plugins/obsidian-ee/src/ | grep -v '/target/'
+> ```
+
+Audited 2026-09-09, re-run 2026-09-11. Branched from `main` @ `8db2779`. Line numbers are against
 this branch's HEAD, after both the comment rewrites this audit made and the
 three fixes it led to (`7f35087`, `445407b`, `f06d870`).
 
@@ -191,13 +202,13 @@ message that does not exist.
   practice, or whenever `Error` gains a `doc_id` for another reason — the field
   is cheap to ride along.
 
-**`collab-client.ts:576` — no mid-handshake resume state machine. — SHARPENED**
+**`collab-client.ts:580` — no mid-handshake resume state machine. — SHARPENED**
 Fails closed (no plaintext); `armJoinTimer` is the cheap recovery. Explicit YAGNI.
 
 - **Upgrade (added):** when joiners drop mid-handshake often enough that waiting
   out the join deadline is visibly slow.
 
-**`collab-client.ts:1088` — a joiner with a lost Welcome stays stuck. — SHARPENED**
+**`collab-client.ts:1092` — a joiner with a lost Welcome stays stuck. — SHARPENED**
 
 - **Ceiling:** the joiner already freed the key package its leaf's private key
   came from, so recovery needs an owner-side re-invite protocol that does not
@@ -207,7 +218,7 @@ Fails closed (no plaintext); `armJoinTimer` is the cheap recovery. Explicit YAGN
   failed join is cheaper than the manual remove/re-add — i.e. once users hit the
   stuck state often enough to report it.
 
-**`collab-client.ts:1103` — admission by name, not public key. — DECISION**
+**`collab-client.ts:1107` — admission by name, not public key. — DECISION**
 
 - **Ceiling:** a `BasicCredential` identity is self-asserted, so knowing an
   allowlisted name is sufficient. This stops the stranger who knows only the doc
