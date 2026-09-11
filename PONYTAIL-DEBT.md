@@ -52,15 +52,29 @@ described, and what closed it:
   diverged. A lost `Welcome` or `Commit` never heals at all, and that is the kind
   an outsider could send. The corrected reasoning now lives on the `Kind` enum.
 
+**`storage.rs:91` — `message_bytes` charges the payload only. — DEFERRED**
+
+- **Ceiling:** `doc_id` and `from` are attacker-chosen strings up to `MAX_ID_LEN`
+  (256 B each) and are left uncharged, and no *minimum* payload length is checked
+  anywhere — so a zero-byte message is admitted and charged 0 against every
+  budget. Small-payload traffic is bounded by message COUNT, not bytes: roughly
+  5 GiB of uncharged ids at the default caps, on top of the 128 MiB payload
+  ceiling. A reader of the module docs would put the real ceiling ~40x lower.
+- **Why not fixed:** charging the ids would make charge/credit depend on id
+  length at both ends. `docs/security.md` already accepts the class (count times
+  `MAX_ID_LEN`); what was missing was its size, which the marker now names.
+- **Upgrade:** charge `doc_id.len() + from.len()` too, or size
+  `max_users * max_per_user` against a real memory target.
+
 Two NEW markers replace it, both recording ceilings of the fix rather than
 deferred work on the old one:
 
-**`storage.rs:190` — O(queue) walk to find the oldest message of one kind. — DEFERRED**
+**`storage.rs:205` — O(queue) walk to find the oldest message of one kind. — DEFERRED**
 The single deque is what keeps drain FIFO across kinds, which the TS client
 depends on. Runs only under budget pressure. Upgrade: a per-kind index of deque
 positions if eviction stops being rare.
 
-**`storage.rs:203` — O(users) scan per evicted message. — DEFERRED**
+**`storage.rs:218` — O(users) scan per evicted message. — DEFERRED**
 The happy path stays O(1). Upgrade: a per-kind max-heap keyed by bytes if the
 relay routinely sits at its budget.
 
@@ -218,6 +232,10 @@ Verified nothing greps `ponytail:` in `.github/`, `.claude/`, or
 
 ---
 
-17 markers, 0 with no trigger. One deferral (offline-queue starvation) was paid
-down rather than re-deferred; the two markers that replaced it record the cost of
-the fix, not a reprieve from it.
+18 markers, 0 with no trigger.
+
+The offline-queue starvation deferral was paid down rather than re-deferred; the
+markers that replaced it record the cost of the fix, not a reprieve from it. The
+`message_bytes` row was added by the second audit pass, which found that comment
+asserting the ids were fixed-size when they are attacker-chosen — a ceiling that
+existed all along and was simply undocumented.
